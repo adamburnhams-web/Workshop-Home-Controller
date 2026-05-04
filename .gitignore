@@ -1,0 +1,12 @@
+# Claude Code local settings (machine-specific, not for version control)
+**/.claude/settings.local.json
+
+# PlatformIO build artifacts
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# IDE files
+.vscode/
+*.suo
+*.user
