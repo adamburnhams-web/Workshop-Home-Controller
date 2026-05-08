@@ -61,6 +61,7 @@ enum WinchState : uint8_t {
 #define FAULT_W_SENSOR_WORKSHOP_AIR  (1UL << 16)
 #define FAULT_W_SENSOR_OUTSIDE_AIR   (1UL << 17)
 #define FAULT_W_SENSOR_INVERTER_TEMP (1UL << 18)
+#define FAULT_W_FIRE_ALARM           (1UL << 19)
 
 // H-side faults (in hFaultFlags)
 #define FAULT_H_HEATER_OVERHEAT_WARN (1UL << 0)

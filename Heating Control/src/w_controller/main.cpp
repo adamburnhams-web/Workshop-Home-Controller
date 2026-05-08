@@ -36,36 +36,39 @@
 #define PIN_MANUAL_RELOCK   12   // dry contact, pull-up; LOW=suppression ON
 #define PIN_ONE_WIRE        13   // DS18B20 1-Wire bus (6 sensors)
 
-// Fan tachometers — moved to A8/A9 (PCINT16/17) to free D41/D42 for relay outputs
-// NOTE: spec originally assigned D41=fan1-tach and D42=fan2-tach, but D41 and D42
-//       are also assigned as relay outputs (vacuum pump and alarm sounder respectively).
-//       Tachometers are reassigned here to A8/A9 which support PCINT.
+// Fan tachometers on A8/A9 (PCINT16/17)
 #define PIN_FAN1_TACH       A8   // PCINT16 (PK0) — open collector, 10k pull-up
 #define PIN_FAN2_TACH       A9   // PCINT17 (PK1) — open collector, 10k pull-up
 #define PIN_FAN_BTN         43   // dry contact, pull-up; press = 8hr full-speed timer
 
 // Digital outputs — relays and actuators
-#define PIN_UFH_COLD_DIR    22   // 15VDC ch1: SPDT direction relay, NO=open, NC=close
-// D23 spare (was power relay, removed — auto-cutout handles it)
-#define PIN_SOLAR_COLD_DIR  24   // 15VDC ch3: SPDT direction relay
-// D25 spare
-#define PIN_UFH_PUMP        26   // 230VAC ch1: UFH central heating pump
-#define PIN_WALL_FAN        27   // 230VAC ch2: wall axial fan (BES speed controller)
-#define PIN_FAN_FLAP        28   // 15VDC ch5: fan flap actuator (open before fan ON)
-#define PIN_DOOR_LOCK_A     29   // 15VDC ch6: door lock H-bridge relay 1
-#define PIN_EXT_LIGHTS      30   // 230VAC ch3: external LED lights
-#define PIN_WINCH_DIR_OPEN  31   // 230VAC ch4: winch direction open (with power ch6)
-#define PIN_WINCH_POWER     32   // 230VAC ch6: winch power (with direction ch4 or ch5)
-#define PIN_WINCH_DIR_CLOSE 33   // 230VAC ch5: winch direction close (with power ch6)
-#define PIN_MIDPOINT_LED    34   // direct output: 1mm T&E live to mid-point LED
-#define PIN_RS485_DE_LINK   35   // MAX485 DE/RE for inter-controller link (HIGH=TX)
-#define PIN_RS485_DE_GROWATT 36  // MAX485 DE/RE for Growatt Modbus (HIGH=TX)
-#define PIN_VAC_ISO_OPEN    37   // 4-ch ch1: vacuum isolation valve H-bridge open relay
-#define PIN_VAC_ISO_CLOSE   38   // 4-ch ch2: vacuum isolation valve H-bridge close relay
-#define PIN_DOOR_LOCK_B     39   // 15VDC ch8: door lock H-bridge relay 2
-#define PIN_BUZZER_SIGNAL   40   // 4-ch ch3: relay pulls 2.5mm T&E earth → buzzer at H
-#define PIN_VAC_PUMP        41   // 230VAC ch7: 230VAC vacuum pump
-#define PIN_ALARM_SOUNDER   42   // 15VDC ch7: 15VDC alarm sounder at W
+// Even board (D22–D36): D22 D24 D26 D28 D30 D32 D34 D36
+// Odd board  (D23–D37): D25 D27 D29 D31 D33 D35 D37  (D23 spare)
+#define PIN_UFH_COLD_DIR    22   // even ch1: SPDT direction relay, NO=open, NC=close
+// D23: spare (odd ch1)
+#define PIN_SOLAR_COLD_DIR  24   // even ch2: SPDT direction relay
+#define PIN_EXT_LIGHTS      25   // odd  ch2: external LED lights
+#define PIN_ALARM_SOUNDER   26   // even ch3: alarm sounder at W
+#define PIN_WALL_FAN        27   // odd  ch3: wall axial fan (BES speed controller)
+#define PIN_FAN_FLAP        28   // even ch4: fan flap actuator (open before fan ON)
+#define PIN_WINCH_POWER     29   // odd  ch4: winch power (with direction ch5 or ch6)
+#define PIN_DOOR_LOCK_A     30   // even ch5: door lock H-bridge relay 1
+#define PIN_WINCH_DIR_OPEN  31   // odd  ch5: winch direction open (with power ch4)
+#define PIN_DOOR_LOCK_B     32   // even ch6: door lock H-bridge relay 2
+#define PIN_WINCH_DIR_CLOSE 33   // odd  ch6: winch direction close (with power ch4)
+#define PIN_VAC_ISO_CLOSE   34   // even ch7: vacuum isolation valve H-bridge close relay
+#define PIN_VAC_PUMP        35   // odd  ch7: 230VAC vacuum pump
+#define PIN_VAC_ISO_OPEN    36   // even ch8: vacuum isolation valve H-bridge open relay
+#define PIN_UFH_PUMP        37   // odd  ch8: UFH central heating pump
+// 4th relay board (D41, D42, D48–D53)
+#define PIN_BUZZER_SIGNAL   41   // board4 ch1: pulls 2.5mm T&E earth → buzzer at H
+#define PIN_HEN_DOOR_OPEN   42   // board4 ch2: hen house door open
+#define PIN_HEN_DOOR_CLOSE  48   // board4 ch3: hen house door close
+#define PIN_MIDPOINT_LED    49   // board4 ch4: 12VDC status LED relay
+// D50–D53: spare (board4 ch5–ch8)
+
+#define PIN_RS485_DE_LINK   46   // MAX485 DE/RE for inter-controller link (HIGH=TX)
+#define PIN_RS485_DE_GROWATT 47  // MAX485 DE/RE for Growatt Modbus (HIGH=TX)
 #define PIN_SOLAR_PUMP      44   // MOSFET gate via 120Ω: solar pump clocking output
 #define PIN_FAN_PWM         45   // Timer5 OC5B 25kHz PWM: PC fan MOSFET gate
 
@@ -80,12 +83,12 @@
 // DS18B20 64-bit addresses — scan with address-scan sketch and fill in
 // Sensor order: solar_hot, solar_cold, UFH_supply, UFH_post_TMV, workshop_air, outside_air
 static const uint8_t DS18B20_ADDRS[6][8] = {
-    { 0x28, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }, // TODO: solar hot
-    { 0x28, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 }, // TODO: solar cold
-    { 0x28, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02 }, // TODO: UFH supply (at pump)
-    { 0x28, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03 }, // TODO: UFH post TMV
-    { 0x28, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04 }, // TODO: workshop air
-    { 0x28, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05 }, // TODO: outside air
+    { 0x28, 0xFE, 0xB5, 0x14, 0x00, 0x00, 0x00, 0xD4 }, // solar hot      (sensor 1)
+    { 0x28, 0x5C, 0x8E, 0x12, 0x00, 0x00, 0x00, 0x1B }, // solar cold     (sensor 2)
+    { 0x28, 0xE1, 0xEB, 0x14, 0x00, 0x00, 0x00, 0x9C }, // UFH supply     (sensor 3)
+    { 0x28, 0xD1, 0x67, 0x15, 0x00, 0x00, 0x00, 0x14 }, // UFH post TMV   (sensor 4)
+    { 0x28, 0x45, 0x77, 0x12, 0x00, 0x00, 0x00, 0x83 }, // workshop air   (sensor 5)
+    { 0x28, 0xC9, 0x83, 0x12, 0x00, 0x00, 0x00, 0xAD }, // outside air    (sensor 6)
 };
 #define SENSOR_SOLAR_HOT    0
 #define SENSOR_SOLAR_COLD   1
@@ -406,6 +409,24 @@ bool          buzzerActive        = false;
 bool          doorHandleAlertActive = false;
 unsigned long handleAlertStartMs  = 0;
 bool          extLightsOn         = false;
+
+// ============================================================
+//  FIRE ALARM STATE
+// ============================================================
+
+enum FirePhase : uint8_t { FIRE_IDLE, FIRE_ALERT, FIRE_SOUNDER_ON, FIRE_SOUNDER_OFF, FIRE_DONE };
+FirePhase     firePhase            = FIRE_IDLE;
+unsigned long firePhaseStartMs     = 0;
+uint8_t       fireCycle            = 0;
+bool          fireAlarmActive      = false;
+uint8_t       fireAlarmTriggerSeq  = 0;  // alertResetSeq value at time of trigger
+
+bool          gDoorOpen            = false;  // set by updateSecurity() each loop
+uint8_t       gWinchReedFlags      = 0;      // set by updateWinchInputs() each loop
+bool          wAirRising           = false;
+float         wAirPrevMinTemp      = NAN;
+unsigned long wAirRateMs           = 0;
+unsigned long lastOutsideAbove25Ms = 0;
 
 // ============================================================
 //  FAN CONTROL
@@ -1068,7 +1089,7 @@ void updateSummerSolar() {
         pumpClockPeriodMs = 20000;
         pumpMinOnMs       = 500;
         solarColdValve.setOpen();
-        ufhColdValve.setOpen();  // UFH stays closed in summer, but log-burner path open at H
+        ufhColdValve.setClose(); // UFH cold stays closed in summer; opens only for fault dump
         setSolarPumpDuty(SUMMER_MIN_STARTUP_DUTY);
         solarPumpActive  = true;
         solarActiveEver  = true;
@@ -1132,6 +1153,7 @@ void updateSummerSolar() {
         }
     } else if (hot <= 83.0f) {
         clearFault(FAULT_W_SOLAR_OVERHEAT_HOT);
+        ufhColdValve.setClose();
     }
 
     // End-of-day abort (all phases): PV gone + pipe differential lost + array below 45°C.
@@ -1143,6 +1165,7 @@ void updateSummerSolar() {
                      || hot < 45.0f || cold < 45.0f;
     if (!pvActive && pipeCool && arrayLow) {
         solarColdValve.setClose();
+        ufhColdValve.setClose();
         setSolarPumpDuty(0);
         solarPumpActive = false;
         summerPhase     = SUMPH_IDLE;
@@ -1259,6 +1282,7 @@ void updateSecurity() {
     bool doorOpen     = (digitalRead(PIN_DOOR_REED) == LOW);
     bool pirActive    = (digitalRead(PIN_PIR)        == HIGH);
 #endif
+    gDoorOpen = doorOpen;
     bool manualSupp   = (digitalRead(PIN_MANUAL_RELOCK) == LOW); // LOW = suppression ON
     bool handleDown   = (digitalRead(PIN_DOOR_HANDLE)   == LOW);
 #ifdef DEBUG_SERIAL
@@ -1282,7 +1306,7 @@ void updateSecurity() {
 
     // External light toggle
     static bool prevLightBtn = false;
-    if (lightBtn && !prevLightBtn) {
+    if (!fireAlarmActive && lightBtn && !prevLightBtn) {
         extLightsOn = !extLightsOn;
         digitalWrite(PIN_EXT_LIGHTS, extLightsOn ? HIGH : LOW);
     }
@@ -1354,10 +1378,11 @@ void updateSecurity() {
         }
     }
 
-    // Fault-based buzzer: solar overheat or pump fault
+    // Fault-based buzzer: solar overheat, pump fault, or fire alarm
     buzzerActive |= hasFault(FAULT_W_SOLAR_OVERHEAT_COLD)
                  || hasFault(FAULT_W_SOLAR_OVERHEAT_HOT)
-                 || hasFault(FAULT_W_SOLAR_PUMP);
+                 || hasFault(FAULT_W_SOLAR_PUMP)
+                 || fireAlarmActive;
 
     digitalWrite(PIN_BUZZER_SIGNAL, buzzerActive ? HIGH : LOW);
     doorLock.update();
@@ -1377,6 +1402,12 @@ void updateWinchInputs() {
     bool manualLock  = (digitalRead(PIN_WINCH_REED_LOCK)  == LOW);
 #endif
     bool safetyLimit = (digitalRead(PIN_WINCH_SAFETY)     == LOW);
+
+    gWinchReedFlags = 0;
+    if (fullOpen)    gWinchReedFlags |= WREED_FULLY_OPEN;
+    if (fullClosed)  gWinchReedFlags |= WREED_FULLY_CLOSED;
+    if (manualLock)  gWinchReedFlags |= WREED_MANUAL_LOCK;
+    if (safetyLimit) gWinchReedFlags |= WREED_SAFETY_LIMIT;
 
     // Lockout management
     winch.openLockout  = fullOpen || manualLock || safetyLimit;
@@ -1444,13 +1475,127 @@ void updateNightCooling() {
 }
 
 // ============================================================
+//  FIRE ALARM
+// ============================================================
+
+static void updateFireRateCheck(unsigned long now) {
+    if (now - wAirRateMs < 60000UL) return;
+    float wAir = sFault[SENSOR_WORKSHOP_AIR] ? NAN : sTemp[SENSOR_WORKSHOP_AIR];
+    if (!isnan(wAir) && !isnan(wAirPrevMinTemp)) {
+        wAirRising = (wAir - wAirPrevMinTemp) >= 0.5f;
+    } else {
+        wAirRising = false;
+    }
+    wAirPrevMinTemp = wAir;
+    wAirRateMs = now;
+}
+
+static bool checkFireTrigger() {
+    if (sFault[SENSOR_WORKSHOP_AIR]) return false;
+    float wAir = sTemp[SENSOR_WORKSHOP_AIR];
+
+    // Absolute: workshop air > 25°C and outside hasn't been >= 25°C in last 24hrs
+    bool outsideRecentlyHot = (lastOutsideAbove25Ms != 0)
+                           && (millis() - lastOutsideAbove25Ms < 86400000UL);
+    if (wAir > 25.0f && !outsideRecentlyHot) return true;
+
+    // Rate of rise: >= 0.5°C/min with door closed and winch fully closed
+    if (wAirRising && !gDoorOpen && (gWinchReedFlags & WREED_FULLY_CLOSED)) return true;
+
+    return false;
+}
+
+void updateFireAlarm() {
+    unsigned long now = millis();
+
+    // Track outside temp for 24hr inhibit
+    if (!sFault[SENSOR_OUTSIDE_AIR] && sTemp[SENSOR_OUTSIDE_AIR] >= 25.0f) {
+        lastOutsideAbove25Ms = now;
+    }
+
+    // Reset: H controller user acknowledged the alert
+    if (fireAlarmActive && hasHPacket && lastH.alertResetSeq != fireAlarmTriggerSeq) {
+        firePhase = FIRE_IDLE;
+        fireAlarmActive = false;
+        fireCycle = 0;
+        digitalWrite(PIN_ALARM_SOUNDER, LOW);
+        digitalWrite(PIN_EXT_LIGHTS, extLightsOn ? HIGH : LOW); // restore to pre-alarm state
+        clearFault(FAULT_W_FIRE_ALARM);
+        return;
+    }
+
+    if (firePhase == FIRE_IDLE) {
+        updateFireRateCheck(now);
+        if (checkFireTrigger()) {
+            firePhase           = FIRE_ALERT;
+            firePhaseStartMs    = now;
+            fireCycle           = 0;
+            fireAlarmActive     = true;
+            fireAlarmTriggerSeq = lastAlertResetSeq;
+            setFault(FAULT_W_FIRE_ALARM);
+        }
+        return;
+    }
+
+    // Flash D30 at 250ms while alarm active
+    bool flashOn = ((now / 250UL) % 2) == 0;
+    digitalWrite(PIN_EXT_LIGHTS, flashOn ? HIGH : LOW);
+
+    updateFireRateCheck(now);
+
+    switch (firePhase) {
+        case FIRE_ALERT:
+            // D40 held on via buzzerActive in updateSecurity(); no sounder yet
+            if (now - firePhaseStartMs >= 60000UL) {
+                firePhase        = FIRE_SOUNDER_ON;
+                firePhaseStartMs = now;
+                fireCycle        = 1;
+                digitalWrite(PIN_ALARM_SOUNDER, HIGH);
+            }
+            break;
+
+        case FIRE_SOUNDER_ON:
+            if (now - firePhaseStartMs >= 60000UL) {
+                digitalWrite(PIN_ALARM_SOUNDER, LOW);
+                firePhase        = FIRE_SOUNDER_OFF;
+                firePhaseStartMs = now;
+            }
+            break;
+
+        case FIRE_SOUNDER_OFF:
+            if (now - firePhaseStartMs >= 60000UL) {
+                if (fireCycle >= 5 || !wAirRising) {
+                    firePhase = FIRE_DONE;
+                } else {
+                    fireCycle++;
+                    firePhase        = FIRE_SOUNDER_ON;
+                    firePhaseStartMs = now;
+                    digitalWrite(PIN_ALARM_SOUNDER, HIGH);
+                }
+            }
+            break;
+
+        case FIRE_DONE:
+            // Sounder cycles exhausted; D40 and flashing continue until H reset
+            break;
+
+        default: break;
+    }
+}
+
+// ============================================================
 //  MID-POINT LED UPDATE  (D34)
 // ============================================================
 
 void updateMidpointLED() {
+    unsigned long now = millis();
+    if (fireAlarmActive) {
+        bool flashOn = ((now / 250UL) % 2) == 0;
+        digitalWrite(PIN_MIDPOINT_LED, flashOn ? HIGH : LOW);
+        return;
+    }
     bool anyFault       = (wFaultFlags != 0) || (hasHPacket && lastH.hFaultFlags != 0);
     bool manualHeaterOn = hasHPacket && lastH.manualHeaterMode != MHM_OFF;
-    unsigned long now   = millis();
 
     uint8_t priority = anyFault ? 1 : (manualHeaterOn ? 2 : (!workshopLocked ? 3 : 4));
     static uint8_t prevPriority = 0;
@@ -1680,6 +1825,31 @@ void receiveHToWPacket() {
 //  SERIAL DEBUG COMMAND FUNCTIONS
 // ============================================================
 
+static void dbgScan() {
+    uint8_t addr[8];
+    uint8_t count = 0;
+    oneWire.reset_search();
+    Serial.println(F("Scanning 1-Wire bus..."));
+    while (oneWire.search(addr)) {
+        if (OneWire::crc8(addr, 7) != addr[7]) {
+            Serial.println(F("  CRC error — skipping"));
+            continue;
+        }
+        Serial.print(F("  { "));
+        for (uint8_t i = 0; i < 8; i++) {
+            Serial.print(F("0x"));
+            if (addr[i] < 0x10) Serial.print(F("0"));
+            Serial.print(addr[i], HEX);
+            if (i < 7) Serial.print(F(", "));
+        }
+        Serial.print(F(" }  family=0x"));
+        Serial.println(addr[0], HEX);
+        count++;
+    }
+    if (count == 0) Serial.println(F("  none found"));
+    else { Serial.print(F("  total: ")); Serial.println(count); }
+}
+
 static void dbgPrintTemp(uint8_t i, const __FlashStringHelper* name) {
     Serial.print(F("  ")); Serial.print(name); Serial.print(F(": "));
     if (sSimulate[i]) Serial.print(F("SIM "));
@@ -1831,6 +2001,7 @@ static void handleDebugCommand(char* buf) {
 
     if      (!strcmp_P(cmd, PSTR("help"))) {
         Serial.println(F("temps  valves  faults  mode  status  pump  fans  security  growatt"));
+        Serial.println(F("scan  (1-Wire address discovery)"));
         Serial.println(F("set <sensor> <val>  (val=999 clears sim)"));
         Serial.println(F("  sensors: solar_hot solar_cold ufh_supply ufh_post_tmv workshop_air outside_air"));
         Serial.println(F("set pir|door|winch_cls|winch_lock <0|1>"));
@@ -1845,6 +2016,7 @@ static void handleDebugCommand(char* buf) {
     else if (!strcmp_P(cmd, PSTR("fans")))     dbgFans();
     else if (!strcmp_P(cmd, PSTR("security"))) dbgSecurity();
     else if (!strcmp_P(cmd, PSTR("growatt")))  dbgGrowatt();
+    else if (!strcmp_P(cmd, PSTR("scan")))     dbgScan();
     else if (!strcmp_P(cmd, PSTR("set")))      dbgSet(arg1, arg2);
     else if (cmd[0] != 0) { Serial.print(F("unknown: ")); Serial.println(cmd); }
 }
@@ -1947,6 +2119,8 @@ void setup() {
     pinMode(PIN_VAC_ISO_CLOSE,   OUTPUT); digitalWrite(PIN_VAC_ISO_CLOSE,   LOW);
     pinMode(PIN_DOOR_LOCK_B,     OUTPUT); digitalWrite(PIN_DOOR_LOCK_B,     LOW);
     pinMode(PIN_BUZZER_SIGNAL,   OUTPUT); digitalWrite(PIN_BUZZER_SIGNAL,   LOW);
+    pinMode(PIN_HEN_DOOR_OPEN,   OUTPUT); digitalWrite(PIN_HEN_DOOR_OPEN,   LOW);
+    pinMode(PIN_HEN_DOOR_CLOSE,  OUTPUT); digitalWrite(PIN_HEN_DOOR_CLOSE,  LOW);
     pinMode(PIN_VAC_PUMP,        OUTPUT); digitalWrite(PIN_VAC_PUMP,        LOW);
     pinMode(PIN_ALARM_SOUNDER,   OUTPUT); digitalWrite(PIN_ALARM_SOUNDER,   LOW);
     pinMode(PIN_SOLAR_PUMP,      OUTPUT); digitalWrite(PIN_SOLAR_PUMP,      LOW);
@@ -2094,6 +2268,9 @@ void loop() {
 
     // Night cooling
     updateNightCooling();
+
+    // Fire alarm
+    updateFireAlarm();
 
     // Mid-point LED
     updateMidpointLED();

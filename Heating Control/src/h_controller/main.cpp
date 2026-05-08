@@ -9,7 +9,7 @@
 #include <avr/wdt.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include <MCUFRIEND_kbv.h>
+#include <TFT_eSPI.h>
 #include <Adafruit_GFX.h>
 #include <SD.h>
 #include <RTClib.h>
@@ -59,12 +59,12 @@
 // ============================================================
 
 static const uint8_t DS18B20_ADDRS[6][8] = {
-    { 0x28, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10 }, // TODO: tank bottom
-    { 0x28, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11 }, // TODO: tank middle
-    { 0x28, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12 }, // TODO: tank top
-    { 0x28, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x13 }, // TODO: hot pipe
-    { 0x28, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14 }, // TODO: cold pipe
-    { 0x28, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x15 }, // TODO: heater output
+    { 0x28, 0xA4, 0xD1, 0x14, 0x00, 0x00, 0x00, 0x3B }, // tank bottom    (sensor 7)
+    { 0x28, 0xB7, 0x37, 0x15, 0x00, 0x00, 0x00, 0xF0 }, // tank middle    (sensor 8)
+    { 0x28, 0xB2, 0x99, 0x12, 0x00, 0x00, 0x00, 0x0C }, // tank top       (sensor 9)
+    { 0x28, 0x11, 0x6C, 0x12, 0x00, 0x00, 0x00, 0x7D }, // hot pipe       (sensor 10)
+    { 0x28, 0x64, 0x27, 0x15, 0x00, 0x00, 0x00, 0x11 }, // cold pipe      (sensor 11)
+    { 0x28, 0xEA, 0x8F, 0x12, 0x00, 0x00, 0x00, 0x63 }, // heater output  (sensor 12)
 };
 #define H_SENSOR_TANK_BOT    0
 #define H_SENSOR_TANK_MID    1
@@ -131,7 +131,7 @@ static const bool HEATER_ENABLED = false;
 
 OneWire          oneWire(PIN_ONE_WIRE);
 DallasTemperature sensors(&oneWire);
-MCUFRIEND_kbv    tft;
+TFT_eSPI         tft;
 RTC_DS3231       rtc;
 
 // ============================================================
@@ -1682,6 +1682,31 @@ static void dbgSet(char* key, char* val) {
     Serial.print(F("unknown key: ")); Serial.println(key);
 }
 
+static void dbgScan() {
+    uint8_t addr[8];
+    uint8_t count = 0;
+    oneWire.reset_search();
+    Serial.println(F("Scanning 1-Wire bus..."));
+    while (oneWire.search(addr)) {
+        if (OneWire::crc8(addr, 7) != addr[7]) {
+            Serial.println(F("  CRC error — skipping"));
+            continue;
+        }
+        Serial.print(F("  { "));
+        for (uint8_t i = 0; i < 8; i++) {
+            Serial.print(F("0x"));
+            if (addr[i] < 0x10) Serial.print(F("0"));
+            Serial.print(addr[i], HEX);
+            if (i < 7) Serial.print(F(", "));
+        }
+        Serial.print(F(" }  family=0x"));
+        Serial.println(addr[0], HEX);
+        count++;
+    }
+    if (count == 0) Serial.println(F("  none found"));
+    else { Serial.print(F("  total: ")); Serial.println(count); }
+}
+
 static void handleDebugCommand(char* buf) {
     char* cmd = buf;
     while (*cmd == ' ') cmd++;
@@ -1695,7 +1720,7 @@ static void handleDebugCommand(char* buf) {
     if (*arg2 == ' ') { *arg2++ = 0; while (*arg2 == ' ') arg2++; }
 
     if      (!strcmp_P(cmd, PSTR("help"))) {
-        Serial.println(F("temps  valves  faults  mode  status  heater  bus  rtc  page <1-5>"));
+        Serial.println(F("temps  valves  faults  mode  status  heater  bus  rtc  page <1-5>  scan"));
         Serial.println(F("set <sensor> <val>  (val=999 clears sim)"));
         Serial.println(F("  sensors: tank_bot tank_mid tank_top hot_pipe cold_pipe htr_out"));
         Serial.println(F("set log_burner|pv_export|batt_soc <val>"));
@@ -1714,6 +1739,7 @@ static void handleDebugCommand(char* buf) {
         if (pg >= 1 && pg <= 5) { currentPage = pg; needFullRedraw = true; wakeDisplay(); Serial.println(F("ok")); }
         else Serial.println(F("usage: page <1-5>"));
     }
+    else if (!strcmp_P(cmd, PSTR("scan")))   dbgScan();
     else if (!strcmp_P(cmd, PSTR("set")))    dbgSet(arg1, arg2);
     else if (cmd[0] != 0) { Serial.print(F("unknown: ")); Serial.println(cmd); }
 }
@@ -1820,8 +1846,7 @@ void setup() {
     twoPortValve.begin(PIN_TWO_PORT_OPEN,  PIN_TWO_PORT_CLOSE,  7000);
 
     // TFT display
-    uint16_t id = tft.readID();
-    tft.begin(id);
+    tft.init();
     tft.setRotation(1);
     tft.fillScreen(C_BLACK);
     tft.setTextColor(C_WHITE); tft.setTextSize(2);
