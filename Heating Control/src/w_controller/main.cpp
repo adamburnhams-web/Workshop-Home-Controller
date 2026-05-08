@@ -40,6 +40,8 @@
 #define PIN_FAN1_TACH       A8   // PCINT16 (PK0) — open collector, 10k pull-up
 #define PIN_FAN2_TACH       A9   // PCINT17 (PK1) — open collector, 10k pull-up
 #define PIN_FAN_BTN         43   // dry contact, pull-up; press = 8hr full-speed timer
+#define PIN_WIN_OPEN_BTN    38   // dry contact, pull-up; press = open window
+#define PIN_WIN_CLOSE_BTN   39   // dry contact, pull-up; press = close window
 
 // Digital outputs — relays and actuators
 // Even board (D22–D36): D22 D24 D26 D28 D30 D32 D34 D36
@@ -1420,6 +1422,28 @@ void updateWinchInputs() {
         // Clears automatically when switch opens (but LED clears only on alert reset)
     }
 
+    // Manual buttons — hold to run; reed lockouts stop the winch automatically
+    bool winOpenBtn  = (digitalRead(PIN_WIN_OPEN_BTN)  == LOW);
+    bool winCloseBtn = (digitalRead(PIN_WIN_CLOSE_BTN) == LOW);
+    static bool prevWinOpenBtn  = false;
+    static bool prevWinCloseBtn = false;
+
+    if (winOpenBtn  && !prevWinOpenBtn)  winch.request(WINCH_OPEN);
+    if (winCloseBtn && !prevWinCloseBtn) winch.request(WINCH_CLOSE);
+
+    // Stop on release — covers both mid-pause and mid-movement
+    if (!winOpenBtn  && prevWinOpenBtn) {
+        if ((winch.phase == WP_MOVING && winch.activeDir  == WINCH_OPEN) ||
+            (winch.phase == WP_PAUSE  && winch.pendingDir == WINCH_OPEN))  winch.immediateStop();
+    }
+    if (!winCloseBtn && prevWinCloseBtn) {
+        if ((winch.phase == WP_MOVING && winch.activeDir  == WINCH_CLOSE) ||
+            (winch.phase == WP_PAUSE  && winch.pendingDir == WINCH_CLOSE)) winch.immediateStop();
+    }
+
+    prevWinOpenBtn  = winOpenBtn;
+    prevWinCloseBtn = winCloseBtn;
+
     winch.update();
 }
 
@@ -2138,6 +2162,8 @@ void setup() {
     pinMode(PIN_LIGHT_BTN,       INPUT);  // voltage divider, no pull-up
     pinMode(PIN_MANUAL_RELOCK,   INPUT_PULLUP);
     pinMode(PIN_FAN_BTN,         INPUT_PULLUP);
+    pinMode(PIN_WIN_OPEN_BTN,    INPUT_PULLUP);
+    pinMode(PIN_WIN_CLOSE_BTN,   INPUT_PULLUP);
     pinMode(PIN_FAN1_TACH,       INPUT_PULLUP); // external 10k also present
     pinMode(PIN_FAN2_TACH,       INPUT_PULLUP);
 
