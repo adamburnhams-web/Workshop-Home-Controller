@@ -340,6 +340,14 @@ float   hSim[H_NUM_SENSORS];
 bool    simLogBurnerActive = false, simLogBurnerVal = false;
 bool    simPVExportActive  = false; int16_t simPVExportVal = 0;
 bool    simBattSOCActive   = false; uint8_t simBattSOCVal  = 0;
+
+enum CalPumpPhase : uint8_t { CALP_IDLE, CALP_STABILIZE, CALP_PRE_RAMP, CALP_RAMPING, CALP_DONE };
+CalPumpPhase  calPumpPhase   = CALP_IDLE;
+uint8_t       calSolarStepC  = 50;    // current test point °C (50–80 in 5°C steps)
+uint8_t       calHeaterPct   = 0;     // heater override %
+bool          calHtrOverride = false;
+unsigned long calPhaseMs     = 0;     // phase start / stability timer
+unsigned long calStepMs      = 0;     // ramp step timer
 #endif // DEBUG_SERIAL
 
 // ============================================================
@@ -1488,6 +1496,11 @@ void sendHToWPacket(bool timeSyncReq) {
         pkt.syncSecond    = rtcNow.second();
     }
 
+#ifdef DEBUG_SERIAL
+    pkt.calPumpActive   = (calPumpPhase != CALP_IDLE && calPumpPhase != CALP_DONE) ? 1 : 0;
+    pkt.calSolarTargetC = (calPumpPhase == CALP_STABILIZE) ? (int16_t)(calSolarStepC * 10) : 900;
+#endif
+
     uint8_t frame[PKT_MAX_FRAME];
     uint16_t len = pktEncode(frame, sizeof(frame), PKT_DIR_HW, txSeqNum++,
                              &pkt, sizeof(pkt));
@@ -1520,6 +1533,9 @@ bool receiveWToHPacket() {
             // SOC is stale when W's Growatt comms are faulted
             bool battSocStale = (lastWPkt.wFaultFlags & FAULT_W_GROWATT_COMMS) != 0;
             bool wSolarFault  = (lastWPkt.wFaultFlags & (FAULT_W_SENSOR_SOLAR_HOT | FAULT_W_SENSOR_SOLAR_COLD)) != 0;
+#ifdef DEBUG_SERIAL
+            if (calPumpPhase == CALP_IDLE || calPumpPhase == CALP_DONE)
+#endif
             updateHeaterDuty(lastWPkt.pvExportW, lastWPkt.gridImportW,
                              lastWPkt.battSOC, battSocStale, manualHeaterMode, wSolarFault);
             return true;
@@ -1707,6 +1723,148 @@ static void dbgScan() {
     else { Serial.print(F("  total: ")); Serial.println(count); }
 }
 
+static void calPrintDataPoint(uint8_t solarStep, uint8_t heaterPct,
+                               bool hotFault, float hotPipe,
+                               bool htrFault, float htrOut,
+                               uint8_t pumpDuty) {
+    Serial.print(F("CAL,"));
+    Serial.print(solarStep); Serial.print(',');
+    Serial.print(heaterPct); Serial.print(',');
+    if (hotFault) Serial.print(F("NaN")); else Serial.print(hotPipe, 1);
+    Serial.print(',');
+    if (htrFault) Serial.print(F("NaN")); else Serial.print(htrOut, 1);
+    Serial.print(',');
+    Serial.println(pumpDuty);
+}
+
+static void updateCalPump() {
+    if (calPumpPhase == CALP_IDLE || calPumpPhase == CALP_DONE) return;
+
+    unsigned long now     = millis();
+    bool hotFault = sFault[H_SENSOR_HOT_PIPE];
+    bool htrFault = sFault[H_SENSOR_HEATER_OUT];
+    float hotPipe = hotFault ? NAN : sTemp[H_SENSOR_HOT_PIPE];
+    float htrOut  = htrFault ? NAN : sTemp[H_SENSOR_HEATER_OUT];
+    uint8_t pumpDuty = hasWPkt ? lastWPkt.solarPumpDutyPct : 0;
+
+    switch (calPumpPhase) {
+        case CALP_STABILIZE:
+            calHtrOverride  = false;
+            heaterRunning   = false;
+            heaterTargetPct = 0;
+            PORTA &= ~(1 << PA5);
+            if (!hotFault && fabsf(hotPipe - (float)calSolarStepC) < 2.0f) {
+                if (calPhaseMs == 0) calPhaseMs = now;
+                if (now - calPhaseMs >= 10000UL) {
+                    Serial.print(F("CAL: hot_pipe stable at ")); Serial.print(hotPipe, 1);
+                    Serial.print(F("C — target ")); Serial.print(calSolarStepC);
+                    Serial.println(F("C, raising solar target to 90C, heater to 5%"));
+                    calPhaseMs     = now;
+                    calHeaterPct   = 5;
+                    calHtrOverride = true;
+                    calPumpPhase   = CALP_PRE_RAMP;
+                }
+            } else {
+                calPhaseMs = 0;
+            }
+            break;
+
+        case CALP_PRE_RAMP:
+            calHtrOverride  = true;
+            calHeaterPct    = 5;
+            heaterRunning   = true;
+            heaterTargetPct = 5;
+            if (!htrFault && htrOut >= 87.0f) {
+                Serial.println(F("CAL: htr_out >= 87C, starting 30s ramp"));
+                Serial.println(F("CAL_HDR: solar_step_C,heater_pct,hot_pipe_C,htr_out_C,pump_pct"));
+                calStepMs    = now;
+                calHeaterPct = 5;
+                calPumpPhase = CALP_RAMPING;
+                calPrintDataPoint(calSolarStepC, calHeaterPct, hotFault, hotPipe, htrFault, htrOut, pumpDuty);
+            } else if (now - calPhaseMs >= 300000UL) {
+                Serial.println(F("CAL: TIMEOUT — htr_out did not reach 87C in 5min, aborting"));
+                calPumpPhase   = CALP_DONE;
+                calHtrOverride = false;
+            }
+            break;
+
+        case CALP_RAMPING: {
+            calHtrOverride  = true;
+            heaterRunning   = true;
+            heaterTargetPct = calHeaterPct;
+            // Pump at ceiling — log current state as max for this solar step and advance
+            if (pumpDuty >= 100) {
+                Serial.print(F("CAL: pump 100% at ")); Serial.print(calHeaterPct);
+                Serial.println(F("% heater — ceiling, advancing"));
+                calPrintDataPoint(calSolarStepC, calHeaterPct, hotFault, hotPipe, htrFault, htrOut, 100);
+                if (calSolarStepC < 80) {
+                    calSolarStepC += 5;
+                    calHeaterPct   = 0;
+                    calHtrOverride = false;
+                    calPhaseMs     = 0;
+                    calPumpPhase   = CALP_STABILIZE;
+                    Serial.print(F("CAL: step done — stabilising at ")); Serial.print(calSolarStepC); Serial.println(F("C"));
+                } else {
+                    Serial.println(F("CAL: all steps complete"));
+                    calPumpPhase   = CALP_DONE;
+                    calHtrOverride = false;
+                }
+                break;
+            }
+            // 30s sweep: 19 intervals between 5%..100% → 1578ms each
+            if (now - calStepMs >= 1578UL) {
+                calStepMs     = now;
+                calHeaterPct  = min((uint8_t)(calHeaterPct + 5), (uint8_t)100);
+                heaterTargetPct = calHeaterPct;
+                calPrintDataPoint(calSolarStepC, calHeaterPct, hotFault, hotPipe, htrFault, htrOut, pumpDuty);
+                if (calHeaterPct >= 100) {
+                    if (calSolarStepC < 80) {
+                        calSolarStepC += 5;
+                        calHeaterPct   = 0;
+                        calHtrOverride = false;
+                        calPhaseMs     = 0;
+                        calPumpPhase   = CALP_STABILIZE;
+                        Serial.print(F("CAL: step done — stabilising at ")); Serial.print(calSolarStepC); Serial.println(F("C"));
+                    } else {
+                        Serial.println(F("CAL: all steps complete"));
+                        calPumpPhase   = CALP_DONE;
+                        calHtrOverride = false;
+                    }
+                }
+            }
+            break;
+        }
+        default: break;
+    }
+}
+
+static void dbgCalPump() {
+    if (!HEATER_ENABLED) {
+        Serial.println(F("cal_pump: HEATER_ENABLED is false — set true in firmware before calibrating"));
+        return;
+    }
+    if (calPumpPhase != CALP_IDLE && calPumpPhase != CALP_DONE) {
+        Serial.println(F("cal_pump: already running — use cal_abort to stop"));
+        return;
+    }
+    calPumpPhase   = CALP_STABILIZE;
+    calSolarStepC  = 50;
+    calHeaterPct   = 0;
+    calHtrOverride = false;
+    calPhaseMs     = 0;
+    Serial.println(F("CAL: started — ensure summer mode active and solar pump running"));
+    Serial.println(F("CAL: waiting for hot_pipe to stabilise at 50C"));
+}
+
+static void dbgCalAbort() {
+    calPumpPhase   = CALP_IDLE;
+    calHtrOverride = false;
+    heaterRunning  = false;
+    heaterTargetPct = 0;
+    PORTA &= ~(1 << PA5);
+    Serial.println(F("CAL: aborted — heater off, normal control restored"));
+}
+
 static void handleDebugCommand(char* buf) {
     char* cmd = buf;
     while (*cmd == ' ') cmd++;
@@ -1725,22 +1883,25 @@ static void handleDebugCommand(char* buf) {
         Serial.println(F("  sensors: tank_bot tank_mid tank_top hot_pipe cold_pipe htr_out"));
         Serial.println(F("set log_burner|pv_export|batt_soc <val>"));
         Serial.println(F("set log_burner_clear|pv_export_clear|batt_soc_clear 0"));
+        Serial.println(F("cal_pump  (start pump cal sequence)  cal_abort"));
     }
-    else if (!strcmp_P(cmd, PSTR("temps")))  dbgTemps();
-    else if (!strcmp_P(cmd, PSTR("valves"))) dbgValves();
-    else if (!strcmp_P(cmd, PSTR("faults"))) dbgFaults();
-    else if (!strcmp_P(cmd, PSTR("mode")))   dbgMode();
-    else if (!strcmp_P(cmd, PSTR("status"))) { dbgMode(); dbgTemps(); dbgFaults(); }
-    else if (!strcmp_P(cmd, PSTR("heater"))) dbgHeater();
-    else if (!strcmp_P(cmd, PSTR("bus")))    dbgBus();
-    else if (!strcmp_P(cmd, PSTR("rtc")))    dbgRTC();
-    else if (!strcmp_P(cmd, PSTR("page")))   {
+    else if (!strcmp_P(cmd, PSTR("temps")))    dbgTemps();
+    else if (!strcmp_P(cmd, PSTR("valves")))   dbgValves();
+    else if (!strcmp_P(cmd, PSTR("faults")))   dbgFaults();
+    else if (!strcmp_P(cmd, PSTR("mode")))     dbgMode();
+    else if (!strcmp_P(cmd, PSTR("status")))   { dbgMode(); dbgTemps(); dbgFaults(); }
+    else if (!strcmp_P(cmd, PSTR("heater")))   dbgHeater();
+    else if (!strcmp_P(cmd, PSTR("bus")))      dbgBus();
+    else if (!strcmp_P(cmd, PSTR("rtc")))      dbgRTC();
+    else if (!strcmp_P(cmd, PSTR("page")))     {
         uint8_t pg = (uint8_t)atoi(arg1);
         if (pg >= 1 && pg <= 5) { currentPage = pg; needFullRedraw = true; wakeDisplay(); Serial.println(F("ok")); }
         else Serial.println(F("usage: page <1-5>"));
     }
-    else if (!strcmp_P(cmd, PSTR("scan")))   dbgScan();
-    else if (!strcmp_P(cmd, PSTR("set")))    dbgSet(arg1, arg2);
+    else if (!strcmp_P(cmd, PSTR("scan")))     dbgScan();
+    else if (!strcmp_P(cmd, PSTR("set")))      dbgSet(arg1, arg2);
+    else if (!strcmp_P(cmd, PSTR("cal_pump"))) dbgCalPump();
+    else if (!strcmp_P(cmd, PSTR("cal_abort"))) dbgCalAbort();
     else if (cmd[0] != 0) { Serial.print(F("unknown: ")); Serial.println(cmd); }
 }
 
@@ -1957,6 +2118,9 @@ void loop() {
         doInterControllerExchange();
         wdt_reset();
     }
+#ifdef DEBUG_SERIAL
+    updateCalPump();
+#endif
 
     // SD logging (every 250ms = on each new W packet)
     if (hasWPkt && now - lastLogMs >= 250) {

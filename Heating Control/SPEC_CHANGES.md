@@ -1,0 +1,164 @@
+# Spec Changes — Delta from HW_Requirements_Spec_v5_9 / HW_Hardware_Spec_v2_5
+Captures decisions and additions made after those documents were written.
+Fold into the official docs at next version bump, then reset this file.
+
+---
+
+## W Controller — pin reassignments
+
+| Signal | Spec pin | Code pin | Notes |
+|---|---|---|---|
+| Fan tachometer 1 | D41 | A8 (PCINT16/PK0) | Changed to PCINT2 group for hardware interrupt support |
+| Fan tachometer 2 | D42 | A9 (PCINT17/PK1) | Changed to PCINT2 group |
+| Alarm sounder | D42 | D26 | Freed D42 for hen house door |
+| Buzzer signal to H | D40 | D41 | Board ch1 on 4th relay board |
+| Mid-point LED | D34 direct output | D49 relay (board4 ch4) | Now switched via relay, not direct |
+
+Full W relay board layout has changed from spec. New arrangement: one 8-ch board on even pins (D22–D36), one 8-ch board on odd pins (D23–D37), plus a separate 4-ch board (D41/D42/D48–D53).
+
+**Even board (D22–D36) — mix of 15VDC and 230VAC loads:**
+| Pin | Load |
+|---|---|
+| D22 | UFH cold valve direction relay (SPDT) |
+| D24 | Solar cold valve direction relay (SPDT) |
+| D26 | 15VDC alarm sounder |
+| D28 | Fan flap actuator (15VDC) |
+| D30 | Door lock H-bridge relay A |
+| D32 | Door lock H-bridge relay B |
+| D34 | Vacuum isolation valve CLOSE relay |
+| D36 | Vacuum isolation valve OPEN relay |
+
+**Odd board (D23–D37) — mix of 15VDC and 230VAC loads:**
+| Pin | Load |
+|---|---|
+| D23 | Spare |
+| D25 | External LED lights (230VAC) |
+| D27 | Wall axial fan (230VAC) |
+| D29 | Window winch power relay (230VAC) |
+| D31 | Window winch direction OPEN (230VAC) |
+| D33 | Window winch direction CLOSE (230VAC) |
+| D35 | Vacuum pump (230VAC) |
+| D37 | UFH central heating pump (230VAC) |
+
+**4th relay board (D41/D42/D48–D53):**
+| Pin | Load |
+|---|---|
+| D41 | Buzzer signal to H (pulls 2.5mm T&E earth) |
+| D42 | Hen house door OPEN |
+| D48 | Hen house door CLOSE |
+| D49 | Mid-point LED (15VDC via relay) |
+| D50–D53 | Spare |
+
+---
+
+## W Controller — new hardware/features
+
+### Window manual buttons (D38/D39)
+Hold-to-run buttons at W for manual window winch control.
+- D38 = open, D39 = close
+- Hold to move, release to stop immediately
+- Reed lockouts still apply (over-open, fully closed, manual lock)
+- Not in spec; added before coding began
+
+### Hen house door (4th relay board ch2/ch3)
+- D42 = open, D48 = close — H-bridge pair, 7s pulse
+- 4th relay board now: ch1=buzzer, ch2=hen door open, ch3=hen door close, ch4=mid-point LED
+- Not in spec; added before coding began
+
+### Fire alarm system
+New feature, not in spec. Logic:
+- **Trigger A (absolute)**: workshop air > 25°C AND outside air has not been ≥ 25°C in the last 24 hours
+- **Trigger B (rate-of-rise)**: workshop air rising ≥ 0.5°C/min AND door closed AND window fully closed
+- **Phase 1 (60s)**: external lights flash 250ms, buzzer at H active, no local sounder
+- **Phase 2**: local sounder on 60s / off 60s, up to 5 cycles or until rate-of-rise stops
+- Clears on alert reset from H display (page 4)
+- Fault flag: `FAULT_W_FIRE_ALARM` (bit 19 in wFaultFlags)
+- External lights flash during alarm, restore to pre-alarm state on clear
+
+---
+
+## H Controller — pin reassignment
+
+| Signal | Spec pin | Code pin | Notes |
+|---|---|---|---|
+| Display backlight | D32 | D44 (OC5C Timer5) | Hardware wire moved; D32 freed |
+
+---
+
+## H Controller — library change
+
+| Function | Spec library | Code library |
+|---|---|---|
+| TFT display | MCUFRIEND_kbv + Adafruit GFX | TFT_eSPI (includes GFX) |
+
+ILI9488 driver, SPI pins, and display dimensions configured via `build_flags` in platformio.ini.
+
+---
+
+## H Controller — logic changes
+
+### 2-port valve mid-tank threshold — hysteresis added
+Spec: switch at 30°C (no hysteresis)
+Code: switch to mid-tank at > 32°C, switch back to heater side at < 28°C; hold between 28–32°C
+
+### Summer 2-port valve — dynamic tracking in phase 3
+Spec did not define ongoing 2-port control once summer startup sequence completes.
+Code: in phase 3, 2-port tracks hot pipe vs tank top with ±1°C hysteresis:
+- Hot pipe > tank top + 1°C → heater/top-of-tank side
+- Hot pipe < tank top − 1°C → mid-tank side
+
+### Fault log size — 80 entries not 200
+Spec suggested ~200 entries. Code uses 80 (`~40 bytes × 80 = 3.2KB`) to stay within ATmega2560 8KB RAM budget with headroom for other state.
+
+---
+
+## Both controllers — RS485
+
+ArduinoRS485 library not used. Custom binary framing implemented in `include/rs485_packet.h`:
+- Header: `[0xAA][0x55][DIR][SEQ][LEN_LO][LEN_HI][PAYLOAD][CRC_LO][CRC_HI]`
+- CRC-16/Modbus over DIR+SEQ+LEN+PAYLOAD
+- `PktReceiver` state machine handles byte-by-byte receive with automatic resync on error
+
+---
+
+## DS18B20 addresses — filled in
+
+Both controllers: real addresses installed, no longer TODO placeholders.
+H controller: sensors 7–12. W controller: sensors 1–6.
+See top of each `main.cpp` for address arrays.
+
+---
+
+## Solar pump calibration — `cal_pump` command (H controller, DEBUG_SERIAL only)
+
+Not in spec. Implemented as a debug serial command on the H controller to find minimum solar pump speed as a function of heater power and hot pipe temperature.
+
+### Procedure
+- Sweeps solar inlet target from 50°C to 80°C in 5°C steps (7 steps total)
+- At each step:
+  1. **STABILIZE**: waits for hot pipe to settle within ±2°C of the target for 10s; heater off
+  2. **PRE_RAMP**: sets solar target to 90°C (pump drops to minimum clocking); heater starts at 5%, waits for heater output ≥ 87°C (5 min timeout)
+  3. **RAMP**: steps heater from 5% to 100% in ~5% increments over 30s (1578ms per step); logs one CSV row just before each increment
+- If pump duty reaches 100% mid-ramp (heater output ≥ 91°C), that heater level is logged as the ceiling for that solar step and the run advances immediately to the next step
+- Advances to next solar step after either 100% heater or pump-ceiling; repeats until 80°C step complete
+
+### Serial output
+CSV format: `solar_step_C, heater_pct, hot_pipe_C, htr_out_C, pump_pct`  
+Header line: `CAL_HDR: solar_step_C,heater_pct,hot_pipe_C,htr_out_C,pump_pct`
+
+### Packet fields used (HToWPacket, DEBUG_SERIAL only)
+- `calPumpActive` — 1 while STABILIZE/PRE_RAMP/RAMP active; W uses this to override solar target
+- `calSolarTargetC` — solar target °C × 10; 900 during PRE_RAMP/RAMP (forces pump to minimum clocking)
+
+### Commands
+- `cal_pump` — start sequence (requires `HEATER_ENABLED = true`)
+- `cal_abort` — stop immediately, heater off, normal control restored
+
+---
+
+## Calibration TODOs (still outstanding)
+
+- `SOLAR_PUMP_MIN_CURRENT_A` (W, INA219): TODO calibrate on-site
+- `FAN_MIN_DUTY_PCT` (W): TODO calibrate on-site
+- `FAN_FLAP_OPEN_MS` (W): TODO calibrate motorized damper travel time
+- `VALVE_POWERUP_WAIT_MS` (W): 30s conservative, verify on-site

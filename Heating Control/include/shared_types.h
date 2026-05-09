@@ -204,4 +204,8 @@ struct __attribute__((packed)) HToWPacket {
 
     // H faults
     uint32_t hFaultFlags;
+
+    // Pump calibration (populated only when DEBUG_SERIAL active; always zero in production)
+    uint8_t  calPumpActive;
+    int16_t  calSolarTargetC;   // solar target override °C × 10
 };

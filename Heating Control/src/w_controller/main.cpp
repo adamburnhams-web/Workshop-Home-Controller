@@ -1113,6 +1113,19 @@ void updateSummerSolar() {
     float solarTarget  = (tgtMode == SOLAR_MAX) ? 80.0f : min(tankTopC + 5.0f, 80.0f);
     float heaterTarget = (tgtMode == SOLAR_MAX) ? 89.0f : min(tankTopC + 5.0f, 89.0f);
 
+    // Cal override: H sets calPumpActive=1 and drives solarTarget remotely
+    if (hasHPacket && lastH.calPumpActive) {
+        solarTarget  = (float)lastH.calSolarTargetC / 10.0f;
+        heaterTarget = 89.0f;
+        if (!solarPumpActive) {
+            solarColdValve.setOpen();
+            pumpClockPeriodMs = 20000;
+            pumpMinOnMs       = 500;
+            solarPumpActive   = true;
+            solarActiveEver   = true;
+        }
+    }
+
     // Solar hot side: ramp 0→100% over ±2°C around solarTarget
     uint8_t dutySolar = calcPumpDuty(hot, solarTarget);
 
