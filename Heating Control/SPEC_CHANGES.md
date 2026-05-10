@@ -97,6 +97,27 @@ ILI9488 driver, SPI pins, and display dimensions configured via `build_flags` in
 
 ## H Controller — logic changes
 
+### Heater SSR — SOC-based charge rate control (summer mode)
+Spec: heater modulates purely on PV export, starts at 500W export.
+Code: two independent signals can drive SSR power up, whichever demands more wins.
+
+**Charge rate target (SOC-based):**
+- SOC < 60%: no charge rate control; existing 500W export start threshold applies
+- SOC 60%→80%: target = 3000W linearly interpolated to 1000W (100W per 1% SOC)
+- SOC 80%→100%: target = 1000W flat
+
+**Start conditions (either triggers heater on):**
+- Export ≥ 500W (existing), OR
+- SOC ≥ 60% AND battery charge rate (`battW` from Growatt Modbus) > SOC target
+
+**Stop condition:** export < 100W AND charge rate ≤ target (both must be true)
+
+**Duty calculation:** `max(exportPct, chargePct)` where:
+- `exportPct = max(0, pvExportW − 100) × 100 / 3000`
+- `chargePct = max(0, battChargeW − chargeTargetW) × 100 / 3000`
+
+`battW` (battery charge watts, positive = charging) was already present in `WToHPacket`; no packet changes required.
+
 ### 2-port valve mid-tank threshold — hysteresis added
 Spec: switch at 30°C (no hysteresis)
 Code: switch to mid-tank at > 32°C, switch back to heater side at < 28°C; hold between 28–32°C

@@ -247,9 +247,9 @@ void zeroCrossISR() {
     else    PORTA &= ~(1 << PA5);
 }
 
-// Outer loop: compute heaterTargetPct from PV export every ~850ms
+// Outer loop: compute heaterTargetPct from PV export / battery charge rate every ~850ms
 void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
-                       int16_t battSOC, bool battSocStale,
+                       int16_t battSOC, bool battSocStale, int16_t battChargeW,
                        ManualHeaterMode manualMode, bool wSolarFault)
 {
     // Grid outage → heater off always
@@ -292,17 +292,28 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
     }
 
     // Automatic summer mode
-    // Trigger: pvExportW >= 500W
-    if (!heaterRunning && pvExportW >= 500) heaterRunning = true;
+    // Charge rate target: 3kW at SOC 60%, linear to 1kW at SOC 80%, 1kW above 80%
+    int32_t chargeTargetW = 0;
+    bool chargeRateActive = !battSocStale && battSOC >= 60;
+    if (chargeRateActive) {
+        chargeTargetW = (battSOC >= 80) ? 1000L
+                                        : 3000L - (int32_t)(battSOC - 60) * 100L;
+    }
+    int32_t chargeExcessW = chargeRateActive ? max(0L, (int32_t)battChargeW - chargeTargetW) : 0L;
+
+    // Trigger: export >= 500W OR battery charging above SOC-based target
+    if (!heaterRunning && pvExportW >= 500)  heaterRunning = true;
+    if (!heaterRunning && chargeExcessW > 0) heaterRunning = true;
 
     if (heaterRunning) {
-        if (pvExportW < 100) {
+        if (pvExportW < 100 && chargeExcessW == 0) {
             heaterRunning   = false;
             heaterTargetPct = 0;
             return;
         }
-        int32_t excess  = (int32_t)pvExportW - 100;
-        heaterTargetPct = (uint8_t)constrain(excess * 100L / 3000L, 0, 100);
+        int32_t exportPct  = max(0L, (int32_t)pvExportW - 100) * 100L / 3000L;
+        int32_t chargePct  = chargeExcessW * 100L / 3000L;
+        heaterTargetPct = (uint8_t)constrain(max(exportPct, chargePct), 0, 100);
 
         // Overheat power reduction (> 91°C heater output)
         if (!sFault[H_SENSOR_HEATER_OUT]) {
@@ -1537,7 +1548,8 @@ bool receiveWToHPacket() {
             if (calPumpPhase == CALP_IDLE || calPumpPhase == CALP_DONE)
 #endif
             updateHeaterDuty(lastWPkt.pvExportW, lastWPkt.gridImportW,
-                             lastWPkt.battSOC, battSocStale, manualHeaterMode, wSolarFault);
+                             lastWPkt.battSOC, battSocStale, lastWPkt.battW,
+                             manualHeaterMode, wSolarFault);
             return true;
         }
     }
