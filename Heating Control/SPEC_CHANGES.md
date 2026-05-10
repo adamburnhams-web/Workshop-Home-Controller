@@ -155,7 +155,7 @@ See top of each `main.cpp` for address arrays.
 Not in spec. Implemented as a debug serial command on the H controller to find minimum solar pump speed as a function of heater power and hot pipe temperature.
 
 ### Procedure
-- Sweeps solar inlet target from 50°C to 80°C in 5°C steps (7 steps total)
+- Sweeps solar inlet target from 85°C down to 40°C in 5°C steps (10 steps total, descending)
 - At each step:
   1. **STABILIZE**: waits for hot pipe to settle within ±2°C of the target for 10s; heater off
   2. **PRE_RAMP**: sets solar target to 90°C (pump drops to minimum clocking); heater starts at 5%, waits for heater output ≥ 87°C (5 min timeout)

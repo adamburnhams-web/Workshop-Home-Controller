@@ -354,7 +354,7 @@ bool    simBattSOCActive   = false; uint8_t simBattSOCVal  = 0;
 
 enum CalPumpPhase : uint8_t { CALP_IDLE, CALP_STABILIZE, CALP_PRE_RAMP, CALP_RAMPING, CALP_DONE };
 CalPumpPhase  calPumpPhase   = CALP_IDLE;
-uint8_t       calSolarStepC  = 50;    // current test point °C (50–80 in 5°C steps)
+uint8_t       calSolarStepC  = 85;    // current test point °C (85–40 in 5°C steps, descending)
 uint8_t       calHeaterPct   = 0;     // heater override %
 bool          calHtrOverride = false;
 unsigned long calPhaseMs     = 0;     // phase start / stability timer
@@ -1809,8 +1809,8 @@ static void updateCalPump() {
                 Serial.print(F("CAL: pump 100% at ")); Serial.print(calHeaterPct);
                 Serial.println(F("% heater — ceiling, advancing"));
                 calPrintDataPoint(calSolarStepC, calHeaterPct, hotFault, hotPipe, htrFault, htrOut, 100);
-                if (calSolarStepC < 80) {
-                    calSolarStepC += 5;
+                if (calSolarStepC > 40) {
+                    calSolarStepC -= 5;
                     calHeaterPct   = 0;
                     calHtrOverride = false;
                     calPhaseMs     = 0;
@@ -1830,8 +1830,8 @@ static void updateCalPump() {
                 heaterTargetPct = calHeaterPct;
                 calPrintDataPoint(calSolarStepC, calHeaterPct, hotFault, hotPipe, htrFault, htrOut, pumpDuty);
                 if (calHeaterPct >= 100) {
-                    if (calSolarStepC < 80) {
-                        calSolarStepC += 5;
+                    if (calSolarStepC > 40) {
+                        calSolarStepC -= 5;
                         calHeaterPct   = 0;
                         calHtrOverride = false;
                         calPhaseMs     = 0;
@@ -1860,12 +1860,12 @@ static void dbgCalPump() {
         return;
     }
     calPumpPhase   = CALP_STABILIZE;
-    calSolarStepC  = 50;
+    calSolarStepC  = 85;
     calHeaterPct   = 0;
     calHtrOverride = false;
     calPhaseMs     = 0;
     Serial.println(F("CAL: started — ensure summer mode active and solar pump running"));
-    Serial.println(F("CAL: waiting for hot_pipe to stabilise at 50C"));
+    Serial.println(F("CAL: waiting for hot_pipe to stabilise at 85C"));
 }
 
 static void dbgCalAbort() {
