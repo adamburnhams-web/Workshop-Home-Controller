@@ -161,7 +161,7 @@ Not in spec. Implemented as a debug serial command on the H controller to find m
   2. **PRE_RAMP**: sets solar target to 90°C (pump drops to minimum clocking); heater starts at 5%, waits for heater output ≥ 87°C (5 min timeout)
   3. **RAMP**: steps heater from 5% to 100% in ~5% increments over 30s (1578ms per step); logs one CSV row just before each increment
 - If pump duty reaches 100% mid-ramp (heater output ≥ 91°C), that heater level is logged as the ceiling for that solar step and the run advances immediately to the next step
-- Advances to next solar step after either 100% heater or pump-ceiling; repeats until 80°C step complete
+- Advances to next solar step after either 100% heater or pump-ceiling; repeats until 40°C step complete
 
 ### Serial output
 CSV format: `solar_step_C, heater_pct, hot_pipe_C, htr_out_C, pump_pct`  
