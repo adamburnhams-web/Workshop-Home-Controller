@@ -27,8 +27,8 @@
 #define PIN_DOOR_HANDLE      3   // INT5 — dry contact, pull-up, closes when pushed
 #define PIN_DOOR_REED        4   // dry contact, pull-up; LOW=door open, HIGH=closed
 #define PIN_WINCH_REED_OPEN  5   // pull-up; LOW=fully open
-#define PIN_WINCH_REED_CLOSE 6   // pull-up; LOW=fully closed
-#define PIN_WINCH_REED_LOCK  7   // pull-up; LOW=manual lock engaged
+#define PIN_WINCH_REED_CLOSE 6   // pull-up; HIGH=fully closed (switch open when closed)
+#define PIN_WINCH_REED_LOCK  7   // pull-up; HIGH=manual lock engaged (switch open when locked)
 #define PIN_WINCH_SAFETY     8   // pull-up; LOW=over-open safety limit
 #define PIN_VAC_SENSOR       9   // pull-up; LOW=full vacuum, HIGH=low vacuum
 #define PIN_UNLOCK_BTN      10   // 15VDC via 10k/4.7k divider
@@ -1301,11 +1301,11 @@ void updateSecurity() {
     bool manualSupp   = (digitalRead(PIN_MANUAL_RELOCK) == LOW); // LOW = suppression ON
     bool handleDown   = (digitalRead(PIN_DOOR_HANDLE)   == LOW);
 #ifdef DEBUG_SERIAL
-    bool winchSecured = (simWinchClsActive  ? simWinchClsVal  : (digitalRead(PIN_WINCH_REED_CLOSE) == LOW))
-                     && (simWinchLockActive ? simWinchLockVal : (digitalRead(PIN_WINCH_REED_LOCK)  == LOW));
+    bool winchSecured = (simWinchClsActive  ? simWinchClsVal  : (digitalRead(PIN_WINCH_REED_CLOSE) == HIGH))
+                     && (simWinchLockActive ? simWinchLockVal : (digitalRead(PIN_WINCH_REED_LOCK)  == HIGH));
 #else
-    bool winchSecured = (digitalRead(PIN_WINCH_REED_CLOSE) == LOW)
-                     && (digitalRead(PIN_WINCH_REED_LOCK)  == LOW);
+    bool winchSecured = (digitalRead(PIN_WINCH_REED_CLOSE) == HIGH)
+                     && (digitalRead(PIN_WINCH_REED_LOCK)  == HIGH);
 #endif
     bool unlockBtn    = (digitalRead(PIN_UNLOCK_BTN)    == HIGH);
     bool lightBtn     = (digitalRead(PIN_LIGHT_BTN)     == HIGH);
@@ -1410,11 +1410,11 @@ void updateSecurity() {
 void updateWinchInputs() {
     bool fullOpen    = (digitalRead(PIN_WINCH_REED_OPEN)  == LOW);
 #ifdef DEBUG_SERIAL
-    bool fullClosed  = simWinchClsActive  ? simWinchClsVal  : (digitalRead(PIN_WINCH_REED_CLOSE) == LOW);
-    bool manualLock  = simWinchLockActive ? simWinchLockVal : (digitalRead(PIN_WINCH_REED_LOCK)  == LOW);
+    bool fullClosed  = simWinchClsActive  ? simWinchClsVal  : (digitalRead(PIN_WINCH_REED_CLOSE) == HIGH);
+    bool manualLock  = simWinchLockActive ? simWinchLockVal : (digitalRead(PIN_WINCH_REED_LOCK)  == HIGH);
 #else
-    bool fullClosed  = (digitalRead(PIN_WINCH_REED_CLOSE) == LOW);
-    bool manualLock  = (digitalRead(PIN_WINCH_REED_LOCK)  == LOW);
+    bool fullClosed  = (digitalRead(PIN_WINCH_REED_CLOSE) == HIGH);
+    bool manualLock  = (digitalRead(PIN_WINCH_REED_LOCK)  == HIGH);
 #endif
     bool safetyLimit = (digitalRead(PIN_WINCH_SAFETY)     == LOW);
 
@@ -1750,8 +1750,8 @@ void sendWToHPacket() {
 
     uint8_t reedFlags = 0;
     if (digitalRead(PIN_WINCH_REED_OPEN)  == LOW) reedFlags |= WREED_FULLY_OPEN;
-    if (digitalRead(PIN_WINCH_REED_CLOSE) == LOW) reedFlags |= WREED_FULLY_CLOSED;
-    if (digitalRead(PIN_WINCH_REED_LOCK)  == LOW) reedFlags |= WREED_MANUAL_LOCK;
+    if (digitalRead(PIN_WINCH_REED_CLOSE) == HIGH) reedFlags |= WREED_FULLY_CLOSED;
+    if (digitalRead(PIN_WINCH_REED_LOCK)  == HIGH) reedFlags |= WREED_MANUAL_LOCK;
     if (digitalRead(PIN_WINCH_SAFETY)     == LOW) reedFlags |= WREED_SAFETY_LIMIT;
     pkt.winchReedFlags = reedFlags;
 
@@ -1973,8 +1973,8 @@ static void dbgSecurity() {
     Serial.print(F("  locked:     ")); Serial.println(workshopLocked ? F("yes") : F("no"));
     Serial.print(F("  door:       ")); Serial.println((digitalRead(PIN_DOOR_REED)       == LOW)  ? F("OPEN")   : F("closed"));
     Serial.print(F("  pir:        ")); Serial.println((digitalRead(PIN_PIR)              == HIGH) ? F("ACTIVE") : F("clear"));
-    Serial.print(F("  winch_cls:  ")); Serial.println((digitalRead(PIN_WINCH_REED_CLOSE) == LOW)  ? F("CLOSED") : F("open"));
-    Serial.print(F("  winch_lock: ")); Serial.println((digitalRead(PIN_WINCH_REED_LOCK)  == LOW)  ? F("LOCKED") : F("clear"));
+    Serial.print(F("  winch_cls:  ")); Serial.println((digitalRead(PIN_WINCH_REED_CLOSE) == HIGH)  ? F("CLOSED") : F("open"));
+    Serial.print(F("  winch_lock: ")); Serial.println((digitalRead(PIN_WINCH_REED_LOCK)  == HIGH)  ? F("LOCKED") : F("clear"));
     Serial.print(F("  alarm:      ")); Serial.println(alarmActive  ? F("ACTIVE") : F("off"));
     Serial.print(F("  buzzer:     ")); Serial.println(buzzerActive ? F("on")     : F("off"));
     if (simDoorActive)      { Serial.print(F("  SIM door=")); Serial.println(simDoorVal); }
