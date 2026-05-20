@@ -13,6 +13,7 @@ Fold into the official docs at next version bump, then reset this file.
 | Alarm sounder | D42 | D26 | Freed D42 for hen house door |
 | Buzzer signal to H | D40 | D41 | Board ch1 on 4th relay board |
 | Mid-point LED | D34 direct output | D49 relay (board4 ch4) | Now switched via relay, not direct |
+| RS485 DE/RE (link) | D46 | D40 | Freed D46; moved away from SPI area |
 
 Full W relay board layout has changed from spec. New arrangement: one 8-ch board on even pins (D22–D36), one 8-ch board on odd pins (D23–D37), plus a separate 4-ch board (D41/D42/D48–D53).
 
@@ -72,7 +73,7 @@ New feature, not in spec. Logic:
 - **Phase 1 (60s)**: external lights flash 250ms, buzzer at H active, no local sounder
 - **Phase 2**: local sounder on 60s / off 60s, up to 5 cycles or until rate-of-rise stops
 - Clears on alert reset from H display (page 4)
-- Fault flag: `FAULT_W_FIRE_ALARM` (bit 19 in wFaultFlags)
+- Fault flag: `FAULT_W_FIRE_ALARM` (bit 18 in wFaultFlags)
 - External lights flash during alarm, restore to pre-alarm state on clear
 
 ---
@@ -122,22 +123,30 @@ ILI9488 driver, SPI pins, and display dimensions configured via `build_flags` in
 Spec: heater modulates purely on PV export, starts at 500W export.
 Code: two independent signals can drive SSR power up, whichever demands more wins.
 
+**Manual modes** (`ManualHeaterMode` enum):
+- `MHM_OFF` — heater stays off
+- `MHM_FORCE_ON` — heater forced to 100% (was `MHM_OVERRIDE_SOC`; `MHM_SOC_LIMITED` removed)
+
+**Pre-conditions (all must pass before any start logic):**
+- Grid present AND `HEATER_ENABLED = true`
+- No W solar sensor fault
+- No heater hard lockout
+- `growattValid = 1` AND combined PV1+PV2 ≥ 200W (end-of-day gate)
+
 **Charge rate target (SOC-based):**
 - SOC < 60%: no charge rate control; existing 500W export start threshold applies
 - SOC 60%→80%: target = 3000W linearly interpolated to 1000W (100W per 1% SOC)
 - SOC 80%→100%: target = 1000W flat
 
 **Start conditions (either triggers heater on):**
-- Export ≥ 500W (existing), OR
-- SOC ≥ 60% AND battery charge rate (`battW` from Growatt Modbus) > SOC target
+- Export ≥ 500W, OR
+- SOC ≥ 60% AND `battChargeW` (from `WToHPacket`) > SOC target
 
-**Stop condition:** export < 100W AND charge rate ≤ target (both must be true)
+**Stop condition:** export < 100W AND (SOC < 60% OR charge rate ≤ target)
 
 **Duty calculation:** `max(exportPct, chargePct)` where:
 - `exportPct = max(0, pvExportW − 100) × 100 / 3000`
-- `chargePct = max(0, battChargeW − chargeTargetW) × 100 / 3000`
-
-`battW` (battery charge watts, positive = charging) was already present in `WToHPacket`; no packet changes required.
+- `chargePct = max(0, battChargeW − chargeTarget) × 100 / 3000` (0 when SOC < 60%)
 
 ### 2-port valve mid-tank threshold — hysteresis added
 Spec: switch at 30°C (no hysteresis)
@@ -200,7 +209,7 @@ Header line: `CAL_HDR: solar_step_C,heater_pct,hot_pipe_C,htr_out_C,pump_pct`
 
 ## Calibration TODOs (still outstanding)
 
-- `SOLAR_PUMP_MIN_CURRENT_A` (W, INA219): TODO calibrate on-site
 - `FAN_MIN_DUTY_PCT` (W): TODO calibrate on-site
 - `FAN_FLAP_OPEN_MS` (W): TODO calibrate motorized damper travel time
 - `VALVE_POWERUP_WAIT_MS` (W): 30s conservative, verify on-site
+- `SOLAR_PUMP_MIN_CURRENT_A` / `SOLAR_PUMP_MAX_CURRENT_A` (W, INA219): set to 1.00A / 2.00A; verify on-site
