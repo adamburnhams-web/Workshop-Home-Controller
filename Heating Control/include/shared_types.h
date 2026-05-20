@@ -28,9 +28,8 @@ enum SolarTargetMode : uint8_t {
 };
 
 enum ManualHeaterMode : uint8_t {
-    MHM_OFF          = 0,
-    MHM_SOC_LIMITED  = 1,
-    MHM_OVERRIDE_SOC = 2
+    MHM_OFF      = 0,
+    MHM_FORCE_ON = 1
 };
 
 enum WinchState : uint8_t {
@@ -45,11 +44,11 @@ enum WinchState : uint8_t {
 #define FAULT_W_SOLAR_OVERHEAT_COLD  (1UL << 0)
 #define FAULT_W_SOLAR_OVERHEAT_HOT   (1UL << 1)
 #define FAULT_W_SOLAR_PUMP           (1UL << 2)
+#define FAULT_W_SOLAR_PUMP_OVERCURRENT (1UL << 7)
 #define FAULT_W_UFH_OVERHEAT         (1UL << 3)
 #define FAULT_W_FROST_NOT_RECOVERING (1UL << 4)
 #define FAULT_W_VAC_PUMP_OVERTIME    (1UL << 5)
 #define FAULT_W_GROWATT_COMMS        (1UL << 6)
-#define FAULT_W_INVERTER_FAULT       (1UL << 7)
 #define FAULT_W_RS485_COMMS          (1UL << 8)
 #define FAULT_W_FAN1                 (1UL << 9)
 #define FAULT_W_FAN2                 (1UL << 10)
@@ -60,8 +59,7 @@ enum WinchState : uint8_t {
 #define FAULT_W_SENSOR_UFH_SUPPLY    (1UL << 15)
 #define FAULT_W_SENSOR_WORKSHOP_AIR  (1UL << 16)
 #define FAULT_W_SENSOR_OUTSIDE_AIR   (1UL << 17)
-#define FAULT_W_SENSOR_INVERTER_TEMP (1UL << 18)
-#define FAULT_W_FIRE_ALARM           (1UL << 19)
+#define FAULT_W_FIRE_ALARM           (1UL << 18)
 
 // H-side faults (in hFaultFlags)
 #define FAULT_H_HEATER_OVERHEAT_WARN (1UL << 0)
@@ -106,29 +104,22 @@ struct __attribute__((packed)) WToHPacket {
     int16_t tempWorkshopAir;
     int16_t tempOutsideAir;
 
-    // Growatt PV/grid (Watts, signed)
-    int16_t pvString1W;
-    int16_t pvString2W;
-    int16_t pvTotalW;
-    int16_t pvExportW;          // positive = exporting to grid
-    int16_t gridImportW;        // positive = importing from grid
-    int16_t loadW;
-
-    // Growatt battery
-    uint8_t  battSOC;           // 0–100 %
-    int16_t  battW;             // positive = charging
-    uint16_t battVoltage_dV;    // ×0.1 V
-
-    // Growatt grid / inverter
-    uint16_t gridVoltage_dV;    // ×0.1 V
-    uint16_t gridFreq_cHz;      // ×0.01 Hz
-    uint16_t energyTodayWh;     // Wh today
-    int16_t  inverterTemp_dC;   // ×0.1 °C, TEMP_FAULT = sensor fault
-    uint8_t  inverterStatus;
-    uint16_t inverterFaultCode;
+    // Growatt inverter data
+    int16_t pv1W;               // PV string 1 power W
+    int16_t pv2W;               // PV string 2 power W
+    int16_t pvOutputW;          // inverter AC output W (PO)
+    int16_t loadW;              // load power W (PL)
+    int16_t pvExportW;          // grid export W (positive = exporting)
+    int16_t gridImportW;        // grid import W (positive = importing)
+    int16_t battVoltage_dV;     // battery voltage ×0.1V
+    uint8_t battSocPct;         // battery SOC %
+    int16_t battChargeW;        // battery net W (positive = charging, negative = discharging)
+    uint8_t growattValid;       // 1 = Growatt data is fresh
+    int16_t dailyGenDeciKwh;    // today's PV generation ×0.1kWh (r57)
 
     // Solar pump
     uint8_t solarPumpDutyPct;
+    uint8_t solarPumpActive;     // 1 = solar loop active (may be suppressed/clocking); 0 = solar stopped
 
     // W-side state
     uint8_t valveStates;        // VSTATE_* bitmask
@@ -186,7 +177,7 @@ struct __attribute__((packed)) HToWPacket {
     int8_t  fanFullTimerDeltaHr;   // +/- hours added to W's full-speed timer (0 = no change)
     int8_t  fanBaseTimerDeltaDay;  // +/- days added to W's base-speed timer (0 = no change)
 
-    // Manual override from page 5
+    // Manual override from page 4
     uint8_t overrideActive;
     uint8_t overrideValves;     // OVER_* bitmask
 
@@ -204,6 +195,9 @@ struct __attribute__((packed)) HToWPacket {
 
     // H faults
     uint32_t hFaultFlags;
+
+    // 2-port valve state (1 = heater cold side / top-of-tank, 0 = mid-tank side)
+    uint8_t twoPortHeaterSide;
 
     // Pump calibration (populated only when DEBUG_SERIAL active; always zero in production)
     uint8_t  calPumpActive;

@@ -1,16 +1,16 @@
-// ============================================================
+﻿// ============================================================
 //  W Controller — Workshop Mega 2560
 //  Controls: solar thermal, UFH pump/valves, vacuum system,
 //            door lock, window winch, PC fans, external lights,
-//            wall fan, Growatt Modbus, inter-controller RS485
+//            wall fan, Growatt inverter Modbus, inter-controller RS485
 // ============================================================
 
 #include <Arduino.h>
 #include <avr/wdt.h>
+#include <Wire.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <Adafruit_INA219.h>
-#include <ModbusMaster.h>
 #include <EEPROM.h>
 
 #include "shared_types.h"
@@ -69,10 +69,14 @@
 #define PIN_MIDPOINT_LED    49   // board4 ch4: 12VDC status LED relay
 // D50–D53: spare (board4 ch5–ch8)
 
-#define PIN_RS485_DE_LINK   46   // MAX485 DE/RE for inter-controller link (HIGH=TX)
-#define PIN_RS485_DE_GROWATT 47  // MAX485 DE/RE for Growatt Modbus (HIGH=TX)
+#define PIN_RS485_DE_LINK   40   // MAX485 DE/RE for inter-controller link (HIGH=TX)
+#define PIN_RS485_DE_GROWATT 47   // MAX485 DE/RE for Growatt Modbus (HIGH=TX)
 #define PIN_SOLAR_PUMP      44   // MOSFET gate via 120Ω: solar pump clocking output
 #define PIN_FAN_PWM         45   // Timer5 OC5B 25kHz PWM: PC fan MOSFET gate
+
+// Active-LOW relay boards: relay energises on LOW, de-energises on HIGH
+#define RELAY_ON  LOW
+#define RELAY_OFF HIGH
 
 // UART assignments
 // UART1 (Serial1 D18/D19): inter-controller RS485 link
@@ -86,7 +90,7 @@
 // Sensor order: solar_hot, solar_cold, UFH_supply, UFH_post_TMV, workshop_air, outside_air
 static const uint8_t DS18B20_ADDRS[6][8] = {
     { 0x28, 0xFE, 0xB5, 0x14, 0x00, 0x00, 0x00, 0xD4 }, // solar hot      (sensor 1)
-    { 0x28, 0x5C, 0x8E, 0x12, 0x00, 0x00, 0x00, 0x1B }, // solar cold     (sensor 2)
+    { 0x28, 0x64, 0x27, 0x15, 0x00, 0x00, 0x00, 0x11 }, // solar cold     (sensor 2)
     { 0x28, 0xE1, 0xEB, 0x14, 0x00, 0x00, 0x00, 0x9C }, // UFH supply     (sensor 3)
     { 0x28, 0xD1, 0x67, 0x15, 0x00, 0x00, 0x00, 0x14 }, // UFH post TMV   (sensor 4)
     { 0x28, 0x45, 0x77, 0x12, 0x00, 0x00, 0x00, 0x83 }, // workshop air   (sensor 5)
@@ -100,8 +104,9 @@ static const uint8_t DS18B20_ADDRS[6][8] = {
 #define SENSOR_OUTSIDE_AIR  5
 #define NUM_SENSORS         6
 
-// INA219 — solar pump minimum current (amps). Calibrate on-site at 20% below lowest reading.
-static const float SOLAR_PUMP_MIN_CURRENT_A = 0.05f; // TODO: calibrate
+// INA219 — solar pump current limits (amps). Both sampled during ON pulse only.
+static const float SOLAR_PUMP_MIN_CURRENT_A = 1.00f;
+static const float SOLAR_PUMP_MAX_CURRENT_A = 2.00f;
 
 // PC fan minimum duty before stall. Calibrate on-site.
 static const uint8_t FAN_MIN_DUTY_PCT = 20; // TODO: calibrate
@@ -109,8 +114,6 @@ static const uint8_t FAN_MIN_DUTY_PCT = 20; // TODO: calibrate
 // UFH/solar cold valve 30-second power-up wait (conservative; verify during commissioning)
 static const uint16_t VALVE_POWERUP_WAIT_MS = 30000;
 
-// Growatt Modbus slave address (default 1)
-static const uint8_t GROWATT_ADDR = 1;
 
 // ============================================================
 //  SYSTEM CONSTANTS
@@ -119,7 +122,7 @@ static const uint8_t GROWATT_ADDR = 1;
 #define TEMP_SCALE          10    // temps stored as int16 = °C × 10
 #define SOLAR_HOT_MIN_C    180    // 18.0°C — winter solar trigger
 #define SOLAR_DIFF_STOP_C   20    // 2.0°C — stop when hot-cold < this
-#define WINTER_UFH_TARGET_C 200   // 20.0°C — winter solar pump target
+#define WINTER_UFH_TARGET_C 200   // 20.0°C — winter solar hot-side target
 #define FROST_THRESH_C       20   // 2.0°C — frost protection trigger
 #define FROST_STOP_C         80   // 8.0°C — frost protection stop
 #define UFH_PUMP_OFF_C      280   // 28.0°C — stop UFH pump when supply drops here
@@ -128,18 +131,17 @@ static const uint8_t GROWATT_ADDR = 1;
 #define RELOCK_TIMEOUT_MS  300000UL  // 5 minutes
 #define ALARM_DURATION_MS   60000UL  // 1-minute alarm auto-stop
 #define HANDLE_ALERT_NIGHT_MIN_MS 10000UL
-#define GROWATT_POLL_MS     850UL
 #define INTER_CTRL_POLL_MS  250UL
 #define DS18B20_CONV_MS     750UL
 #define RS485_RX_TIMEOUT_MS 150UL
-#define COMMS_FAULT_THRESHOLD 5
+#define COMMS_FAULT_THRESHOLD 20
 #define FAN_RPM_FAULT_DELAY_MS 5000UL
 #define VAC_PUMP_MAX_MS    1800000UL // 30 minutes
 #define VAC_EXTRA_RUN_MS   300000UL  // 5 extra minutes after full vacuum
 #define VALVE_PULSE_MS      7000UL   // H-bridge valve travel time
 #define LOCK_PULSE_MS       1000UL   // door lock pulse
 #define HBRIDGE_DEAD_MS      200UL   // dead-time between relay changes
-#define SUMMER_MIN_STARTUP_DUTY 5    // 5% — solar pump during summer startup clocking
+#define SUMMER_MIN_STARTUP_DUTY 2    // 2% — solar pump minimum clocking (100ms on / 4900ms off)
 #define FAN_FLAP_OPEN_MS   30000UL   // motorized damper travel time; calibrate on-site
 #define TIME_SYNC_INTERVAL_MS 3600000UL // 1 hour
 #define EEPROM_FAN_BASE_ADDR 0       // EEPROM address for fan base speed
@@ -151,7 +153,6 @@ static const uint8_t GROWATT_ADDR = 1;
 OneWire        oneWire(PIN_ONE_WIRE);
 DallasTemperature sensors(&oneWire);
 Adafruit_INA219 ina219;   // address 0x40
-ModbusMaster    growatt;
 
 // ============================================================
 //  SENSOR STATE
@@ -178,23 +179,25 @@ static inline int16_t tempEncode(float t) {
 // ============================================================
 
 struct GrowattData {
-    int16_t  pvStr1W, pvStr2W, pvTotalW;
-    int16_t  pvExportW, gridImportW, loadW;
-    uint8_t  battSOC;
-    int16_t  battW;
-    uint16_t battVoltage_dV;
-    uint16_t gridVoltage_dV;
-    uint16_t gridFreq_cHz;
-    uint16_t energyTodayWh;
-    int16_t  inverterTemp_dC;
-    uint8_t  inverterStatus;
-    uint16_t inverterFaultCode;
+    int16_t  pv1W;
+    int16_t  pv2W;
+    int16_t  pvOutputW;
+    int16_t  loadW;
+    int16_t  pvExportW;
+    int16_t  gridImportW;
+    int16_t  battVoltage_dV;
+    uint8_t  battSocPct;
+    int16_t  battChargeW;       // positive = charging, negative = discharging
+    int16_t  dailyGenDeciKwh;
     unsigned long lastGoodMs;
     bool     valid;
-} gd;
+} growatt;
 
-uint8_t  growattFailCount = 0;
-unsigned long lastGrowattPollMs = 0;
+bool    simGrowattActive  = false;
+int16_t simGPvOutW        = 0;
+int16_t simGPvExportW     = 0;
+uint8_t simGBattSocPct    = 0;
+int16_t simGBattChargeW   = 0;
 
 // ============================================================
 //  SOLAR PUMP
@@ -213,8 +216,8 @@ unsigned long pumpAboveClockingMs = 0; // time pump stayed above clocking speed
 bool     pumpAboveClocking = false;
 
 // Clocking parameters (updated by heating mode)
-uint16_t pumpClockPeriodMs = 2000;
-uint16_t pumpMinOnMs       = 200;
+uint16_t pumpClockPeriodMs = 5000;
+uint16_t pumpMinOnMs       = 100;
 
 // ============================================================
 //  H-BRIDGE VALVE  (7s pulse, 200ms dead-time)
@@ -234,15 +237,15 @@ struct HBridgeValve {
     void begin(uint8_t a, uint8_t b, uint16_t dur) {
         pinA = a; pinB = b; pulseDurationMs = dur;
         phase = HBP_IDLE; hasPending = false;
-        pinMode(a, OUTPUT); digitalWrite(a, LOW);
-        pinMode(b, OUTPUT); digitalWrite(b, LOW);
+        pinMode(a, OUTPUT); digitalWrite(a, RELAY_OFF);
+        pinMode(b, OUTPUT); digitalWrite(b, RELAY_OFF);
     }
 
     void request(bool open) {
         // Interrupt mid-pulse: drop to dead-time immediately
         if (phase == HBP_PULSING) {
-            digitalWrite(pinA, LOW);
-            digitalWrite(pinB, LOW);
+            digitalWrite(pinA, RELAY_OFF);
+            digitalWrite(pinB, RELAY_OFF);
         }
         pendingOpen   = open;
         hasPending    = true;
@@ -257,15 +260,15 @@ struct HBridgeValve {
             case HBP_DEAD:
                 if (now - phaseStartMs >= HBRIDGE_DEAD_MS) {
                     hasPending = false;
-                    digitalWrite(pendingOpen ? pinA : pinB, HIGH);
+                    digitalWrite(pendingOpen ? pinA : pinB, RELAY_ON);
                     phaseStartMs = now;
                     phase = HBP_PULSING;
                 }
                 break;
             case HBP_PULSING:
                 if (now - phaseStartMs >= pulseDurationMs) {
-                    digitalWrite(pinA, LOW);
-                    digitalWrite(pinB, LOW);
+                    digitalWrite(pinA, RELAY_OFF);
+                    digitalWrite(pinB, RELAY_OFF);
                     isOpen = pendingOpen;
                     phase = HBP_IDLE;
                     if (hasPending) {
@@ -297,8 +300,8 @@ struct DirectionValve {
         pinMode(p, OUTPUT);
         setClose(); // safe default
     }
-    void setOpen()  { digitalWrite(pin, HIGH); isOpen = true; }
-    void setClose() { digitalWrite(pin, LOW);  isOpen = false; }
+    void setOpen()  { digitalWrite(pin, RELAY_ON);  isOpen = true; }
+    void setClose() { digitalWrite(pin, RELAY_OFF); isOpen = false; }
     void set(bool open) { if (open) setOpen(); else setClose(); }
 };
 
@@ -328,16 +331,16 @@ struct WindowWinch {
     void begin() {
         phase = WP_IDLE; activeDir = WINCH_STOP;
         openLockout = false; closeLockout = false;
-        pinMode(PIN_WINCH_DIR_OPEN,  OUTPUT); digitalWrite(PIN_WINCH_DIR_OPEN,  LOW);
-        pinMode(PIN_WINCH_DIR_CLOSE, OUTPUT); digitalWrite(PIN_WINCH_DIR_CLOSE, LOW);
-        pinMode(PIN_WINCH_POWER,     OUTPUT); digitalWrite(PIN_WINCH_POWER,     LOW);
+        pinMode(PIN_WINCH_DIR_OPEN,  OUTPUT); digitalWrite(PIN_WINCH_DIR_OPEN,  RELAY_OFF);
+        pinMode(PIN_WINCH_DIR_CLOSE, OUTPUT); digitalWrite(PIN_WINCH_DIR_CLOSE, RELAY_OFF);
+        pinMode(PIN_WINCH_POWER,     OUTPUT); digitalWrite(PIN_WINCH_POWER,     RELAY_OFF);
     }
 
     // Immediately cut power — no 1s pause. Used by safety triggers.
     void immediateStop() {
-        digitalWrite(PIN_WINCH_DIR_OPEN,  LOW);
-        digitalWrite(PIN_WINCH_DIR_CLOSE, LOW);
-        digitalWrite(PIN_WINCH_POWER,     LOW);
+        digitalWrite(PIN_WINCH_DIR_OPEN,  RELAY_OFF);
+        digitalWrite(PIN_WINCH_DIR_CLOSE, RELAY_OFF);
+        digitalWrite(PIN_WINCH_POWER,     RELAY_OFF);
         phase     = WP_IDLE;
         activeDir = WINCH_STOP;
     }
@@ -349,9 +352,9 @@ struct WindowWinch {
         if (dir == WINCH_CLOSE && closeLockout)             return;
 
         // Cut current movement / ensure all relays off before pause
-        digitalWrite(PIN_WINCH_DIR_OPEN,  LOW);
-        digitalWrite(PIN_WINCH_DIR_CLOSE, LOW);
-        digitalWrite(PIN_WINCH_POWER,     LOW);
+        digitalWrite(PIN_WINCH_DIR_OPEN,  RELAY_OFF);
+        digitalWrite(PIN_WINCH_DIR_CLOSE, RELAY_OFF);
+        digitalWrite(PIN_WINCH_POWER,     RELAY_OFF);
         pendingDir    = dir;
         phaseStartMs  = millis();
         phase         = WP_PAUSE;
@@ -375,9 +378,9 @@ struct WindowWinch {
                 phase = WP_IDLE;
                 return;
             }
-            if (pendingDir == WINCH_OPEN)  digitalWrite(PIN_WINCH_DIR_OPEN,  HIGH);
-            else                            digitalWrite(PIN_WINCH_DIR_CLOSE, HIGH);
-            digitalWrite(PIN_WINCH_POWER, HIGH);
+            if (pendingDir == WINCH_OPEN)  digitalWrite(PIN_WINCH_DIR_OPEN,  RELAY_ON);
+            else                            digitalWrite(PIN_WINCH_DIR_CLOSE, RELAY_ON);
+            digitalWrite(PIN_WINCH_POWER, RELAY_ON);
             activeDir = pendingDir;
             phase     = WP_MOVING;
         }
@@ -534,14 +537,9 @@ bool  simPIRActive       = false, simPIRVal       = false;
 bool  simDoorActive      = false, simDoorVal      = false;
 bool  simWinchClsActive  = false, simWinchClsVal  = false;
 bool  simWinchLockActive = false, simWinchLockVal = false;
+bool  simPumpCurrentActive = false; float simPumpCurrentVal = 0.0f;
 #endif // DEBUG_SERIAL
 
-// ============================================================
-//  GROWATT MODBUS CALLBACKS
-// ============================================================
-
-void preTransmitGrowatt()  { digitalWrite(PIN_RS485_DE_GROWATT, HIGH); }
-void postTransmitGrowatt() { digitalWrite(PIN_RS485_DE_GROWATT, LOW);  }
 
 // ============================================================
 //  SENSOR READING
@@ -609,97 +607,148 @@ void sampleSolarPumpCurrent() {
     if (!pumpOutputState) return;
     if (millis() - pumpOnStartMs < 50) return; // 50ms spin-up delay
     solarPumpCurrentA = ina219.getCurrent_mA() / 1000.0f;
+    if (simPumpCurrentActive) solarPumpCurrentA = simPumpCurrentVal;
     pumpCurrentSampled = true;
 }
 
 // ============================================================
-//  GROWATT MODBUS POLLING
+//  MODBUS CRC16
 // ============================================================
 
-void pollGrowatt() {
-    bool ok = false;
-    uint8_t result;
+static uint16_t sdmCRC16(const uint8_t* buf, uint8_t len) {
+    uint16_t crc = 0xFFFF;
+    for (uint8_t i = 0; i < len; i++) {
+        crc ^= (uint16_t)buf[i];
+        for (uint8_t b = 0; b < 8; b++)
+            crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : (crc >> 1);
+    }
+    return crc;
+}
 
-    // Read input registers 0–38 (PV strings, grid, frequency, voltage, energy)
-    result = growatt.readInputRegisters(0x0000, 39);
-    if (result == ModbusMaster::ku8MBSuccess) {
-        gd.inverterStatus  = (uint8_t)growatt.getResponseBuffer(0);
+// ============================================================
+//  GROWATT PRODUCTION POLLING  (non-blocking state machine)
+//  Phase 0: FC04 @0  x11 → pv1W (r6), pv2W (r10)
+//  Phase 1: FC04 @35 x7  → pvOutputW (r36), loadW (r41)
+//  Phase 2: FC04 @1000 x25 → batt, gridImport, pvExport
+//  Phase 3: FC04 @55 x3  → dailyGenDeciKwh (r57 ×0.1kWh)
+//  Each call either sends a request or collects bytes; never blocks >5ms.
+// ============================================================
 
-        // PV string 1: V=reg3, I=reg4, P=regs5-6 (32-bit, 0.1W units)
-        uint32_t ppv1 = ((uint32_t)growatt.getResponseBuffer(5) << 16)
-                         | growatt.getResponseBuffer(6);
-        gd.pvStr1W = (int16_t)(ppv1 / 100); // convert 0.1W to 10W steps → Watts OK at 1W
+#define GROWATT_STALE_MS  120000UL
 
-        uint32_t ppv2 = ((uint32_t)growatt.getResponseBuffer(9) << 16)
-                         | growatt.getResponseBuffer(10);
-        gd.pvStr2W = (int16_t)(ppv2 / 100);
+static inline int16_t reg16(const uint8_t* data, uint8_t regOffset) {
+    return (int16_t)(((uint16_t)data[regOffset * 2] << 8) | data[regOffset * 2 + 1]);
+}
 
-        // Total output power (regs 35-36, 0.1W)
-        uint32_t pac = ((uint32_t)growatt.getResponseBuffer(35) << 16)
-                        | growatt.getResponseBuffer(36);
-        gd.pvTotalW = (int16_t)(pac / 100);
+void growattPoll() {
+#ifdef DEBUG_SERIAL
+    if (simGrowattActive) {
+        growatt.pvOutputW   = simGPvOutW;
+        growatt.pv1W        = simGPvOutW;
+        growatt.pvExportW   = simGPvExportW;
+        growatt.battSocPct  = simGBattSocPct;
+        growatt.battChargeW = simGBattChargeW;
+        growatt.lastGoodMs  = millis();
+        growatt.valid       = true;
+        clearFault(FAULT_W_GROWATT_COMMS);
+        return;
+    }
+#endif
+    static uint8_t       phase      = 0;
+    static bool          inRecv     = false;
+    static unsigned long sentMs     = 0;
+    static unsigned long lastByteMs = 0;
+    static bool          rxStarted  = false;
+    static uint8_t       rxBuf[96];
+    static uint8_t       rxN        = 0;
 
-        gd.gridFreq_cHz    = growatt.getResponseBuffer(37); // 0.01Hz
-        gd.gridVoltage_dV  = growatt.getResponseBuffer(38); // 0.1V
+    if (!inRecv) {
+        // SEND: drain stale bytes (5ms), then send request
+        { unsigned long t = millis(); while (millis() - t < 5) if (Serial2.available()) Serial2.read(); }
 
-        // Energy today (regs 53-54, 0.1kWh = 100Wh units)
-        uint32_t eToday = ((uint32_t)growatt.getResponseBuffer(53) << 16)
-                           | growatt.getResponseBuffer(54);
-        gd.energyTodayWh = (uint16_t)(eToday * 10); // 0.1kWh → Wh (up to 65535Wh)
+        static const uint16_t phaseReg[4]   = {    0,  35, 1000, 55 };
+        static const uint16_t phaseCount[4] = {   11,   7,   25,  3 };
+        uint16_t startReg = phaseReg[phase];
+        uint16_t count    = phaseCount[phase];
 
-        ok = true;
+        uint8_t req[8];
+        req[0] = 0x01; req[1] = 0x04;
+        req[2] = (uint8_t)(startReg >> 8); req[3] = (uint8_t)startReg;
+        req[4] = (uint8_t)(count >> 8);    req[5] = (uint8_t)count;
+        uint16_t crc = sdmCRC16(req, 6);
+        req[6] = (uint8_t)crc; req[7] = (uint8_t)(crc >> 8);
+
+        digitalWrite(PIN_RS485_DE_GROWATT, HIGH);
+        delayMicroseconds(200);
+        Serial2.write(req, 8); Serial2.flush();
+        delayMicroseconds(200);
+        digitalWrite(PIN_RS485_DE_GROWATT, LOW);
+
+        sentMs     = millis();
+        lastByteMs = millis();
+        rxStarted  = false;
+        rxN        = 0;
+        inRecv     = true;
+        return;
     }
 
-    // Read input registers 1000–1024 (battery + hybrid data)
-    result = growatt.readInputRegisters(0x03E8, 25);
-    if (result == ModbusMaster::ku8MBSuccess) {
-        // Battery discharge (regs 1009-1010, 0.1W)
-        uint32_t battDis = ((uint32_t)growatt.getResponseBuffer(9) << 16)
-                            | growatt.getResponseBuffer(10);
-        // Battery charge (regs 1011-1012, 0.1W)
-        uint32_t battChr = ((uint32_t)growatt.getResponseBuffer(11) << 16)
-                            | growatt.getResponseBuffer(12);
-        // positive = charging, negative = discharging
-        int32_t battWNet = (int32_t)(battChr / 100) - (int32_t)(battDis / 100);
-        gd.battW = (int16_t)constrain(battWNet, -32767, 32767);
+    // RECV: collect bytes this iteration, return if not done
+    while (Serial2.available() && rxN < sizeof(rxBuf)) {
+        uint8_t b = (uint8_t)Serial2.read();
+        if (!rxStarted && b == 0x00) continue;
+        rxStarted = true;
+        rxBuf[rxN++] = b;
+        lastByteMs = millis();
+    }
 
-        gd.battVoltage_dV = growatt.getResponseBuffer(13); // 0.1V
-        gd.battSOC        = (uint8_t)growatt.getResponseBuffer(14); // direct %
+    bool timedOut   = (millis() - sentMs > 120);
+    bool packetDone = rxStarted && (millis() - lastByteMs >= 5);
+    if (!timedOut && !packetDone) return;
 
-        // Grid import (regs 1021-1022, 0.1W)
-        uint32_t gridImp = ((uint32_t)growatt.getResponseBuffer(21) << 16)
-                            | growatt.getResponseBuffer(22);
-        // Grid export (regs 1023-1024, 0.1W)
-        uint32_t gridExp = ((uint32_t)growatt.getResponseBuffer(23) << 16)
-                            | growatt.getResponseBuffer(24);
-        // ⚠ Verify sign convention during commissioning before enabling HEATER_ENABLED
-        gd.gridImportW = (int16_t)(gridImp / 100);
-        gd.pvExportW   = (int16_t)(gridExp / 100);
-
-        // Load = total PV + battery discharge − battery charge − export + import (approx)
-        // Simple calculation; Growatt may provide a dedicated load register in some firmware versions
-        gd.loadW = (int16_t)((int32_t)gd.pvTotalW - gd.pvExportW + gd.gridImportW);
-
-        // Inverter temperature is in register range 0-124; reg not specified in provided list.
-        // Treat as unavailable until confirmed during commissioning.
-        gd.inverterTemp_dC = TEMP_FAULT;
-
-        gd.inverterFaultCode = 0; // TODO: map from status registers once register address confirmed
-
-        ok = true;
+    // Process response
+    bool ok = false;
+    if (rxN >= 5 && rxBuf[0] == 0x01 && !(rxBuf[1] & 0x80)) {
+        uint16_t rxCrc = sdmCRC16(rxBuf, rxN - 2);
+        if ((uint8_t)rxCrc == rxBuf[rxN-2] && (uint8_t)(rxCrc >> 8) == rxBuf[rxN-1]) {
+            uint8_t* data = rxBuf + 3;
+            switch (phase) {
+                case 0:
+                    growatt.pv1W = (int16_t)((uint16_t)reg16(data, 6) / 10);
+                    growatt.pv2W = (int16_t)((uint16_t)reg16(data, 10) / 10);
+                    ok = true; break;
+                case 1:
+                    growatt.pvOutputW = (int16_t)((uint16_t)reg16(data, 1) / 10);
+                    growatt.loadW     = (int16_t)((uint16_t)reg16(data, 6) / 10);
+                    ok = true; break;
+                case 2:
+                    growatt.battVoltage_dV = reg16(data, 13);
+                    growatt.battSocPct     = (uint8_t)reg16(data, 14);
+                    growatt.gridImportW    = (int16_t)((uint16_t)reg16(data, 16) / 10);
+                    growatt.pvExportW      = (int16_t)((uint16_t)reg16(data, 24) / 10);
+                    { int16_t dis = (int16_t)((uint16_t)reg16(data, 10) / 10);
+                      int16_t chg = (int16_t)((uint16_t)reg16(data, 12) / 10);
+                      growatt.battChargeW = chg - dis; }
+                    ok = true; break;
+                case 3:
+                    growatt.dailyGenDeciKwh = reg16(data, 2);
+                    ok = true; break;
+            }
+        }
     }
 
     if (ok) {
-        gd.valid      = true;
-        gd.lastGoodMs = millis();
-        growattFailCount = 0;
+        growatt.lastGoodMs = millis();
+        growatt.valid      = true;
         clearFault(FAULT_W_GROWATT_COMMS);
-    } else {
-        growattFailCount++;
-        if (growattFailCount >= COMMS_FAULT_THRESHOLD) {
-            setFault(FAULT_W_GROWATT_COMMS);
-        }
     }
+
+    if (growatt.valid && millis() - growatt.lastGoodMs > GROWATT_STALE_MS) {
+        growatt.valid = false;
+        setFault(FAULT_W_GROWATT_COMMS);
+    }
+
+    if (++phase >= 4) phase = 0;
+    inRecv = false;
 }
 
 // ============================================================
@@ -880,7 +929,7 @@ void updateVacuum() {
         case VAC_OPENING:
             vacIsoValve.update();
             if (!vacIsoValve.busy()) {
-                digitalWrite(PIN_VAC_PUMP, HIGH);
+                digitalWrite(PIN_VAC_PUMP, RELAY_ON);
                 vacStateEnteredMs = now;
                 vacState = VAC_PUMPING;
             }
@@ -892,7 +941,7 @@ void updateVacuum() {
                 vacState = VAC_FULL;
             } else if (now - vacStateEnteredMs >= VAC_PUMP_MAX_MS) {
                 // Overtime fault
-                digitalWrite(PIN_VAC_PUMP, LOW);
+                digitalWrite(PIN_VAC_PUMP, RELAY_OFF);
                 setFault(FAULT_W_VAC_PUMP_OVERTIME);
                 vacState = VAC_FAULT;
             }
@@ -912,7 +961,7 @@ void updateVacuum() {
             // Valve is closing; stop pump 10 seconds after valve close command
             vacIsoValve.update();
             if (now - vacDoneStartMs >= 10000UL) {
-                digitalWrite(PIN_VAC_PUMP, LOW);
+                digitalWrite(PIN_VAC_PUMP, RELAY_OFF);
                 vacFullThisSession = true;
                 vacState = VAC_IDLE;
             }
@@ -1002,15 +1051,15 @@ void updateWinterSolar(float tankBottomC) {
     if (!solarPumpActive) {
         ufhColdValve.setOpen();
         solarColdValve.setOpen();
-        pumpClockPeriodMs = 2000;
-        pumpMinOnMs       = 200;
+        pumpClockPeriodMs = 5000;
+        pumpMinOnMs       = 100;
         setSolarPumpDuty(0); // starts at clocking minimum in updateSolarPump
         solarPumpActive  = true;
         solarActiveEver  = true;
     }
 
-    // Speed ramp: target = 20°C (UFH circuit temp)
-    uint8_t duty = calcPumpDuty(cold, (float)WINTER_UFH_TARGET_C / 10.0f);
+    // Speed ramp: hot side targets 20°C (like summer but fixed lower target)
+    uint8_t duty = calcPumpDuty(hot, (float)WINTER_UFH_TARGET_C / 10.0f);
     if (duty == 0) duty = 1; // ensure minimum clocking
     setSolarPumpDuty(duty);
 
@@ -1062,7 +1111,7 @@ void updateSummerSolar() {
             // immersion heater in response — this is enforced on the H side.
             ufhColdValve.setOpen();
             solarColdValve.setOpen();
-            digitalWrite(PIN_UFH_PUMP, HIGH);
+            digitalWrite(PIN_UFH_PUMP, RELAY_ON);
             solarDumpActive = true;
         }
         setSolarPumpDuty(100);
@@ -1072,24 +1121,38 @@ void updateSummerSolar() {
 
     if (solarDumpActive) {
         // Sensor fault cleared — stop the dump-mode UFH pump and exit dump state
-        digitalWrite(PIN_UFH_PUMP, LOW);
+        digitalWrite(PIN_UFH_PUMP, RELAY_OFF);
         solarDumpActive = false;
     }
 
     float hot     = sTemp[SENSOR_SOLAR_HOT];
     float cold    = sTemp[SENSOR_SOLAR_COLD];
-    bool pvActive = gd.valid && gd.pvTotalW > 0;
+    // pvActive goes true immediately when PV >= 200W; goes false only after 5 continuous minutes below 200W.
+    // Holds last state during Growatt comms outage. End-of-day also requires arrayLow (panels < 40°C).
+    static bool          lastPvActive    = false;
+    static unsigned long pvBelowStartMs  = 0;
+    if (growatt.valid) {
+        if ((growatt.pv1W + growatt.pv2W) >= 200) {
+            lastPvActive   = true;
+            pvBelowStartMs = 0;
+        } else {
+            if (pvBelowStartMs == 0) pvBelowStartMs = millis();
+            if (millis() - pvBelowStartMs >= 300000UL) lastPvActive = false;
+        }
+    }
+    bool pvActive = lastPvActive;
 
-    // Summer solar startup condition (PV export >= 500W or solar >= 50°C)
-    bool startTrigger = (gd.valid && gd.pvExportW >= 500)
-                         || hot >= 50.0f || cold >= 50.0f;
+    // Summer solar startup condition (PV export >= 500W, solar >= 50°C, or heater powered)
+    bool startTrigger = (growatt.valid && growatt.pvExportW >= 500)
+                         || hot >= 50.0f || cold >= 50.0f
+                         || (hasHPacket && lastH.heaterPowerPct > 0);
 
     if (!startTrigger && !solarPumpActive) return;
 
     if (startTrigger && !summerSeqDone && summerPhase == SUMPH_IDLE) {
         summerPhase = SUMPH_CIRCULATE_TOP;
-        pumpClockPeriodMs = 20000;
-        pumpMinOnMs       = 500;
+        pumpClockPeriodMs = 5000;
+        pumpMinOnMs       = 100;
         solarColdValve.setOpen();
         ufhColdValve.setClose(); // UFH cold stays closed in summer; opens only for fault dump
         setSolarPumpDuty(SUMMER_MIN_STARTUP_DUTY);
@@ -1119,8 +1182,8 @@ void updateSummerSolar() {
         heaterTarget = 89.0f;
         if (!solarPumpActive) {
             solarColdValve.setOpen();
-            pumpClockPeriodMs = 20000;
-            pumpMinOnMs       = 500;
+            pumpClockPeriodMs = 4800;
+            pumpMinOnMs       = 100;
             solarPumpActive   = true;
             solarActiveEver   = true;
         }
@@ -1136,13 +1199,34 @@ void updateSummerSolar() {
     }
 
     uint8_t duty = max(dutySolar, dutyHeater);
-    if (duty == 0 && solarPumpActive) duty = SUMMER_MIN_STARTUP_DUTY; // keep clocking
-    setSolarPumpDuty(duty);
-
-    // Overspeed overheat fault (same as winter)
     bool tankBotStale = !hasHPacket || (millis() - lastRxMs > 10000UL)
                          || lastH.tempTankBot == TEMP_FAULT;
     float tankBotC    = tankBotStale ? 0.0f : (float)lastH.tempTankBot / 10.0f;
+
+    if (duty == 0 && solarPumpActive) {
+        bool heaterPowered    = hasHPacket && lastH.heaterPowerPct > 0;
+        bool bothBelowTankBot = !tankBotStale
+                                && !sFault[SENSOR_SOLAR_HOT] && !sFault[SENSOR_SOLAR_COLD]
+                                && hot < tankBotC && cold < tankBotC;
+        if (heaterPowered) {
+            // Heater powered: always keep minimum clocking regardless of temperatures
+            duty = SUMMER_MIN_STARTUP_DUTY;
+        } else if (!bothBelowTankBot) {
+            // Solar pipes not both below tank bottom: apply normal suppression logic.
+            // Suppress only when 2-port on heater side, solar far below target, heater off.
+            // Never suppress during startup: H needs pump running to advance phase sequence.
+            bool twoPortHeater = hasHPacket && lastH.twoPortHeaterSide;
+            bool heaterOff     = !hasHPacket || lastH.heaterPowerPct == 0;
+            bool solarFarBelow = !sFault[SENSOR_SOLAR_HOT] && !sFault[SENSOR_SOLAR_COLD]
+                                 && hot  < solarTarget - 15.0f
+                                 && cold < solarTarget - 15.0f;
+            if (!summerSeqDone || !(twoPortHeater && heaterOff && solarFarBelow)) duty = SUMMER_MIN_STARTUP_DUTY;
+        }
+        // else: both solar pipes below tank bottom, heater off → allow duty = 0 (pump stops)
+    }
+    setSolarPumpDuty(duty);
+
+    // Overspeed overheat fault (same as winter)
     bool pumpAboveMin = (duty > SUMMER_MIN_STARTUP_DUTY);
     if (pumpAboveMin && !tankBotStale && !sFault[SENSOR_SOLAR_COLD]) {
         float cold2 = sTemp[SENSOR_SOLAR_COLD];
@@ -1171,13 +1255,12 @@ void updateSummerSolar() {
         ufhColdValve.setClose();
     }
 
-    // End-of-day abort (all phases): PV gone + pipe differential lost + array below 45°C.
+    // End-of-day abort (all phases): PV < 200W + differential < 6°C + both pipes below 40°C.
     // Sensor faults default to abort-condition-met (cannot confirm heat present).
-    // 45°C threshold gives hysteresis below the 50°C start trigger.
     bool pipeCool = sFault[SENSOR_SOLAR_HOT] || sFault[SENSOR_SOLAR_COLD]
-                     || (hot - cold) < 5.0f;
+                     || (hot - cold) < 6.0f;
     bool arrayLow = sFault[SENSOR_SOLAR_HOT] || sFault[SENSOR_SOLAR_COLD]
-                     || hot < 45.0f || cold < 45.0f;
+                     || (hot < 40.0f && cold < 40.0f);
     if (!pvActive && pipeCool && arrayLow) {
         solarColdValve.setClose();
         ufhColdValve.setClose();
@@ -1203,7 +1286,7 @@ void updateUFHHeating() {
         float postTMV = sTemp[SENSOR_UFH_POST_TMV];
         if (ufhState != WUFH_IDLE && postTMV > 45.0f) {
             setSolarPumpDuty(0);
-            digitalWrite(PIN_UFH_PUMP, LOW);
+            digitalWrite(PIN_UFH_PUMP, RELAY_OFF);
             ufhColdValve.setClose();
             ufhHardLockout = true;
             setFault(FAULT_W_UFH_OVERHEAT);
@@ -1227,7 +1310,7 @@ void updateUFHHeating() {
 
     if (!morningActive) {
         if (ufhState == WUFH_ACTIVE || ufhState == WUFH_COOLING) {
-            digitalWrite(PIN_UFH_PUMP, LOW);
+            digitalWrite(PIN_UFH_PUMP, RELAY_OFF);
             if (ufhState == WUFH_ACTIVE) ufhColdValve.setClose();
             ufhState = WUFH_IDLE;
         }
@@ -1239,7 +1322,7 @@ void updateUFHHeating() {
             if (ufhHardLockout) break;
             if (!isnan(wAir) && wAir < stopTempC) {
                 ufhColdValve.setOpen();
-                digitalWrite(PIN_UFH_PUMP, HIGH);
+                digitalWrite(PIN_UFH_PUMP, RELAY_ON);
                 ufhState = WUFH_ACTIVE;
             } else {
                 // Already at or above target
@@ -1258,7 +1341,7 @@ void updateUFHHeating() {
         case WUFH_COOLING:
             // Keep pump running until UFH supply (return) drops below 28°C
             if (!sFault[SENSOR_UFH_SUPPLY] && ufhSupply < 28.0f) {
-                digitalWrite(PIN_UFH_PUMP, LOW);
+                digitalWrite(PIN_UFH_PUMP, RELAY_OFF);
                 ufhColdValve.setClose();
                 ufhState = WUFH_LOCKED;
             }
@@ -1307,7 +1390,9 @@ void updateSecurity() {
     bool winchSecured = (digitalRead(PIN_WINCH_REED_CLOSE) == HIGH)
                      && (digitalRead(PIN_WINCH_REED_LOCK)  == HIGH);
 #endif
-    bool unlockBtn    = (digitalRead(PIN_UNLOCK_BTN)    == HIGH);
+    // D10 is shared with midpoint LED wire: mask button when LED relay is energised (RELAY_ON=LOW)
+    bool unlockBtn    = (digitalRead(PIN_UNLOCK_BTN)    == HIGH)
+                     && (digitalRead(PIN_MIDPOINT_LED) == RELAY_OFF);
     bool lightBtn     = (digitalRead(PIN_LIGHT_BTN)     == HIGH);
     unsigned long now = millis();
 
@@ -1323,7 +1408,7 @@ void updateSecurity() {
     static bool prevLightBtn = false;
     if (!fireAlarmActive && lightBtn && !prevLightBtn) {
         extLightsOn = !extLightsOn;
-        digitalWrite(PIN_EXT_LIGHTS, extLightsOn ? HIGH : LOW);
+        digitalWrite(PIN_EXT_LIGHTS, extLightsOn ? RELAY_ON : RELAY_OFF);
     }
     prevLightBtn = lightBtn;
 
@@ -1354,13 +1439,13 @@ void updateSecurity() {
         alarmActive   = true;
         alarmStartMs  = now;
         buzzerActive  = true; // relay at W + signal to H
-        digitalWrite(PIN_ALARM_SOUNDER, HIGH);
+        digitalWrite(PIN_ALARM_SOUNDER, RELAY_ON);
     }
     if (alarmActive) {
         if (!pirActive || now - alarmStartMs >= ALARM_DURATION_MS) {
             // Auto-stop after 1 minute; stop immediately if PIR clears
             if (now - alarmStartMs >= ALARM_DURATION_MS) {
-                digitalWrite(PIN_ALARM_SOUNDER, LOW);
+                digitalWrite(PIN_ALARM_SOUNDER, RELAY_OFF);
                 alarmActive = false;
             }
         }
@@ -1399,7 +1484,7 @@ void updateSecurity() {
                  || hasFault(FAULT_W_SOLAR_PUMP)
                  || fireAlarmActive;
 
-    digitalWrite(PIN_BUZZER_SIGNAL, buzzerActive ? HIGH : LOW);
+    digitalWrite(PIN_BUZZER_SIGNAL, buzzerActive ? RELAY_ON : RELAY_OFF);
     doorLock.update();
 }
 
@@ -1472,8 +1557,8 @@ void updateNightCooling() {
     static unsigned long nfFlapMs  = 0;
 
     auto nightFanOff = [&]() {
-        digitalWrite(PIN_WALL_FAN, LOW);
-        digitalWrite(PIN_FAN_FLAP, LOW);
+        digitalWrite(PIN_WALL_FAN, RELAY_OFF);
+        digitalWrite(PIN_FAN_FLAP, RELAY_OFF);
         nfState = NF_OFF;
     };
 
@@ -1492,7 +1577,7 @@ void updateNightCooling() {
     switch (nfState) {
         case NF_OFF:
             if (gap >= 5.0f) {
-                digitalWrite(PIN_FAN_FLAP, HIGH);
+                digitalWrite(PIN_FAN_FLAP, RELAY_ON);
                 nfFlapMs = millis();
                 nfState  = NF_FLAP_OPENING;
             }
@@ -1501,7 +1586,7 @@ void updateNightCooling() {
             if (gap <= 2.0f) {
                 nightFanOff();
             } else if (millis() - nfFlapMs >= FAN_FLAP_OPEN_MS) {
-                digitalWrite(PIN_WALL_FAN, HIGH);
+                digitalWrite(PIN_WALL_FAN, RELAY_ON);
                 nfState = NF_ON;
             }
             break;
@@ -1555,8 +1640,8 @@ void updateFireAlarm() {
         firePhase = FIRE_IDLE;
         fireAlarmActive = false;
         fireCycle = 0;
-        digitalWrite(PIN_ALARM_SOUNDER, LOW);
-        digitalWrite(PIN_EXT_LIGHTS, extLightsOn ? HIGH : LOW); // restore to pre-alarm state
+        digitalWrite(PIN_ALARM_SOUNDER, RELAY_OFF);
+        digitalWrite(PIN_EXT_LIGHTS, extLightsOn ? RELAY_ON : RELAY_OFF); // restore to pre-alarm state
         clearFault(FAULT_W_FIRE_ALARM);
         return;
     }
@@ -1576,7 +1661,7 @@ void updateFireAlarm() {
 
     // Flash D30 at 250ms while alarm active
     bool flashOn = ((now / 250UL) % 2) == 0;
-    digitalWrite(PIN_EXT_LIGHTS, flashOn ? HIGH : LOW);
+    digitalWrite(PIN_EXT_LIGHTS, flashOn ? RELAY_ON : RELAY_OFF);
 
     updateFireRateCheck(now);
 
@@ -1587,13 +1672,13 @@ void updateFireAlarm() {
                 firePhase        = FIRE_SOUNDER_ON;
                 firePhaseStartMs = now;
                 fireCycle        = 1;
-                digitalWrite(PIN_ALARM_SOUNDER, HIGH);
+                digitalWrite(PIN_ALARM_SOUNDER, RELAY_ON);
             }
             break;
 
         case FIRE_SOUNDER_ON:
             if (now - firePhaseStartMs >= 60000UL) {
-                digitalWrite(PIN_ALARM_SOUNDER, LOW);
+                digitalWrite(PIN_ALARM_SOUNDER, RELAY_OFF);
                 firePhase        = FIRE_SOUNDER_OFF;
                 firePhaseStartMs = now;
             }
@@ -1607,7 +1692,7 @@ void updateFireAlarm() {
                     fireCycle++;
                     firePhase        = FIRE_SOUNDER_ON;
                     firePhaseStartMs = now;
-                    digitalWrite(PIN_ALARM_SOUNDER, HIGH);
+                    digitalWrite(PIN_ALARM_SOUNDER, RELAY_ON);
                 }
             }
             break;
@@ -1628,7 +1713,7 @@ void updateMidpointLED() {
     unsigned long now = millis();
     if (fireAlarmActive) {
         bool flashOn = ((now / 250UL) % 2) == 0;
-        digitalWrite(PIN_MIDPOINT_LED, flashOn ? HIGH : LOW);
+        digitalWrite(PIN_MIDPOINT_LED, flashOn ? RELAY_ON : RELAY_OFF);
         return;
     }
     bool anyFault       = (wFaultFlags != 0) || (hasHPacket && lastH.hFaultFlags != 0);
@@ -1649,20 +1734,20 @@ void updateMidpointLED() {
             ledBlinkHigh = !ledBlinkHigh;
             ledBlinkMs   = now;
         }
-        digitalWrite(PIN_MIDPOINT_LED, ledBlinkHigh ? HIGH : LOW);
+        digitalWrite(PIN_MIDPOINT_LED, ledBlinkHigh ? RELAY_ON : RELAY_OFF);
     } else if (manualHeaterOn) {
         // Priority 2: 1s on / 5s off
         if (now - ledBlinkMs >= (ledBlinkHigh ? 1000UL : 5000UL)) {
             ledBlinkHigh = !ledBlinkHigh;
             ledBlinkMs   = now;
         }
-        digitalWrite(PIN_MIDPOINT_LED, ledBlinkHigh ? HIGH : LOW);
+        digitalWrite(PIN_MIDPOINT_LED, ledBlinkHigh ? RELAY_ON : RELAY_OFF);
     } else if (!workshopLocked) {
         // Priority 3: steady on
-        digitalWrite(PIN_MIDPOINT_LED, HIGH);
+        digitalWrite(PIN_MIDPOINT_LED, RELAY_ON);
     } else {
         // Priority 4: off
-        digitalWrite(PIN_MIDPOINT_LED, LOW);
+        digitalWrite(PIN_MIDPOINT_LED, RELAY_OFF);
     }
 }
 
@@ -1671,28 +1756,54 @@ void updateMidpointLED() {
 // ============================================================
 
 void checkSolarPumpFault() {
-    if (!pumpOutputState || pumpTargetDuty == 0) {
+    static unsigned long faultStartMs    = 0;
+    static unsigned long ocStartMs       = 0;
+    static bool          dumpValveOpened = false;
+
+    auto clearPumpFault = [&]() {
+        if (dumpValveOpened) {
+            ufhColdValve.setClose();
+            dumpValveOpened = false;
+        }
+        faultStartMs = 0;
         clearFault(FAULT_W_SOLAR_PUMP);
+    };
+
+    if (!pumpOutputState || pumpTargetDuty == 0) {
+        clearPumpFault();
+        ocStartMs = 0;
+        clearFault(FAULT_W_SOLAR_PUMP_OVERCURRENT);
         return;
     }
     if (!pumpCurrentSampled) return;
 
-    static unsigned long faultStartMs = 0;
+    // Overcurrent — stop pump immediately after 2s to protect motor
+    if (solarPumpCurrentA > SOLAR_PUMP_MAX_CURRENT_A) {
+        if (ocStartMs == 0) ocStartMs = millis();
+        if (millis() - ocStartMs > 3000UL) {
+            setFault(FAULT_W_SOLAR_PUMP_OVERCURRENT);
+            setSolarPumpDuty(0);
+        }
+    } else {
+        ocStartMs = 0;
+        clearFault(FAULT_W_SOLAR_PUMP_OVERCURRENT);
+    }
+
+    // Undercurrent (stall) — open dump valves after 5s
     if (solarPumpCurrentA < SOLAR_PUMP_MIN_CURRENT_A) {
         if (faultStartMs == 0) faultStartMs = millis();
-        if (millis() - faultStartMs > 5000UL) {
+        if (millis() - faultStartMs > 3000UL) {
             setFault(FAULT_W_SOLAR_PUMP);
-            // UFH dump if both sides ≤ 90°C
             if (!sFault[SENSOR_SOLAR_HOT] && !sFault[SENSOR_SOLAR_COLD]) {
                 if (sTemp[SENSOR_SOLAR_HOT] <= 90.0f && sTemp[SENSOR_SOLAR_COLD] <= 90.0f) {
                     ufhColdValve.setOpen();
                     solarColdValve.setOpen();
+                    dumpValveOpened = true;
                 }
             }
         }
     } else {
-        faultStartMs = 0;
-        clearFault(FAULT_W_SOLAR_PUMP);
+        clearPumpFault();
     }
     pumpCurrentSampled = false;
 }
@@ -1713,26 +1824,23 @@ void sendWToHPacket() {
     pkt.tempWorkshopAir = sFault[SENSOR_WORKSHOP_AIR] ? TEMP_FAULT : (int16_t)(sTemp[SENSOR_WORKSHOP_AIR] * 10);
     pkt.tempOutsideAir  = sFault[SENSOR_OUTSIDE_AIR]  ? TEMP_FAULT : (int16_t)(sTemp[SENSOR_OUTSIDE_AIR]  * 10);
 
-    // Growatt data
-    if (gd.valid) {
-        pkt.pvString1W        = gd.pvStr1W;
-        pkt.pvString2W        = gd.pvStr2W;
-        pkt.pvTotalW          = gd.pvTotalW;
-        pkt.pvExportW         = gd.pvExportW;
-        pkt.gridImportW       = gd.gridImportW;
-        pkt.loadW             = gd.loadW;
-        pkt.battSOC           = gd.battSOC;
-        pkt.battW             = gd.battW;
-        pkt.battVoltage_dV    = gd.battVoltage_dV;
-        pkt.gridVoltage_dV    = gd.gridVoltage_dV;
-        pkt.gridFreq_cHz      = gd.gridFreq_cHz;
-        pkt.energyTodayWh     = gd.energyTodayWh;
-        pkt.inverterTemp_dC   = gd.inverterTemp_dC;
-        pkt.inverterStatus    = gd.inverterStatus;
-        pkt.inverterFaultCode = gd.inverterFaultCode;
+    // Growatt inverter data
+    pkt.growattValid    = growatt.valid ? 1 : 0;
+    if (growatt.valid) {
+        pkt.pv1W            = growatt.pv1W;
+        pkt.pv2W            = growatt.pv2W;
+        pkt.pvOutputW       = growatt.pvOutputW;
+        pkt.loadW           = growatt.loadW;
+        pkt.pvExportW       = growatt.pvExportW;
+        pkt.gridImportW     = growatt.gridImportW;
+        pkt.battVoltage_dV  = growatt.battVoltage_dV;
+        pkt.battSocPct      = growatt.battSocPct;
+        pkt.battChargeW     = growatt.battChargeW;
+        pkt.dailyGenDeciKwh = growatt.dailyGenDeciKwh;
     }
 
-    pkt.solarPumpDutyPct = pumpTargetDuty;
+    pkt.solarPumpDutyPct  = pumpTargetDuty;
+    pkt.solarPumpActive   = solarPumpActive ? 1 : 0;
 
     // Valve state bitmask
     if (ufhColdValve.isOpen)      pkt.valveStates |= VSTATE_UFH_COLD_OPEN;
@@ -1887,6 +1995,21 @@ static void dbgScan() {
     else { Serial.print(F("  total: ")); Serial.println(count); }
 }
 
+static void dbgI2CScan() {
+    Serial.println(F("Scanning I2C bus..."));
+    uint8_t found = 0;
+    for (uint8_t addr = 1; addr < 127; addr++) {
+        Wire.beginTransmission(addr);
+        if (Wire.endTransmission() == 0) {
+            Serial.print(F("  0x")); if (addr < 0x10) Serial.print(F("0"));
+            Serial.println(addr, HEX);
+            found++;
+        }
+    }
+    if (found == 0) Serial.println(F("  none found"));
+    else { Serial.print(F("  total: ")); Serial.println(found); }
+}
+
 static void dbgPrintTemp(uint8_t i, const __FlashStringHelper* name) {
     Serial.print(F("  ")); Serial.print(name); Serial.print(F(": "));
     if (sSimulate[i]) Serial.print(F("SIM "));
@@ -1921,8 +2044,7 @@ static void dbgFaults() {
     WF(FAULT_W_UFH_OVERHEAT,         "UFH_OVERHEAT")
     WF(FAULT_W_FROST_NOT_RECOVERING, "FROST_NOT_RECOVERING")
     WF(FAULT_W_VAC_PUMP_OVERTIME,    "VAC_PUMP_OVERTIME")
-    WF(FAULT_W_GROWATT_COMMS,        "GROWATT_COMMS")
-    WF(FAULT_W_INVERTER_FAULT,       "INVERTER_FAULT")
+    WF(FAULT_W_GROWATT_COMMS,         "SDM230_COMMS")
     WF(FAULT_W_RS485_COMMS,          "RS485_COMMS")
     WF(FAULT_W_FAN1,                 "FAN1")
     WF(FAULT_W_FAN2,                 "FAN2")
@@ -1933,7 +2055,6 @@ static void dbgFaults() {
     WF(FAULT_W_SENSOR_UFH_POST_TMV,  "SENSOR_UFH_POST_TMV")
     WF(FAULT_W_SENSOR_WORKSHOP_AIR,  "SENSOR_WORKSHOP_AIR")
     WF(FAULT_W_SENSOR_OUTSIDE_AIR,   "SENSOR_OUTSIDE_AIR")
-    WF(FAULT_W_SENSOR_INVERTER_TEMP, "SENSOR_INVERTER_TEMP")
     #undef WF
     if (!any) Serial.println(F("  none"));
 }
@@ -1951,12 +2072,23 @@ static void dbgMode() {
     Serial.print(F("  workshop:    ")); Serial.println(workshopLocked ? F("locked") : F("unlocked"));
     Serial.print(F("  rs485:       ")); Serial.println(rs485CommsFault ? F("FAULT") : F("ok"));
     Serial.print(F("  time_synced: ")); Serial.println(timeSynced ? F("yes") : F("no"));
+    Serial.print(F("  growatt:     "));
+    if (simGrowattActive) {
+        Serial.print(F("SIM pv_out=")); Serial.print(simGPvOutW);
+        Serial.print(F(" export=")); Serial.print(simGPvExportW);
+        Serial.print(F(" soc=")); Serial.print(simGBattSocPct);
+        Serial.print(F("% charge=")); Serial.println(simGBattChargeW);
+    } else {
+        Serial.println(growatt.valid ? F("live") : F("no data"));
+    }
 }
 
 static void dbgPump() {
     Serial.print(F("  duty:      ")); Serial.println(pumpTargetDuty);
     Serial.print(F("  output:    ")); Serial.println(pumpOutputState ? F("ON") : F("OFF"));
-    Serial.print(F("  current_A: ")); Serial.println(solarPumpCurrentA, 3);
+    Serial.print(F("  current_A: ")); Serial.print(solarPumpCurrentA, 3);
+    if (simPumpCurrentActive) Serial.print(F(" (SIM)"));
+    Serial.println();
     Serial.print(F("  active:    ")); Serial.println(solarPumpActive ? F("yes") : F("no"));
 }
 
@@ -1983,20 +2115,132 @@ static void dbgSecurity() {
     if (simWinchLockActive) { Serial.print(F("  SIM winch_lock=")); Serial.println(simWinchLockVal); }
 }
 
-static void dbgGrowatt() {
-    if (!gd.valid) { Serial.println(F("  no Growatt data")); return; }
-    Serial.print(F("  pv1=")); Serial.print(gd.pvStr1W);
-    Serial.print(F("W  pv2=")); Serial.print(gd.pvStr2W);
-    Serial.print(F("W  tot=")); Serial.print(gd.pvTotalW); Serial.println(F("W"));
-    Serial.print(F("  export=")); Serial.print(gd.pvExportW);
-    Serial.print(F("W  import=")); Serial.print(gd.gridImportW); Serial.println(F("W"));
-    Serial.print(F("  batt_soc=")); Serial.print(gd.battSOC);
-    Serial.print(F("%  batt_w=")); Serial.print(gd.battW); Serial.println(F("W"));
-    Serial.print(F("  grid=")); Serial.print(gd.gridVoltage_dV / 10.0f, 1);
-    Serial.print(F("V  freq=")); Serial.print(gd.gridFreq_cHz / 100.0f, 2); Serial.println(F("Hz"));
-    Serial.print(F("  inv_status=")); Serial.print(gd.inverterStatus);
-    Serial.print(F("  fault_code=")); Serial.println(gd.inverterFaultCode);
+// Send one Modbus request to Growatt and print the raw response.
+// Uses Serial2 with DE pin driven active for TX, returns to passive (LOW) after.
+static void growattReadRaw(uint8_t fc, uint16_t startReg, uint16_t count) {
+    uint8_t req[8];
+    req[0] = 0x01;
+    req[1] = fc;
+    req[2] = (uint8_t)(startReg >> 8);
+    req[3] = (uint8_t)(startReg);
+    req[4] = (uint8_t)(count >> 8);
+    req[5] = (uint8_t)(count);
+    uint16_t crc = sdmCRC16(req, 6);
+    req[6] = (uint8_t)crc;
+    req[7] = (uint8_t)(crc >> 8);
+
+    // Drain, ignoring 0x00 idle-bus noise. Wait for 30ms with no non-zero bytes.
+    // If non-zero bytes keep arriving for >500ms another master owns the bus.
+    // Mandatory 50ms drain first — absorbs any trailing bytes from the previous exchange
+    // that arrive in transit after the previous call returned.
+    { unsigned long t = millis(); while (millis() - t < 50) if (Serial2.available()) Serial2.read(); }
+    {
+        unsigned long quietStart = millis();
+        unsigned long giveUp = millis();
+        while (millis() - quietStart < 30) {
+            if (Serial2.available()) {
+                uint8_t b = Serial2.read();
+                if (b != 0x00) quietStart = millis(); // only real data resets the timer
+            }
+            if (millis() - giveUp > 500) {
+                Serial.println(F("    (bus busy - no quiet window)"));
+                return;
+            }
+        }
+    }
+
+    digitalWrite(PIN_RS485_DE_GROWATT, HIGH);
+    delayMicroseconds(200);
+    Serial2.write(req, 8);
+    Serial2.flush();
+    delayMicroseconds(200);
+    digitalWrite(PIN_RS485_DE_GROWATT, LOW);
+
+    // Collect response; skip leading 0x00 idle bytes, stop after 5ms gap or 300ms total.
+    uint8_t buf[96];
+    uint8_t n = 0;
+    unsigned long t0 = millis();
+    unsigned long lastByte = millis();
+    bool started = false;
+    while (millis() - t0 < 300 && n < sizeof(buf)) {
+        if (Serial2.available()) {
+            uint8_t b = (uint8_t)Serial2.read();
+            if (!started && b == 0x00) continue; // skip idle noise before response
+            started = true;
+            buf[n++] = b;
+            lastByte = millis(); // track ALL bytes — zero register values must not trigger gap
+        } else if (started && millis() - lastByte > 5) break;
+    }
+    wdt_reset();
+
+    Serial.print(F("  FC0")); Serial.print(fc, HEX);
+    Serial.print(F(" @")); Serial.print(startReg);
+    Serial.print(F(" x")); Serial.print(count);
+    Serial.print(F(": [")); Serial.print(n); Serial.print(F("] "));
+    for (uint8_t i = 0; i < n; i++) {
+        if (buf[i] < 0x10) Serial.print('0');
+        Serial.print(buf[i], HEX); Serial.print(' ');
+    }
+    Serial.println();
+
+    if (n < 5) { Serial.println(F("    (no/short response)")); return; }
+    if (buf[0] != 0x01) { Serial.print(F("    (wrong addr ")); Serial.print(buf[0]); Serial.println(')'); return; }
+    if (buf[1] & 0x80)  { Serial.print(F("    (exception ")); Serial.print(buf[2]); Serial.println(')'); return; }
+
+    uint16_t rxCrc = sdmCRC16(buf, n - 2);
+    bool crcOk = ((rxCrc & 0xFF) == buf[n-2]) && ((rxCrc >> 8) == buf[n-1]);
+    Serial.print(F("    crc ")); Serial.println(crcOk ? F("ok") : F("FAIL (registers may be truncated)"));
+    if (buf[2] == 0) return;
+
+    // Decode however many complete register pairs we actually received.
+    uint8_t bc = buf[2];
+    uint8_t available = (n > 3) ? (n - 3) : 0; // data bytes in buf
+    if (available > bc) available = bc;          // cap at declared byteCount
+    available &= ~1;                             // round down to complete pair
+    for (uint8_t i = 0; i + 1 < available; i += 2) {
+        uint16_t val = ((uint16_t)buf[3+i] << 8) | buf[3+i+1];
+        Serial.print(F("    r")); Serial.print(startReg + i/2);
+        Serial.print(F(" = 0x")); Serial.print(val, HEX);
+        Serial.print(F(" (")); Serial.print(val); Serial.println(')');
+    }
 }
+
+// Passively listen for 2s and dump everything that arrives — diagnose bus traffic.
+static void growattListen() {
+    Serial.println(F("  [listening 2s]"));
+    uint8_t buf[128];
+    uint8_t n = 0;
+    unsigned long t0 = millis();
+    while (millis() - t0 < 2000 && n < sizeof(buf)) {
+        if (Serial2.available()) buf[n++] = (uint8_t)Serial2.read();
+    }
+    wdt_reset();
+    Serial.print(F("  [")); Serial.print(n); Serial.print(F(" bytes] "));
+    for (uint8_t i = 0; i < n; i++) {
+        if (buf[i] < 0x10) Serial.print('0');
+        Serial.print(buf[i], HEX); Serial.print(' ');
+    }
+    Serial.println();
+}
+
+static void dbgGrowatt() {
+    // FC04 input registers: real-time PV, battery, grid
+    Serial.println(F("  [FC04 0-11: PV / status]"));
+    growattReadRaw(0x04,    0, 12);
+    Serial.println(F("  [FC04 10-34: gap]"));
+    growattReadRaw(0x04,   10, 25);
+    Serial.println(F("  [FC04 35-54: output / grid power]"));
+    growattReadRaw(0x04,   35, 20);
+    Serial.println(F("  [FC04 55-74: extended]"));
+    growattReadRaw(0x04,   55, 20);
+    Serial.println(F("  [FC04 80-109: energy totals]"));
+    growattReadRaw(0x04,   80, 30);
+    Serial.println(F("  [FC04 1000-1029: battery / grid block]"));
+    growattReadRaw(0x04, 1000, 30);
+    Serial.println(F("  [FC04 3000-3019: alt energy block]"));
+    growattReadRaw(0x04, 3000, 20);
+}
+
 
 static void dbgSet(char* key, char* val) {
     float fval = atof(val);
@@ -2021,6 +2265,13 @@ static void dbgSet(char* key, char* val) {
     if (!strcmp_P(key, PSTR("door_clear")))      { simDoorActive      = false; Serial.println(F("cleared")); return; }
     if (!strcmp_P(key, PSTR("winch_cls_clear"))) { simWinchClsActive  = false; Serial.println(F("cleared")); return; }
     if (!strcmp_P(key, PSTR("winch_lock_clear"))){ simWinchLockActive = false; Serial.println(F("cleared")); return; }
+    if (!strcmp_P(key, PSTR("pv_out")))      { simGrowattActive = true; simGPvOutW      = (int16_t)fval; Serial.println(F("ok")); return; }
+    if (!strcmp_P(key, PSTR("pv_export")))   { simGrowattActive = true; simGPvExportW   = (int16_t)fval; Serial.println(F("ok")); return; }
+    if (!strcmp_P(key, PSTR("batt_soc")))    { simGrowattActive = true; simGBattSocPct  = (uint8_t)fval;  Serial.println(F("ok")); return; }
+    if (!strcmp_P(key, PSTR("batt_charge"))) { simGrowattActive = true; simGBattChargeW = (int16_t)fval; Serial.println(F("ok")); return; }
+    if (!strcmp_P(key, PSTR("growatt_clear"))){ simGrowattActive = false; Serial.println(F("cleared")); return; }
+    if (!strcmp_P(key, PSTR("pump_current")))      { simPumpCurrentActive = true;  simPumpCurrentVal = fval; Serial.println(F("ok")); return; }
+    if (!strcmp_P(key, PSTR("pump_current_clear"))) { simPumpCurrentActive = false; Serial.println(F("cleared")); return; }
     Serial.print(F("unknown key: ")); Serial.println(key);
 }
 
@@ -2037,12 +2288,14 @@ static void handleDebugCommand(char* buf) {
     if (*arg2 == ' ') { *arg2++ = 0; while (*arg2 == ' ') arg2++; }
 
     if      (!strcmp_P(cmd, PSTR("help"))) {
-        Serial.println(F("temps  valves  faults  mode  status  pump  fans  security  growatt"));
-        Serial.println(F("scan  (1-Wire address discovery)"));
+        Serial.println(F("temps  valves  faults  mode  status  pump  fans  security  growatt  growattlisten"));
+        Serial.println(F("scan  (1-Wire address discovery)  i2cscan  (I2C address discovery)"));
         Serial.println(F("set <sensor> <val>  (val=999 clears sim)"));
         Serial.println(F("  sensors: solar_hot solar_cold ufh_supply ufh_post_tmv workshop_air outside_air"));
         Serial.println(F("set pir|door|winch_cls|winch_lock <0|1>"));
         Serial.println(F("set pir_clear|door_clear|winch_cls_clear|winch_lock_clear 0"));
+        Serial.println(F("set pv_out|pv_export|batt_soc|batt_charge <val>  (Growatt sim)"));
+        Serial.println(F("set growatt_clear 0  (clears all Growatt sim)"));
     }
     else if (!strcmp_P(cmd, PSTR("temps")))    dbgTemps();
     else if (!strcmp_P(cmd, PSTR("valves")))   dbgValves();
@@ -2052,8 +2305,10 @@ static void handleDebugCommand(char* buf) {
     else if (!strcmp_P(cmd, PSTR("pump")))     dbgPump();
     else if (!strcmp_P(cmd, PSTR("fans")))     dbgFans();
     else if (!strcmp_P(cmd, PSTR("security"))) dbgSecurity();
-    else if (!strcmp_P(cmd, PSTR("growatt")))  dbgGrowatt();
+    else if (!strcmp_P(cmd, PSTR("growatt")))       dbgGrowatt();
+    else if (!strcmp_P(cmd, PSTR("growattlisten"))) growattListen();
     else if (!strcmp_P(cmd, PSTR("scan")))     dbgScan();
+    else if (!strcmp_P(cmd, PSTR("i2cscan"))) dbgI2CScan();
     else if (!strcmp_P(cmd, PSTR("set")))      dbgSet(arg1, arg2);
     else if (cmd[0] != 0) { Serial.print(F("unknown: ")); Serial.println(cmd); }
 }
@@ -2114,13 +2369,13 @@ void powerUpSafeState() {
     }
 
     // Step 5: Ensure all relay outputs in a known safe state
-    digitalWrite(PIN_UFH_PUMP,       LOW);
-    digitalWrite(PIN_WALL_FAN,       LOW);
-    digitalWrite(PIN_FAN_FLAP,       LOW);
-    digitalWrite(PIN_EXT_LIGHTS,     LOW);
-    digitalWrite(PIN_VAC_PUMP,       LOW);
-    digitalWrite(PIN_ALARM_SOUNDER,  LOW);
-    digitalWrite(PIN_BUZZER_SIGNAL,  LOW);
+    digitalWrite(PIN_UFH_PUMP,       RELAY_OFF);
+    digitalWrite(PIN_WALL_FAN,       RELAY_OFF);
+    digitalWrite(PIN_FAN_FLAP,       RELAY_OFF);
+    digitalWrite(PIN_EXT_LIGHTS,     RELAY_OFF);
+    digitalWrite(PIN_VAC_PUMP,       RELAY_OFF);
+    digitalWrite(PIN_ALARM_SOUNDER,  RELAY_OFF);
+    digitalWrite(PIN_BUZZER_SIGNAL,  RELAY_OFF);
     setSolarPumpDuty(0);
     setFanPWM(0);
 
@@ -2138,29 +2393,29 @@ void setup() {
     Serial.begin(115200);
 #endif
 
-    // Output pins
-    pinMode(PIN_UFH_COLD_DIR,    OUTPUT); digitalWrite(PIN_UFH_COLD_DIR,    LOW);
-    pinMode(PIN_SOLAR_COLD_DIR,  OUTPUT); digitalWrite(PIN_SOLAR_COLD_DIR,  LOW);
-    pinMode(PIN_UFH_PUMP,        OUTPUT); digitalWrite(PIN_UFH_PUMP,        LOW);
-    pinMode(PIN_WALL_FAN,        OUTPUT); digitalWrite(PIN_WALL_FAN,        LOW);
-    pinMode(PIN_FAN_FLAP,        OUTPUT); digitalWrite(PIN_FAN_FLAP,        LOW);
-    pinMode(PIN_DOOR_LOCK_A,     OUTPUT); digitalWrite(PIN_DOOR_LOCK_A,     LOW);
-    pinMode(PIN_EXT_LIGHTS,      OUTPUT); digitalWrite(PIN_EXT_LIGHTS,      LOW);
-    pinMode(PIN_WINCH_DIR_OPEN,  OUTPUT); digitalWrite(PIN_WINCH_DIR_OPEN,  LOW);
-    pinMode(PIN_WINCH_POWER,     OUTPUT); digitalWrite(PIN_WINCH_POWER,     LOW);
-    pinMode(PIN_WINCH_DIR_CLOSE, OUTPUT); digitalWrite(PIN_WINCH_DIR_CLOSE, LOW);
-    pinMode(PIN_MIDPOINT_LED,    OUTPUT); digitalWrite(PIN_MIDPOINT_LED,    LOW);
-    pinMode(PIN_RS485_DE_LINK,   OUTPUT); digitalWrite(PIN_RS485_DE_LINK,   LOW);
-    pinMode(PIN_RS485_DE_GROWATT,OUTPUT); digitalWrite(PIN_RS485_DE_GROWATT,LOW);
-    pinMode(PIN_VAC_ISO_OPEN,    OUTPUT); digitalWrite(PIN_VAC_ISO_OPEN,    LOW);
-    pinMode(PIN_VAC_ISO_CLOSE,   OUTPUT); digitalWrite(PIN_VAC_ISO_CLOSE,   LOW);
-    pinMode(PIN_DOOR_LOCK_B,     OUTPUT); digitalWrite(PIN_DOOR_LOCK_B,     LOW);
-    pinMode(PIN_BUZZER_SIGNAL,   OUTPUT); digitalWrite(PIN_BUZZER_SIGNAL,   LOW);
-    pinMode(PIN_HEN_DOOR_OPEN,   OUTPUT); digitalWrite(PIN_HEN_DOOR_OPEN,   LOW);
-    pinMode(PIN_HEN_DOOR_CLOSE,  OUTPUT); digitalWrite(PIN_HEN_DOOR_CLOSE,  LOW);
-    pinMode(PIN_VAC_PUMP,        OUTPUT); digitalWrite(PIN_VAC_PUMP,        LOW);
-    pinMode(PIN_ALARM_SOUNDER,   OUTPUT); digitalWrite(PIN_ALARM_SOUNDER,   LOW);
-    pinMode(PIN_SOLAR_PUMP,      OUTPUT); digitalWrite(PIN_SOLAR_PUMP,      LOW);
+    // Output pins — set register before pinMode to avoid glitch on active-LOW relay boards
+    pinMode(PIN_UFH_COLD_DIR,    OUTPUT); digitalWrite(PIN_UFH_COLD_DIR,    RELAY_OFF);
+    pinMode(PIN_SOLAR_COLD_DIR,  OUTPUT); digitalWrite(PIN_SOLAR_COLD_DIR,  RELAY_OFF);
+    pinMode(PIN_UFH_PUMP,        OUTPUT); digitalWrite(PIN_UFH_PUMP,        RELAY_OFF);
+    pinMode(PIN_WALL_FAN,        OUTPUT); digitalWrite(PIN_WALL_FAN,        RELAY_OFF);
+    pinMode(PIN_FAN_FLAP,        OUTPUT); digitalWrite(PIN_FAN_FLAP,        RELAY_OFF);
+    pinMode(PIN_DOOR_LOCK_A,     OUTPUT); digitalWrite(PIN_DOOR_LOCK_A,     RELAY_OFF);
+    pinMode(PIN_EXT_LIGHTS,      OUTPUT); digitalWrite(PIN_EXT_LIGHTS,      RELAY_OFF);
+    pinMode(PIN_WINCH_DIR_OPEN,  OUTPUT); digitalWrite(PIN_WINCH_DIR_OPEN,  RELAY_OFF);
+    pinMode(PIN_WINCH_POWER,     OUTPUT); digitalWrite(PIN_WINCH_POWER,     RELAY_OFF);
+    pinMode(PIN_WINCH_DIR_CLOSE, OUTPUT); digitalWrite(PIN_WINCH_DIR_CLOSE, RELAY_OFF);
+    pinMode(PIN_MIDPOINT_LED,    OUTPUT); digitalWrite(PIN_MIDPOINT_LED,    RELAY_OFF);
+    pinMode(PIN_RS485_DE_LINK,   OUTPUT); digitalWrite(PIN_RS485_DE_LINK,   LOW);        // not a relay
+    pinMode(PIN_RS485_DE_GROWATT, OUTPUT); digitalWrite(PIN_RS485_DE_GROWATT, LOW);      // not a relay
+    pinMode(PIN_VAC_ISO_OPEN,    OUTPUT); digitalWrite(PIN_VAC_ISO_OPEN,    RELAY_OFF);
+    pinMode(PIN_VAC_ISO_CLOSE,   OUTPUT); digitalWrite(PIN_VAC_ISO_CLOSE,   RELAY_OFF);
+    pinMode(PIN_DOOR_LOCK_B,     OUTPUT); digitalWrite(PIN_DOOR_LOCK_B,     RELAY_OFF);
+    pinMode(PIN_BUZZER_SIGNAL,   OUTPUT); digitalWrite(PIN_BUZZER_SIGNAL,   RELAY_OFF);
+    pinMode(PIN_HEN_DOOR_OPEN,   OUTPUT); digitalWrite(PIN_HEN_DOOR_OPEN,   RELAY_OFF);
+    pinMode(PIN_HEN_DOOR_CLOSE,  OUTPUT); digitalWrite(PIN_HEN_DOOR_CLOSE,  RELAY_OFF);
+    pinMode(PIN_VAC_PUMP,        OUTPUT); digitalWrite(PIN_VAC_PUMP,        RELAY_OFF);
+    pinMode(PIN_ALARM_SOUNDER,   OUTPUT); digitalWrite(PIN_ALARM_SOUNDER,   RELAY_OFF);
+    pinMode(PIN_SOLAR_PUMP,      OUTPUT); digitalWrite(PIN_SOLAR_PUMP,      LOW);        // MOSFET gate, not relay
 
     // Input pins
     pinMode(PIN_PIR,             INPUT);  // voltage divider, no pull-up
@@ -2185,8 +2440,8 @@ void setup() {
     PCICR  |= (1 << PCIE2);
 
     // RS485 UARTs
-    Serial1.begin(9600); // inter-controller link
-    Serial2.begin(9600); // Growatt Modbus
+    Serial1.begin(9600);             // inter-controller link
+    Serial2.begin(9600); // SDM230/Growatt RS485 — 9600 8N1
 
     // DS18B20
     sensors.begin();
@@ -2205,12 +2460,8 @@ void setup() {
     // INA219
     ina219.begin();
 
-    // Growatt Modbus
-    growatt.begin(GROWATT_ADDR, Serial2);
-    growatt.preTransmission(preTransmitGrowatt);
-    growatt.postTransmission(postTransmitGrowatt);
-    memset(&gd, 0, sizeof(gd));
-    gd.valid = false;
+    // Growatt Modbus polling
+    memset(&growatt, 0, sizeof(growatt));
 
     // Valve objects
     vacIsoValve.begin(PIN_VAC_ISO_OPEN, PIN_VAC_ISO_CLOSE, VALVE_PULSE_MS);
@@ -2314,12 +2565,7 @@ void loop() {
     // Mid-point LED
     updateMidpointLED();
 
-    // Growatt polling (independent timing on UART2)
-    if (now - lastGrowattPollMs >= GROWATT_POLL_MS) {
-        lastGrowattPollMs = now;
-        pollGrowatt();
-        wdt_reset();
-    }
+    growattPoll();
 
     // Inter-controller RS485 (every 250ms)
     if (now - lastTxMs >= INTER_CTRL_POLL_MS) {

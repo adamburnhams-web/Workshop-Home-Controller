@@ -82,6 +82,27 @@ New feature, not in spec. Logic:
 | Signal | Spec pin | Code pin | Notes |
 |---|---|---|---|
 | Display backlight | D32 | D44 (OC5C Timer5) | Hardware wire moved; D32 freed |
+| Log burner cold CLOSE | D23 | D24 | 8-ch relay board moved to even pins D22–D36 |
+| Bottom-of-tank OPEN | D24 | D26 | |
+| Bottom-of-tank CLOSE | D25 | D28 | |
+| 2-port OPEN | D26 | D30 | |
+| 2-port CLOSE | D28 | D32 | |
+| 12V PSU relay | D29 | D34 | |
+| RS485 DE/RE | D30 | D31 | Freed D30 for relay ch5 |
+
+**H relay board layout (8-ch, even pins D22–D36):**
+| Pin | Ch | Load |
+|---|---|---|
+| D22 | 1 | Log burner cold valve OPEN |
+| D24 | 2 | Log burner cold valve CLOSE |
+| D26 | 3 | Bottom-of-tank valve OPEN |
+| D28 | 4 | Bottom-of-tank valve CLOSE |
+| D30 | 5 | 2-port valve OPEN (heater side) |
+| D32 | 6 | 2-port valve CLOSE (mid-tank side) |
+| D34 | 7 | 12VDC backup PSU relay |
+| D36 | 8 | Spare |
+
+D27 (SSR-40DA) is odd and sits between relay channels — not connected to the relay board.
 
 ---
 
