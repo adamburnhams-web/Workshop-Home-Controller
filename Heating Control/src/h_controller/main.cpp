@@ -653,7 +653,14 @@ void updateHeatSourceSelection() {
     }
     prevMorningActive = morningHeatActive;
 
-    if (!morningHeatActive) return;
+    if (!morningHeatActive) {
+        // Solar emergency dump with UFH pump on: isolate tank from log burner and bottom port
+        if (lastWPkt.solarDumpActive) {
+            logBurnerCold.request(false);
+            botTankValve.request(false);
+        }
+        return;
+    }
 
     if (lastWPkt.ufhTargetReached) {
         // W reached target: open top-of-tank path at H

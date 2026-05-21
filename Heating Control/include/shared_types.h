@@ -136,6 +136,7 @@ struct __attribute__((packed)) WToHPacket {
     uint32_t fanBaseTimerSecs;
     uint8_t ufhPumpRunning;
     uint8_t ufhTargetReached;   // W signals W-air reached target
+    uint8_t solarDumpActive;    // 1 = UFH pump running for emergency solar heat dump
 
     // W faults
     uint32_t wFaultFlags;

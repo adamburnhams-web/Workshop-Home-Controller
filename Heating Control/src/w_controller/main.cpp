@@ -470,8 +470,9 @@ SummerPhase summerPhase     = SUMPH_IDLE;
 bool        summerSeqDone   = false;
 
 // Solar running flag
-bool solarPumpActive = false;
-bool solarActiveEver = false; // for vacuum system "heating active" check
+bool solarPumpActive  = false;
+bool solarActiveEver  = false; // for vacuum system "heating active" check
+bool solarDumpUFHOn   = false; // UFH pump running for emergency solar dump; sent to H
 bool frostProtActive = false;
 bool frostProtUFHOpen = false;
 
@@ -1112,7 +1113,8 @@ void updateSummerSolar() {
             ufhColdValve.setOpen();
             solarColdValve.setOpen();
             digitalWrite(PIN_UFH_PUMP, RELAY_ON);
-            solarDumpActive = true;
+            solarDumpActive  = true;
+            solarDumpUFHOn   = true;
         }
         setSolarPumpDuty(100);
         solarPumpActive = false;
@@ -1123,6 +1125,7 @@ void updateSummerSolar() {
         // Sensor fault cleared — stop the dump-mode UFH pump and exit dump state
         digitalWrite(PIN_UFH_PUMP, RELAY_OFF);
         solarDumpActive = false;
+        solarDumpUFHOn  = false;
     }
 
     float hot     = sTemp[SENSOR_SOLAR_HOT];
@@ -1756,28 +1759,37 @@ void updateMidpointLED() {
 // ============================================================
 
 void checkSolarPumpFault() {
-    static unsigned long faultStartMs    = 0;
-    static unsigned long ocStartMs       = 0;
-    static bool          dumpValveOpened = false;
+    enum PumpUCPhase : uint8_t { PUC_OK = 0, PUC_RAMP, PUC_FAULT };
+    static PumpUCPhase   ucPhase       = PUC_OK;
+    static unsigned long ucStartMs     = 0;
+    static unsigned long ocStartMs     = 0;
+    static bool          ufhDumpActive = false;
 
-    auto clearPumpFault = [&]() {
-        if (dumpValveOpened) {
+    auto clearUC = [&]() {
+        if (ufhDumpActive) {
             ufhColdValve.setClose();
-            dumpValveOpened = false;
+            digitalWrite(PIN_UFH_PUMP, RELAY_OFF);
+            ufhDumpActive  = false;
+            solarDumpUFHOn = false;
         }
-        faultStartMs = 0;
+        ucPhase   = PUC_OK;
+        ucStartMs = 0;
         clearFault(FAULT_W_SOLAR_PUMP);
     };
 
     if (!pumpOutputState || pumpTargetDuty == 0) {
-        clearPumpFault();
+        clearUC();
         ocStartMs = 0;
         clearFault(FAULT_W_SOLAR_PUMP_OVERCURRENT);
         return;
     }
+
+    // In ramp/fault phase keep 100% even between INA219 samples
+    if (ucPhase != PUC_OK) setSolarPumpDuty(100);
+
     if (!pumpCurrentSampled) return;
 
-    // Overcurrent — stop pump immediately after 2s to protect motor
+    // Overcurrent — stop pump after 3s to protect motor
     if (solarPumpCurrentA > SOLAR_PUMP_MAX_CURRENT_A) {
         if (ocStartMs == 0) ocStartMs = millis();
         if (millis() - ocStartMs > 3000UL) {
@@ -1789,21 +1801,32 @@ void checkSolarPumpFault() {
         clearFault(FAULT_W_SOLAR_PUMP_OVERCURRENT);
     }
 
-    // Undercurrent (stall) — open dump valves after 5s
-    if (solarPumpCurrentA < SOLAR_PUMP_MIN_CURRENT_A) {
-        if (faultStartMs == 0) faultStartMs = millis();
-        if (millis() - faultStartMs > 3000UL) {
-            setFault(FAULT_W_SOLAR_PUMP);
-            if (!sFault[SENSOR_SOLAR_HOT] && !sFault[SENSOR_SOLAR_COLD]) {
-                if (sTemp[SENSOR_SOLAR_HOT] <= 90.0f && sTemp[SENSOR_SOLAR_COLD] <= 90.0f) {
-                    ufhColdValve.setOpen();
-                    solarColdValve.setOpen();
-                    dumpValveOpened = true;
+    // Undercurrent (stall): ramp to 100% immediately, then open UFH dump after 5s at full speed
+    bool underCurrent = (solarPumpCurrentA < SOLAR_PUMP_MIN_CURRENT_A);
+    switch (ucPhase) {
+        case PUC_OK:
+            if (underCurrent) { ucPhase = PUC_RAMP; ucStartMs = millis(); setSolarPumpDuty(100); }
+            break;
+        case PUC_RAMP:
+            if (!underCurrent) {
+                clearUC();
+            } else if (millis() - ucStartMs > 5000UL) {
+                ucPhase = PUC_FAULT;
+                setFault(FAULT_W_SOLAR_PUMP);
+                if (!sFault[SENSOR_SOLAR_HOT] && !sFault[SENSOR_SOLAR_COLD]) {
+                    if (sTemp[SENSOR_SOLAR_HOT] <= 90.0f && sTemp[SENSOR_SOLAR_COLD] <= 90.0f) {
+                        ufhColdValve.setOpen();
+                        solarColdValve.setOpen();
+                        digitalWrite(PIN_UFH_PUMP, RELAY_ON);
+                        ufhDumpActive  = true;
+                        solarDumpUFHOn = true;
+                    }
                 }
             }
-        }
-    } else {
-        clearPumpFault();
+            break;
+        case PUC_FAULT:
+            if (!underCurrent) clearUC();
+            break;
     }
     pumpCurrentSampled = false;
 }
@@ -1866,8 +1889,9 @@ void sendWToHPacket() {
     pkt.fanDutyPct         = fanCurrentDuty;
     pkt.fanFullTimerSecs   = fanFullTimerSecs;
     pkt.fanBaseTimerSecs   = fanBaseTimerSecs;
-    pkt.ufhPumpRunning     = (digitalRead(PIN_UFH_PUMP) == HIGH) ? 1 : 0;
+    pkt.ufhPumpRunning     = (digitalRead(PIN_UFH_PUMP) == RELAY_ON) ? 1 : 0;
     pkt.ufhTargetReached   = ufhTargetReached ? 1 : 0;
+    pkt.solarDumpActive    = solarDumpUFHOn ? 1 : 0;
     pkt.wFaultFlags        = wFaultFlags;
     pkt.requestTimeSync    = (!timeSynced || millis() - lastTimeSyncReceivedMs >= TIME_SYNC_INTERVAL_MS) ? 1 : 0;
 
@@ -2534,7 +2558,6 @@ void loop() {
 
     // INA219 current sampling (during pump ON period)
     sampleSolarPumpCurrent();
-    checkSolarPumpFault();
 
     // Heating logic (mode comes from H via RS485)
     SystemMode mode = hasHPacket ? (SystemMode)lastH.systemMode : MODE_WINTER;
@@ -2547,6 +2570,8 @@ void loop() {
         updateSummerSolar();
     }
     updateUFHHeating();
+    // Fault check after solar+UFH so it can override both pump duty and UFH pump pin
+    checkSolarPumpFault();
     updateSolarPump();
 
     // Vacuum system
