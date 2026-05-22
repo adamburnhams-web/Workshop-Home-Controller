@@ -213,3 +213,72 @@ Header line: `CAL_HDR: solar_step_C,heater_pct,hot_pipe_C,htr_out_C,pump_pct`
 - `FAN_FLAP_OPEN_MS` (W): TODO calibrate motorized damper travel time
 - `VALVE_POWERUP_WAIT_MS` (W): 30s conservative, verify on-site
 - `SOLAR_PUMP_MIN_CURRENT_A` / `SOLAR_PUMP_MAX_CURRENT_A` (W, INA219): set to 1.00A / 2.00A; verify on-site
+
+---
+
+## H Controller — heater SSR control changes
+
+### Spread firing (Bresenham) replaces burst firing
+Spec/previous: SSR fired for the first N consecutive half-cycles of a 100-cycle window (burst).
+Code: Bresenham error-accumulator distributes firing events evenly across all half-cycles.
+
+Effect: at 10% duty the pattern is one pulse every 10 half-cycles (every 100ms) rather than 10 pulses then 900ms silence. Export meters see near-constant load regardless of polling interval, eliminating false over-export readings.
+
+ISR variable renamed: `heaterCycleCnt` → `heaterSpreadAcc` (accumulator, not a counter).
+
+### Manual heater test override — `set heater_pct` serial command (DEBUG_SERIAL only)
+Not in spec. Allows the heater SSR to be tested independently of `HEATER_ENABLED` commissioning flag.
+
+- `set heater_pct <0–100>` — activates sim override at given duty %; sets `simHeaterActive = true`
+- `set heater_pct_clear` — cancels override, returns to normal control
+- Override bypasses `HEATER_ENABLED` check in ISR only; all other lockouts (grid, overheat, lockout flag) still apply
+- `simHeaterActive` declared as `volatile bool` before the ISR; `simHeaterVal` (uint8) held separately
+
+### `zc_pin` diagnostic added to `heater` debug command
+`heater` serial command now samples D2 (zero crossing pin) 200 times at 100µs intervals and reports `xH/yL` counts. Used to confirm H11AA1 optocoupler is switching correctly before enabling heater.
+
+---
+
+## W Controller — solar pump control rework
+
+### Overcurrent fault — UFH dump added
+Previously: overcurrent (>2.0A for 3s) stopped the pump but opened no dump path; solar fluid could stagnate and overheat in collectors.
+Code: on overcurrent trigger, opens `ufhColdValve` + `solarColdValve` and starts UFH pump (same as stall/undercurrent fault), subject to same safety guards (sensor valid, temps ≤ 90°C).
+
+Separate `ocDumpActive` flag (static, inside `checkSolarPumpFault`) tracks the overcurrent dump independently of `ufhDumpActive` (undercurrent). The dump persists while the pump is stopped; clears when the pump restarts and current returns to normal.
+
+### Solar pump speed — new duty calculation
+
+Replaces `calcPumpDuty` (simple ±2°C ramp) and `clockPeriodForDiff` (3-step period lookup).
+
+**Heater off:**
+
+| Solar hot vs target | Duty |
+|---|---|
+| < target − 8°C | 1% |
+| target − 8°C to target − 2°C | 2% → 4% linear (over 6°C) |
+| target − 2°C to target + 2°C | 4% → 100% linear (over 4°C) |
+| ≥ target + 2°C | 100% |
+
+**Heater on:**
+- Floor = `heaterMinPumpPct(heaterPct, heaterOutC)` = `max(2, heaterPct/5)`, boosted slightly if heater outlet > 70°C, capped at 25%. Needs on-site calibration.
+- Solar hot < target − 2°C: hold at floor
+- Solar hot target − 2°C to target + 2°C: linear floor → 100%
+- Solar hot ≥ target + 2°C: 100%
+
+Winter trigger (18°C) unchanged — pump will not start below this regardless of duty calc.
+
+`calcPumpDuty` signature changed to `(float hot, float targetC, uint8_t heaterPct, float heaterOutC)`. Summer solar's separate `dutyHeater` path (heater outlet vs heater target) removed; heater state now handled via the unified heaterMinPumpPct floor.
+
+### Solar pump timing — three-zone clocking
+
+Replaces `pumpClockPeriodMs` / `pumpMinOnMs` dynamic period scheme. Variables and `minClockingDuty()` function removed.
+
+| Zone | Duty range | On time | Off time |
+|---|---|---|---|
+| 1 | 1–20% | 200ms fixed | 19,800ms → 800ms (linear) |
+| 2 | 20–50% | 200ms → 800ms (`duty×800/(100−duty)`) | 800ms fixed |
+| 3 | 50–100% | 800ms fixed | 800ms → 0ms (`800×(100−duty)/duty`) |
+| — | 100% | continuous | — |
+
+Zones 1/2 transition smoothly at 20% (on=200ms, off=800ms). Zones 2/3 transition smoothly at 50% (on=800ms, off=800ms). At high duty (e.g. 90%) the pump runs 800ms on / 89ms off rather than the old 7.2s on / 800ms off.

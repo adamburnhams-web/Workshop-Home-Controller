@@ -141,7 +141,6 @@ static const uint16_t VALVE_POWERUP_WAIT_MS = 30000;
 #define VALVE_PULSE_MS      7000UL   // H-bridge valve travel time
 #define LOCK_PULSE_MS       1000UL   // door lock pulse
 #define HBRIDGE_DEAD_MS      200UL   // dead-time between relay changes
-#define SUMMER_MIN_STARTUP_DUTY 2    // 2% — solar pump minimum clocking (100ms on / 4900ms off)
 #define FAN_FLAP_OPEN_MS   30000UL   // motorized damper travel time; calibrate on-site
 #define TIME_SYNC_INTERVAL_MS 3600000UL // 1 hour
 #define EEPROM_FAN_BASE_ADDR 0       // EEPROM address for fan base speed
@@ -199,6 +198,9 @@ int16_t simGPvExportW     = 0;
 uint8_t simGBattSocPct    = 0;
 int16_t simGBattChargeW   = 0;
 
+bool    simHtrPctActive   = false;
+uint8_t simHtrPctVal      = 0;
+
 // ============================================================
 //  SOLAR PUMP
 // ============================================================
@@ -215,9 +217,10 @@ bool     pumpCurrentSampled = false;
 unsigned long pumpAboveClockingMs = 0; // time pump stayed above clocking speed
 bool     pumpAboveClocking = false;
 
-// Clocking parameters (updated by heating mode)
-uint16_t pumpClockPeriodMs = 5000;
-uint16_t pumpMinOnMs       = 100;
+// Clocking: zone 1 (1-20%)  fixes on=200ms,  shrinks off 19800→800ms.
+//           zone 2 (20-50%) fixes off=800ms,  grows   on  200→800ms.
+//           zone 3 (50-100%)fixes on=800ms,   shrinks off 800→0ms.
+//           100% = continuous.
 
 // ============================================================
 //  H-BRIDGE VALVE  (7s pulse, 200ms dead-time)
@@ -496,6 +499,10 @@ uint8_t    missedPackets       = 0;
 bool       rs485CommsFault     = false;
 unsigned long lastRxMs         = 0;
 unsigned long lastTxMs         = 0;
+
+uint16_t   rs485RxGood         = 0;  // total valid H packets received
+uint16_t   rs485RxMiss         = 0;  // total timeout misses
+uint16_t   rs485RxBadFrame     = 0;  // decoded frames with wrong dir/len
 
 HToWPacket lastH;           // last valid H→W packet
 bool       hasHPacket        = false;
@@ -781,10 +788,20 @@ void updateSolarPump() {
         return;
     }
 
-    // Time-proportioning: ON for max(minOnMs, duty*period/100), then OFF
-    uint16_t onMs  = max((uint32_t)pumpMinOnMs,
-                          (uint32_t)pumpClockPeriodMs * pumpTargetDuty / 100);
-    uint16_t offMs = pumpClockPeriodMs - onMs;
+    // Zone 1 (1–20%):  on=200ms fixed,  off shrinks 19800→800ms linearly.
+    // Zone 2 (20–50%): off=800ms fixed, on  grows  200→800ms via duty/(1−duty).
+    // Zone 3 (50–100%):on=800ms fixed,  off shrinks 800→0ms  via (1−duty)/duty.
+    uint32_t onMs, offMs;
+    if (pumpTargetDuty <= 20) {
+        onMs  = 200UL;
+        offMs = 19800UL - 1000UL * (pumpTargetDuty - 1);
+    } else if (pumpTargetDuty <= 50) {
+        onMs  = (uint32_t)pumpTargetDuty * 800UL / (100 - pumpTargetDuty);
+        offMs = 800UL;
+    } else {
+        onMs  = 800UL;
+        offMs = 800UL * (100 - pumpTargetDuty) / pumpTargetDuty;
+    }
     unsigned long now = millis();
 
     if (pumpOutputState) {
@@ -802,12 +819,40 @@ void updateSolarPump() {
     }
 }
 
-// Linear ramp: 0% at (target - 2°C), 100% at (target + 2°C)
-uint8_t calcPumpDuty(float measured, float targetC) {
-    float diff = measured - (targetC - 2.0f);
-    if (diff <= 0.0f) return 0;
-    if (diff >= 4.0f) return 100;
-    return (uint8_t)(diff / 4.0f * 100.0f);
+// Minimum pump % when heater is on. Proportional to heater power;
+// hotter outlet (heater working hard) slightly raises the floor.
+// Calibrate divisor and offset on-site.
+static uint8_t heaterMinPumpPct(uint8_t heaterPct, float heaterOutC) {
+    uint8_t base = max(2, heaterPct / 5);
+    if (!isnan(heaterOutC) && heaterOutC > 70.0f)
+        base = max(base, (uint8_t)((heaterOutC - 70.0f) / 5.0f + 2));
+    return min(base, (uint8_t)25);
+}
+
+// Pump duty % given solar hot-side temperature vs target.
+// heaterPct==0 → heater off branch; otherwise heater-on branch applies a floor.
+static uint8_t calcPumpDuty(float hot, float targetC,
+                             uint8_t heaterPct, float heaterOutC) {
+    if (heaterPct == 0) {
+        // Heater off: 1% far below target, slow ramp to 100% above target
+        if (hot < targetC - 8.0f) return 1;
+        if (hot < targetC - 2.0f) {
+            // 2% → 4% linear over 6°C (target-8 to target-2)
+            float t = (hot - (targetC - 8.0f)) / 6.0f;
+            return (uint8_t)(2.0f + t * 2.0f);
+        }
+        if (hot >= targetC + 2.0f) return 100;
+        // 4% → 100% linear over 4°C (target-2 to target+2)
+        float t = (hot - (targetC - 2.0f)) / 4.0f;
+        return (uint8_t)(4.0f + t * 96.0f);
+    } else {
+        // Heater on: hold floor below target-2, ramp floor→100% in upper 4°C band
+        uint8_t minPct = heaterMinPumpPct(heaterPct, heaterOutC);
+        if (hot >= targetC + 2.0f) return 100;
+        if (hot < targetC - 2.0f)  return minPct;
+        float t = (hot - (targetC - 2.0f)) / 4.0f;
+        return (uint8_t)(minPct + t * (100.0f - minPct));
+    }
 }
 
 // ============================================================
@@ -1052,21 +1097,21 @@ void updateWinterSolar(float tankBottomC) {
     if (!solarPumpActive) {
         ufhColdValve.setOpen();
         solarColdValve.setOpen();
-        pumpClockPeriodMs = 5000;
-        pumpMinOnMs       = 100;
         setSolarPumpDuty(0); // starts at clocking minimum in updateSolarPump
         solarPumpActive  = true;
         solarActiveEver  = true;
     }
 
-    // Speed ramp: hot side targets 20°C (like summer but fixed lower target)
-    uint8_t duty = calcPumpDuty(hot, (float)WINTER_UFH_TARGET_C / 10.0f);
-    if (duty == 0) duty = 1; // ensure minimum clocking
+    // Speed ramp: hot side targets 20°C
+    uint8_t htrPct  = hasHPacket ? lastH.heaterPowerPct : 0;
+    float   htrOutC = (hasHPacket && lastH.tempHeaterOut != TEMP_FAULT)
+                      ? (float)lastH.tempHeaterOut / 10.0f : NAN;
+    uint8_t duty = calcPumpDuty(hot, (float)WINTER_UFH_TARGET_C / 10.0f, htrPct, htrOutC);
     setSolarPumpDuty(duty);
 
-    // Overspeed fault: pump above clocking for > 10s AND cold > tankBottom + 10°C
+    // Overspeed fault: pump above minimum for > 10s AND cold > tankBottom + 10°C
     // If tank bottom is stale: skip fault check
-    bool pumpAboveMin = (duty > (uint8_t)(pumpMinOnMs * 100 / pumpClockPeriodMs + 1));
+    bool pumpAboveMin = (duty > 1);
     if (pumpAboveMin && !tankBotStale && !sFault[SENSOR_SOLAR_COLD]) {
         float tankBot = tankBottomC;
         if (cold > tankBot + 10.0f) {
@@ -1154,11 +1199,9 @@ void updateSummerSolar() {
 
     if (startTrigger && !summerSeqDone && summerPhase == SUMPH_IDLE) {
         summerPhase = SUMPH_CIRCULATE_TOP;
-        pumpClockPeriodMs = 5000;
-        pumpMinOnMs       = 100;
         solarColdValve.setOpen();
         ufhColdValve.setClose(); // UFH cold stays closed in summer; opens only for fault dump
-        setSolarPumpDuty(SUMMER_MIN_STARTUP_DUTY);
+        setSolarPumpDuty(1);
         solarPumpActive  = true;
         solarActiveEver  = true;
     }
@@ -1185,52 +1228,42 @@ void updateSummerSolar() {
         heaterTarget = 89.0f;
         if (!solarPumpActive) {
             solarColdValve.setOpen();
-            pumpClockPeriodMs = 4800;
-            pumpMinOnMs       = 100;
             solarPumpActive   = true;
             solarActiveEver   = true;
         }
     }
 
-    // Solar hot side: ramp 0→100% over ±2°C around solarTarget
-    uint8_t dutySolar = calcPumpDuty(hot, solarTarget);
+    uint8_t htrPct  = hasHPacket ? lastH.heaterPowerPct : 0;
+    float   htrOutC = (hasHPacket && lastH.tempHeaterOut != TEMP_FAULT)
+                      ? (float)lastH.tempHeaterOut / 10.0f : NAN;
+    uint8_t duty = calcPumpDuty(hot, solarTarget, htrPct, htrOutC);
 
-    // Heater output side: ramp 0→100% over ±2°C around heaterTarget, only when heater is on
-    uint8_t dutyHeater = 0;
-    if (hasHPacket && lastH.heaterPowerPct > 0 && lastH.tempHeaterOut != TEMP_FAULT) {
-        dutyHeater = calcPumpDuty((float)lastH.tempHeaterOut / 10.0f, heaterTarget);
-    }
-
-    uint8_t duty = max(dutySolar, dutyHeater);
     bool tankBotStale = !hasHPacket || (millis() - lastRxMs > 10000UL)
                          || lastH.tempTankBot == TEMP_FAULT;
     float tankBotC    = tankBotStale ? 0.0f : (float)lastH.tempTankBot / 10.0f;
 
-    if (duty == 0 && solarPumpActive) {
-        bool heaterPowered    = hasHPacket && lastH.heaterPowerPct > 0;
+    // Allow full stop only when both solar pipes are below tank bottom,
+    // heater off, sequence done, 2-port on heater side, and solar far below target.
+    // In all other cases hold at minimum 1%.
+    if (duty <= 1 && solarPumpActive && htrPct == 0) {
         bool bothBelowTankBot = !tankBotStale
                                 && !sFault[SENSOR_SOLAR_HOT] && !sFault[SENSOR_SOLAR_COLD]
                                 && hot < tankBotC && cold < tankBotC;
-        if (heaterPowered) {
-            // Heater powered: always keep minimum clocking regardless of temperatures
-            duty = SUMMER_MIN_STARTUP_DUTY;
-        } else if (!bothBelowTankBot) {
-            // Solar pipes not both below tank bottom: apply normal suppression logic.
-            // Suppress only when 2-port on heater side, solar far below target, heater off.
-            // Never suppress during startup: H needs pump running to advance phase sequence.
+        if (bothBelowTankBot) {
             bool twoPortHeater = hasHPacket && lastH.twoPortHeaterSide;
-            bool heaterOff     = !hasHPacket || lastH.heaterPowerPct == 0;
             bool solarFarBelow = !sFault[SENSOR_SOLAR_HOT] && !sFault[SENSOR_SOLAR_COLD]
                                  && hot  < solarTarget - 15.0f
                                  && cold < solarTarget - 15.0f;
-            if (!summerSeqDone || !(twoPortHeater && heaterOff && solarFarBelow)) duty = SUMMER_MIN_STARTUP_DUTY;
+            if (!summerSeqDone || !(twoPortHeater && solarFarBelow)) duty = 1;
+            // else: all suppression conditions met → allow duty = 0 (pump stops)
+        } else {
+            duty = 1;
         }
-        // else: both solar pipes below tank bottom, heater off → allow duty = 0 (pump stops)
     }
     setSolarPumpDuty(duty);
 
     // Overspeed overheat fault (same as winter)
-    bool pumpAboveMin = (duty > SUMMER_MIN_STARTUP_DUTY);
+    bool pumpAboveMin = (duty > 1);
     if (pumpAboveMin && !tankBotStale && !sFault[SENSOR_SOLAR_COLD]) {
         float cold2 = sTemp[SENSOR_SOLAR_COLD];
         if (cold2 > tankBotC + 10.0f) {
@@ -1764,6 +1797,7 @@ void checkSolarPumpFault() {
     static unsigned long ucStartMs     = 0;
     static unsigned long ocStartMs     = 0;
     static bool          ufhDumpActive = false;
+    static bool          ocDumpActive  = false;
 
     auto clearUC = [&]() {
         if (ufhDumpActive) {
@@ -1780,7 +1814,7 @@ void checkSolarPumpFault() {
     if (!pumpOutputState || pumpTargetDuty == 0) {
         clearUC();
         ocStartMs = 0;
-        clearFault(FAULT_W_SOLAR_PUMP_OVERCURRENT);
+        if (!ocDumpActive) clearFault(FAULT_W_SOLAR_PUMP_OVERCURRENT);
         return;
     }
 
@@ -1789,15 +1823,30 @@ void checkSolarPumpFault() {
 
     if (!pumpCurrentSampled) return;
 
-    // Overcurrent — stop pump after 3s to protect motor
+    // Overcurrent — stop pump after 3s to protect motor; open UFH dump to bleed solar heat
     if (solarPumpCurrentA > SOLAR_PUMP_MAX_CURRENT_A) {
         if (ocStartMs == 0) ocStartMs = millis();
         if (millis() - ocStartMs > 3000UL) {
             setFault(FAULT_W_SOLAR_PUMP_OVERCURRENT);
             setSolarPumpDuty(0);
+            if (!ocDumpActive && !sFault[SENSOR_SOLAR_HOT] && !sFault[SENSOR_SOLAR_COLD]) {
+                if (sTemp[SENSOR_SOLAR_HOT] <= 90.0f && sTemp[SENSOR_SOLAR_COLD] <= 90.0f) {
+                    ufhColdValve.setOpen();
+                    solarColdValve.setOpen();
+                    digitalWrite(PIN_UFH_PUMP, RELAY_ON);
+                    ocDumpActive   = true;
+                    solarDumpUFHOn = true;
+                }
+            }
         }
     } else {
         ocStartMs = 0;
+        if (ocDumpActive) {
+            ufhColdValve.setClose();
+            digitalWrite(PIN_UFH_PUMP, RELAY_OFF);
+            ocDumpActive   = false;
+            solarDumpUFHOn = false;
+        }
         clearFault(FAULT_W_SOLAR_PUMP_OVERCURRENT);
     }
 
@@ -1916,7 +1965,7 @@ void receiveHToWPacket() {
         if (!Serial1.available()) continue;
         uint8_t b = (uint8_t)Serial1.read();
         if (pktRx.feed(b, outDir, outSeq, payload, payLen)) {
-            if (outDir != PKT_DIR_HW || payLen != sizeof(HToWPacket)) continue;
+            if (outDir != PKT_DIR_HW || payLen != sizeof(HToWPacket)) { rs485RxBadFrame++; continue; }
 
             // Sequence number miss detection
             uint8_t expectedSeq = (uint8_t)(lastRxSeq + 1);
@@ -1926,9 +1975,13 @@ void receiveHToWPacket() {
             lastRxSeq = outSeq;
 
             memcpy(&lastH, payload, sizeof(HToWPacket));
+#ifdef DEBUG_SERIAL
+            if (simHtrPctActive) lastH.heaterPowerPct = simHtrPctVal;
+#endif
             hasHPacket = true;
             lastRxMs   = millis();
             missedPackets = 0;
+            rs485RxGood++;
 
             if (rs485CommsFault) {
                 rs485CommsFault = false;
@@ -1983,6 +2036,7 @@ void receiveHToWPacket() {
 
     // Timeout — no valid packet received
     missedPackets++;
+    rs485RxMiss++;
     if (missedPackets >= COMMS_FAULT_THRESHOLD && !rs485CommsFault) {
         rs485CommsFault = true;
         setFault(FAULT_W_RS485_COMMS);
@@ -2105,6 +2159,21 @@ static void dbgMode() {
     } else {
         Serial.println(growatt.valid ? F("live") : F("no data"));
     }
+}
+
+static void dbgBus() {
+    Serial.print(F("  fault:       ")); Serial.println(rs485CommsFault ? F("YES") : F("no"));
+    Serial.print(F("  consec_miss: ")); Serial.println(missedPackets);
+    Serial.print(F("  rx_good:     ")); Serial.println(rs485RxGood);
+    Serial.print(F("  rx_miss:     ")); Serial.println(rs485RxMiss);
+    Serial.print(F("  rx_badframe: ")); Serial.println(rs485RxBadFrame);
+    Serial.print(F("  last_rx_ms:  "));
+    if (!hasHPacket) Serial.println(F("never"));
+    else { Serial.print(millis() - lastRxMs); Serial.println(F("ms ago")); }
+    Serial.print(F("  miss_rate:   "));
+    uint16_t total = rs485RxGood + rs485RxMiss;
+    if (total == 0) Serial.println(F("n/a"));
+    else { Serial.print((uint32_t)rs485RxMiss * 100 / total); Serial.println(F("%")); }
 }
 
 static void dbgPump() {
@@ -2296,6 +2365,8 @@ static void dbgSet(char* key, char* val) {
     if (!strcmp_P(key, PSTR("growatt_clear"))){ simGrowattActive = false; Serial.println(F("cleared")); return; }
     if (!strcmp_P(key, PSTR("pump_current")))      { simPumpCurrentActive = true;  simPumpCurrentVal = fval; Serial.println(F("ok")); return; }
     if (!strcmp_P(key, PSTR("pump_current_clear"))) { simPumpCurrentActive = false; Serial.println(F("cleared")); return; }
+    if (!strcmp_P(key, PSTR("heater_pct")))        { simHtrPctActive = true;  simHtrPctVal = (uint8_t)constrain((int)fval, 0, 100); Serial.println(F("ok")); return; }
+    if (!strcmp_P(key, PSTR("heater_pct_clear")))  { simHtrPctActive = false; Serial.println(F("cleared")); return; }
     Serial.print(F("unknown key: ")); Serial.println(key);
 }
 
@@ -2312,7 +2383,7 @@ static void handleDebugCommand(char* buf) {
     if (*arg2 == ' ') { *arg2++ = 0; while (*arg2 == ' ') arg2++; }
 
     if      (!strcmp_P(cmd, PSTR("help"))) {
-        Serial.println(F("temps  valves  faults  mode  status  pump  fans  security  growatt  growattlisten"));
+        Serial.println(F("temps  valves  faults  mode  status  bus  pump  fans  security  growatt  growattlisten"));
         Serial.println(F("scan  (1-Wire address discovery)  i2cscan  (I2C address discovery)"));
         Serial.println(F("set <sensor> <val>  (val=999 clears sim)"));
         Serial.println(F("  sensors: solar_hot solar_cold ufh_supply ufh_post_tmv workshop_air outside_air"));
@@ -2320,12 +2391,14 @@ static void handleDebugCommand(char* buf) {
         Serial.println(F("set pir_clear|door_clear|winch_cls_clear|winch_lock_clear 0"));
         Serial.println(F("set pv_out|pv_export|batt_soc|batt_charge <val>  (Growatt sim)"));
         Serial.println(F("set growatt_clear 0  (clears all Growatt sim)"));
+        Serial.println(F("set heater_pct <val>  set heater_pct_clear 0"));
     }
     else if (!strcmp_P(cmd, PSTR("temps")))    dbgTemps();
     else if (!strcmp_P(cmd, PSTR("valves")))   dbgValves();
     else if (!strcmp_P(cmd, PSTR("faults")))   dbgFaults();
     else if (!strcmp_P(cmd, PSTR("mode")))     dbgMode();
     else if (!strcmp_P(cmd, PSTR("status")))   { dbgMode(); dbgTemps(); dbgFaults(); }
+    else if (!strcmp_P(cmd, PSTR("bus")))      dbgBus();
     else if (!strcmp_P(cmd, PSTR("pump")))     dbgPump();
     else if (!strcmp_P(cmd, PSTR("fans")))     dbgFans();
     else if (!strcmp_P(cmd, PSTR("security"))) dbgSecurity();

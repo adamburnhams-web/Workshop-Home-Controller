@@ -69,7 +69,7 @@ static const uint8_t DS18B20_ADDRS[6][8] = {
     { 0x28, 0xB7, 0x37, 0x15, 0x00, 0x00, 0x00, 0xF0 }, // tank middle    (sensor 8)
     { 0x28, 0xB2, 0x99, 0x12, 0x00, 0x00, 0x00, 0x0C }, // tank top       (sensor 9)
     { 0x28, 0x11, 0x6C, 0x12, 0x00, 0x00, 0x00, 0x7D }, // hot pipe       (sensor 10)
-    { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }, // cold pipe      (unassigned)
+    { 0x28, 0x5C, 0x8E, 0x12, 0x00, 0x00, 0x00, 0x1B }, // cold pipe
     { 0x28, 0xEA, 0x8F, 0x12, 0x00, 0x00, 0x00, 0x63 }, // heater output  (sensor 12)
 };
 #define H_SENSOR_TANK_BOT    0
@@ -227,8 +227,14 @@ static inline bool tempValid(float t) {
 // ============================================================
 
 volatile unsigned long lastZCMicros  = 0;
-volatile uint8_t       heaterCycleCnt = 0;    // 0–99 within 100-cycle window
+volatile uint8_t       heaterSpreadAcc = 0;   // Bresenham accumulator for spread firing
 volatile uint8_t       heaterTargetPct = 0;   // 0–100, written by outer loop
+volatile uint32_t      zcFireCount   = 0;
+#ifdef DEBUG_SERIAL
+volatile bool simHeaterActive = false;
+#else
+static const bool simHeaterActive = false;
+#endif
 
 bool heaterRunning    = false;
 bool heaterHardLockout = false;   // set on element fail / UFH hard lockout — clears on restart
@@ -240,15 +246,19 @@ bool gridPresent                 = true;
 unsigned long lastGridLossMs     = 0;
 bool gridOutageFault             = false;
 
-// Zero-crossing ISR — runs every 20ms on 50Hz grid
+// Zero-crossing ISR — runs every 10ms on 50Hz grid (every half-cycle)
+// Bresenham spread firing: pulses distributed evenly rather than burst,
+// so instantaneous load is stable and export meters don't see large swings.
 // Direct port write (PA5 = D27) to avoid digitalWrite() overhead in ISR
 void zeroCrossISR() {
     lastZCMicros = micros();
-    if (heaterCycleCnt >= 99) heaterCycleCnt = 0;
-    else                       heaterCycleCnt++;
+    zcFireCount++;
 
-    bool on = HEATER_ENABLED && heaterRunning && !heaterHardLockout
-               && (heaterCycleCnt < heaterTargetPct);
+    heaterSpreadAcc += heaterTargetPct;
+    bool fire = (heaterSpreadAcc >= 100);
+    if (fire) heaterSpreadAcc -= 100;
+
+    bool on = (HEATER_ENABLED || simHeaterActive) && heaterRunning && !heaterHardLockout && fire;
     if (on) PORTA |= (1 << PA5);    // D27 = PA5
     else    PORTA &= ~(1 << PA5);
 }
@@ -256,7 +266,7 @@ void zeroCrossISR() {
 uint8_t rtcHour();   // defined after RTC section
 
 #ifdef DEBUG_SERIAL
-bool simHeaterActive = false; uint8_t simHeaterVal = 0;
+uint8_t simHeaterVal = 0;
 #endif
 
 // Outer loop: compute heaterTargetPct from Growatt data every 2s
@@ -1890,6 +1900,10 @@ static void dbgHeater() {
     Serial.print(F("  lockout:   ")); Serial.println(heaterHardLockout ? F("YES")  : F("no"));
     Serial.print(F("  ovht_warn: ")); Serial.println(heaterOvheatWarn  ? F("YES")  : F("no"));
     Serial.print(F("  grid:      ")); Serial.println(gridPresent       ? F("ok")   : F("OUTAGE"));
+    Serial.print(F("  zc_count:  ")); Serial.println(zcFireCount);
+    Serial.print(F("  zc_age_ms: ")); Serial.println((micros() - lastZCMicros) / 1000UL);
+    { uint8_t hi = 0, lo = 0; for (uint8_t i = 0; i < 200; i++) { if (digitalRead(PIN_ZERO_CROSSING)) hi++; else lo++; delayMicroseconds(100); }
+      Serial.print(F("  zc_pin:    ")); Serial.print(hi); Serial.print(F("H/")); Serial.print(lo); Serial.println(F("L (200 samples@100us)")); }
     Serial.print(F("  enabled:   ")); Serial.println(HEATER_ENABLED    ? F("yes")  : F("NO (commissioning flag)"));
     if (simPVExportActive) { Serial.print(F("  SIM pv_export=")); Serial.println(simPVExportVal); }
     if (simHeaterActive)   { Serial.print(F("  SIM heater_pct=")); Serial.println(simHeaterVal); }
