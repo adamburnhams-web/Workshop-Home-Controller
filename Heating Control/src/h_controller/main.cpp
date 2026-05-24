@@ -50,6 +50,7 @@
 #define PIN_PSU_12V         34   // 8-ch ch7: 12VDC backup PSU relay
 // D36: 8-ch ch8 spare
 #define PIN_RS485_DE_LINK   31   // MAX485 DE/RE (HIGH = transmit)
+#define PIN_SOLAR_PUMP      46   // pump MOSFET gate via diode + spare wire to W
 
 // Display (SPI bus: D51=MOSI, D50=MISO, D52=SCK)
 #define PIN_DISPLAY_CS      53   // active LOW
@@ -101,7 +102,7 @@ static const bool HEATER_ENABLED = false;
 //  SYSTEM CONSTANTS
 // ============================================================
 
-#define DS18B20_CONV_MS         750UL
+#define DS18B20_CONV_MS         375UL
 #define INTER_CTRL_POLL_MS      250UL
 #define RS485_RX_TIMEOUT_MS     150UL
 #define COMMS_FAULT_THRESHOLD   20
@@ -246,6 +247,11 @@ bool gridPresent                 = true;
 unsigned long lastGridLossMs     = 0;
 bool gridOutageFault             = false;
 
+uint8_t       hPumpDuty        = 0;
+bool          hPumpOutputState = false;
+unsigned long hPumpOnMs        = 0;
+unsigned long hPumpOffMs       = 0;
+
 // Zero-crossing ISR — runs every 10ms on 50Hz grid (every half-cycle)
 // Bresenham spread firing: pulses distributed evenly rather than burst,
 // so instantaneous load is stable and export meters don't see large swings.
@@ -269,7 +275,7 @@ uint8_t rtcHour();   // defined after RTC section
 uint8_t simHeaterVal = 0;
 #endif
 
-// Outer loop: compute heaterTargetPct from Growatt data every 2s
+// Called every RS485 packet (~250ms); Growatt data arrives via W.
 void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
                        ManualHeaterMode manualMode, bool wSolarFault)
 {
@@ -300,41 +306,43 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
         heaterRunning = false; heaterTargetPct = 0; return;
     }
 
-    uint8_t soc        = lastWPkt.battSocPct;
+    uint8_t soc         = lastWPkt.battSocPct;
     int16_t battChargeW = lastWPkt.battChargeW;  // +ve=charging, -ve=discharging
     bool    socControl  = (soc >= 60);
 
-    // SOC-based charge rate target: 3000W→1000W between 60-80%, flat 1000W above 80%
+    // SOC-based charge rate target: 3000W→1000W between 60–80%, flat 1000W above 80%
     int16_t chargeTarget = 0;
-    if (soc >= 80)       chargeTarget = 1000;
-    else if (soc >= 60)  chargeTarget = (int16_t)(3000 - (int32_t)(soc - 60) * 100);
+    if (soc >= 80)      chargeTarget = 1000;
+    else if (soc >= 60) chargeTarget = (int16_t)(3000 - (int32_t)(soc - 60) * 100);
 
-    // Start: export ≥ 500W, OR SOC ≥ 60% and battery charging above target
+    // Net grid flow (positive = exporting, negative = importing).
+    // The Growatt readings already include the heater as a load, so adding back
+    // heaterCurrentW gives the system balance as if the heater weren't running,
+    // letting us solve directly for the correct operating duty in one step.
+    int32_t netGridW       = (int32_t)pvExportW - gridImportW;
+    int32_t battW          = socControl ? (int32_t)battChargeW - chargeTarget
+                                        : (int32_t)min((int16_t)0, battChargeW);
+    int32_t heaterCurrentW = (int32_t)heaterTargetPct * 3000 / 100;
+    int32_t available      = netGridW + heaterCurrentW + battW - 100L;
+    int16_t rawPct         = (int16_t)constrain(available * 100L / 3000L, 0L, 100L);
+
+    // Start when ~150W net surplus available; stop immediately when none.
     if (!heaterRunning) {
-        if (pvExportW >= 500) heaterRunning = true;
-        else if (socControl && battChargeW > chargeTarget) heaterRunning = true;
+        if (rawPct < 5) return;
+        heaterRunning = true;
     }
+    if (rawPct == 0) { heaterRunning = false; heaterTargetPct = 0; return; }
 
-    if (heaterRunning) {
-        // Stop: export < 100W AND (no SOC control active OR charge rate ≤ target)
-        if (pvExportW < 100 && (!socControl || battChargeW <= chargeTarget)) {
-            heaterRunning = false; heaterTargetPct = 0; return;
-        }
-        int16_t exportPct = (int16_t)constrain(
-            max(0L, (int32_t)(pvExportW  - 100)) * 100L / 3000L, 0, 100);
-        int16_t chargePct = socControl ? (int16_t)constrain(
-            max(0L, (int32_t)(battChargeW - chargeTarget)) * 100L / 3000L, 0, 100) : 0;
-        heaterTargetPct = (uint8_t)max(exportPct, chargePct);
+    heaterTargetPct = (uint8_t)rawPct;
 
-        // Overheat power reduction (> 91°C heater output)
-        if (!sFault[H_SENSOR_HEATER_OUT]) {
-            float hOut = sTemp[H_SENSOR_HEATER_OUT];
-            if (hOut > 92.0f) {
-                heaterTargetPct = 0;
-            } else if (hOut > 91.0f) {
-                uint8_t reduce = (uint8_t)((hOut - 91.0f) * 100.0f);
-                heaterTargetPct = heaterTargetPct * (100 - reduce) / 100;
-            }
+    // Overheat power reduction (> 91°C heater output)
+    if (!sFault[H_SENSOR_HEATER_OUT]) {
+        float hOut = sTemp[H_SENSOR_HEATER_OUT];
+        if (hOut > 92.0f) {
+            heaterTargetPct = 0;
+        } else if (hOut > 91.0f) {
+            uint8_t reduce = (uint8_t)((hOut - 91.0f) * 100.0f);
+            heaterTargetPct = heaterTargetPct * (100 - reduce) / 100;
         }
     }
 }
@@ -448,6 +456,7 @@ static const uint32_t sensorFaultMaskH[H_NUM_SENSORS] = {
 inline void pollBtns();  // forward declaration — defined after Button struct
 
 void startConversion() {
+    sensors.setResolution(11);
     sensors.setWaitForConversion(false);
     sensors.requestTemperatures();
     lastConvStartMs = millis();
@@ -1715,6 +1724,66 @@ uint8_t   missedPackets  = 0;
 bool      rs485Fault     = false;
 PktReceiver pktRx;
 
+// ============================================================
+//  H-SIDE SOLAR PUMP DIRECT DRIVE
+// ============================================================
+
+static uint8_t hHeaterMinPumpPct(uint8_t heaterPct, float heaterOutC) {
+    uint8_t base = max(2, heaterPct / 5);
+    if (!isnan(heaterOutC) && heaterOutC > 70.0f)
+        base = max(base, (uint8_t)((heaterOutC - 70.0f) / 5.0f + 2));
+    return min(base, (uint8_t)25);
+}
+
+static uint8_t calcHPumpDuty() {
+    if (!heaterRunning || heaterTargetPct == 0) return 0;
+    float heaterOutC = sFault[H_SENSOR_HEATER_OUT] ? NAN : sTemp[H_SENSOR_HEATER_OUT];
+    uint8_t minPct = hHeaterMinPumpPct(heaterTargetPct, heaterOutC);
+    if (!isnan(heaterOutC)) {
+        float tankTopC     = sFault[H_SENSOR_TANK_TOP] ? 60.0f : sTemp[H_SENSOR_TANK_TOP];
+        float heaterTarget = (solarTargetMode == SOLAR_MAX) ? 89.0f : min(tankTopC + 5.0f, 89.0f);
+        if (heaterOutC >= heaterTarget + 2.0f) return 100;
+        if (heaterOutC >= heaterTarget - 2.0f) {
+            float t = (heaterOutC - (heaterTarget - 2.0f)) / 4.0f;
+            return (uint8_t)max((int)minPct, (int)(minPct + t * (100.0f - minPct)));
+        }
+    }
+    return minPct;
+}
+
+static void setHPumpDuty(uint8_t duty) {
+    hPumpDuty = duty;
+    if (duty == 0) { digitalWrite(PIN_SOLAR_PUMP, LOW); hPumpOutputState = false; }
+}
+
+static void updateHPump() {
+    if (hPumpDuty == 0) {
+        if (hPumpOutputState) { digitalWrite(PIN_SOLAR_PUMP, LOW); hPumpOutputState = false; }
+        return;
+    }
+    if (hPumpDuty == 100) {
+        if (!hPumpOutputState) { digitalWrite(PIN_SOLAR_PUMP, HIGH); hPumpOutputState = true; hPumpOnMs = millis(); }
+        return;
+    }
+    uint32_t onMs, offMs;
+    if (hPumpDuty <= 20) {
+        onMs  = 200UL;
+        offMs = 19800UL - 1000UL * (hPumpDuty - 1);
+    } else if (hPumpDuty <= 50) {
+        onMs  = (uint32_t)hPumpDuty * 800UL / (100 - hPumpDuty);
+        offMs = 800UL;
+    } else {
+        onMs  = 800UL;
+        offMs = 800UL * (100 - hPumpDuty) / hPumpDuty;
+    }
+    unsigned long now = millis();
+    if (hPumpOutputState) {
+        if (now - hPumpOnMs >= onMs) { digitalWrite(PIN_SOLAR_PUMP, LOW); hPumpOutputState = false; hPumpOffMs = now; }
+    } else {
+        if (now - hPumpOffMs >= offMs) { digitalWrite(PIN_SOLAR_PUMP, HIGH); hPumpOutputState = true; hPumpOnMs = now; }
+    }
+}
+
 void sendHToWPacket(bool timeSyncReq) {
     HToWPacket pkt;
     memset(&pkt, 0, sizeof(pkt));
@@ -1766,6 +1835,8 @@ void sendHToWPacket(bool timeSyncReq) {
     pkt.calPumpActive   = (calPumpPhase != CALP_IDLE && calPumpPhase != CALP_DONE) ? 1 : 0;
     pkt.calSolarTargetC = (calPumpPhase == CALP_STABILIZE) ? (int16_t)(calSolarStepC * 10) : 900;
 #endif
+
+    pkt.hPumpDutyPct = hPumpDuty;
 
     uint8_t frame[PKT_MAX_FRAME];
     uint16_t len = pktEncode(frame, sizeof(frame), PKT_DIR_HW, txSeqNum++,
@@ -2218,6 +2289,7 @@ void setup() {
     digitalWrite(PIN_TWO_PORT_CLOSE, RELAY_OFF); pinMode(PIN_TWO_PORT_CLOSE, OUTPUT);
     digitalWrite(PIN_PSU_12V,        RELAY_OFF); pinMode(PIN_PSU_12V,        OUTPUT);
     digitalWrite(PIN_RS485_DE_LINK,  LOW);        pinMode(PIN_RS485_DE_LINK,  OUTPUT);
+    digitalWrite(PIN_SOLAR_PUMP,     LOW);        pinMode(PIN_SOLAR_PUMP,     OUTPUT);
     pinMode(PIN_DISPLAY_BL,     OUTPUT); setBacklight(displayBrightness);
 
     // Input pins
@@ -2244,7 +2316,6 @@ void setup() {
 
     // DS18B20
     sensors.begin();
-    sensors.setResolution(12);
     for (uint8_t i = 0; i < H_NUM_SENSORS; i++) {
         sTemp[i] = NAN; sFault[i] = false; sFailCount[i] = 0; sGoodCount[i] = 0;
     }
@@ -2311,8 +2382,7 @@ void loop() {
     unsigned long now = millis();
 
     // Sensors
-    static unsigned long lastConvReqMs = 0;
-    if (!convStarted && now - lastConvReqMs >= 1100) { startConversion(); lastConvReqMs = now; }
+    if (!convStarted) startConversion();
     readSensors();
 
     // Log burner module
@@ -2348,6 +2418,10 @@ void loop() {
 
     // Heater fault checks
     checkHeaterFaults();
+
+    // H-side solar pump direct drive
+    setHPumpDuty(calcHPumpDuty());
+    updateHPump();
 
     // 5am trigger and heating session
     checkMorningTrigger();

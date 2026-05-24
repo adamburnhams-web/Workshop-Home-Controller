@@ -203,4 +203,7 @@ struct __attribute__((packed)) HToWPacket {
     // Pump calibration (populated only when DEBUG_SERIAL active; always zero in production)
     uint8_t  calPumpActive;
     int16_t  calSolarTargetC;   // solar target override °C × 10
+
+    // H-side solar pump direct drive duty (0–100%; non-zero only when heater on)
+    uint8_t hPumpDutyPct;
 };

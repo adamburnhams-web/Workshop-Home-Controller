@@ -132,7 +132,7 @@ static const uint16_t VALVE_POWERUP_WAIT_MS = 30000;
 #define ALARM_DURATION_MS   60000UL  // 1-minute alarm auto-stop
 #define HANDLE_ALERT_NIGHT_MIN_MS 10000UL
 #define INTER_CTRL_POLL_MS  250UL
-#define DS18B20_CONV_MS     750UL
+#define DS18B20_CONV_MS     375UL
 #define RS485_RX_TIMEOUT_MS 150UL
 #define COMMS_FAULT_THRESHOLD 20
 #define FAN_RPM_FAULT_DELAY_MS 5000UL
@@ -216,6 +216,17 @@ bool     pumpCurrentSampled = false;
 // Pump fault tracking
 unsigned long pumpAboveClockingMs = 0; // time pump stayed above clocking speed
 bool     pumpAboveClocking = false;
+
+// Pump speed override state (fast-rise 5s@100%, fast-drop 10s@0%, periodic 1s kick)
+uint8_t       pumpSpdOvMode     = 0;    // 0=none, 1=5s@100%, 2=10s@0%
+unsigned long pumpSpdOvStartMs  = 0;
+bool          hotRiseTracking   = false;
+unsigned long hotRiseCrossMs    = 0;
+bool          hotPrevAboveLow   = false;
+bool          hotWasAboveHigh   = false;
+unsigned long lastKick60Ms      = 0;
+bool          kick60Active      = false;
+unsigned long kick60StartMs     = 0;
 
 // Clocking: zone 1 (1-20%)  fixes on=200ms,  shrinks off 19800→800ms.
 //           zone 2 (20-50%) fixes off=800ms,  grows   on  200→800ms.
@@ -557,7 +568,7 @@ unsigned long lastSensorConvMs = 0;
 bool          sensorConvStarted = false;
 
 void startSensorConversion() {
-    sensors.setResolution(12);
+    sensors.setResolution(11);
     sensors.setWaitForConversion(false);
     sensors.requestTemperatures();
     lastSensorConvMs = millis();
@@ -855,6 +866,79 @@ static uint8_t calcPumpDuty(float hot, float targetC,
     }
 }
 
+static void resetSolarPumpOverrides() {
+    pumpSpdOvMode    = 0;
+    hotRiseTracking  = false;
+    hotWasAboveHigh  = false;
+    hotPrevAboveLow  = false;
+    kick60Active     = false;
+}
+
+// Returns final pump duty after applying three speed override rules.
+// Rule 1: if pipe > 60°C and baseDuty < 4%, run 100% for 1s every 60s.
+// Rule 2: if hot rises from target-2.5 to target-2.0 in < 15s → 5s @ 100%.
+// Rule 3: if hot was > target+2.5 and drops to ≤ target+2.0 → 0% for 10s.
+static uint8_t applyPumpSpeedOverrides(uint8_t baseDuty, float hot, float cold, float targetC) {
+    unsigned long now = millis();
+
+    // Rule 3: track above-target excursion; trigger 10s zero on drop to target+2.0
+    if (hot > targetC + 2.5f) hotWasAboveHigh = true;
+    if (hotWasAboveHigh && hot <= targetC + 2.0f) {
+        hotWasAboveHigh  = false;
+        pumpSpdOvMode    = 2;
+        pumpSpdOvStartMs = now;
+    }
+
+    // Rule 2: track upward crossing of target-2.5; trigger 5s@100% on reaching target-2.0 within 15s
+    bool hotAboveLow = (hot >= targetC - 2.5f);
+    if (!hotPrevAboveLow && hotAboveLow && hot < targetC - 2.0f) {
+        hotRiseTracking = true;
+        hotRiseCrossMs  = now;
+    }
+    if (!hotAboveLow) hotRiseTracking = false;
+    hotPrevAboveLow = hotAboveLow;
+    if (hotRiseTracking) {
+        if (now - hotRiseCrossMs >= 15000UL) {
+            hotRiseTracking = false;
+        } else if (hot >= targetC - 2.0f) {
+            if (pumpSpdOvMode != 2) {
+                pumpSpdOvMode    = 1;
+                pumpSpdOvStartMs = now;
+            }
+            hotRiseTracking = false;
+        }
+    }
+
+    // Apply active timed override (takes priority over kick)
+    if (pumpSpdOvMode == 1) {
+        if (now - pumpSpdOvStartMs < 5000UL) return 100;
+        pumpSpdOvMode = 0;
+    }
+    if (pumpSpdOvMode == 2) {
+        if (now - pumpSpdOvStartMs < 10000UL) return 0;
+        pumpSpdOvMode = 0;
+    }
+
+    // Rule 1: every 60s run pump @ 100% for 1s when pipe > 60°C and base duty < 4%
+    bool pipeOver60 = (!sFault[SENSOR_SOLAR_HOT]  && hot  > 60.0f)
+                   || (!sFault[SENSOR_SOLAR_COLD] && cold > 60.0f);
+    if (pipeOver60 && baseDuty < 4) {
+        if (!kick60Active && now - lastKick60Ms >= 60000UL) {
+            kick60Active  = true;
+            kick60StartMs = now;
+            lastKick60Ms  = now;
+        }
+    } else {
+        kick60Active = false;
+    }
+    if (kick60Active) {
+        if (now - kick60StartMs < 1000UL) return 100;
+        kick60Active = false;
+    }
+
+    return baseDuty;
+}
+
 // ============================================================
 //  PC FAN SPEED (Timer5 25kHz hardware PWM on D45 = OC5B)
 // ============================================================
@@ -1043,6 +1127,7 @@ void updateWinterSolar(float tankBottomC) {
         // Sensor fault: dump through UFH
         ufhColdValve.setOpen();
         solarColdValve.setOpen();
+        resetSolarPumpOverrides();
         setSolarPumpDuty(100);
         setFault(FAULT_W_SOLAR_PUMP); // covered by sensor fault logic
         solarPumpActive = false;
@@ -1087,6 +1172,7 @@ void updateWinterSolar(float tankBottomC) {
             if ((hot - cold) <= 2.0f) {
                 // Stop solar
                 solarColdValve.setClose();
+                resetSolarPumpOverrides();
                 setSolarPumpDuty(0);
                 solarPumpActive = false;
             }
@@ -1103,11 +1189,12 @@ void updateWinterSolar(float tankBottomC) {
     }
 
     // Speed ramp: hot side targets 20°C
-    uint8_t htrPct  = hasHPacket ? lastH.heaterPowerPct : 0;
-    float   htrOutC = (hasHPacket && lastH.tempHeaterOut != TEMP_FAULT)
-                      ? (float)lastH.tempHeaterOut / 10.0f : NAN;
-    uint8_t duty = calcPumpDuty(hot, (float)WINTER_UFH_TARGET_C / 10.0f, htrPct, htrOutC);
-    setSolarPumpDuty(duty);
+    float   wTarget   = (float)WINTER_UFH_TARGET_C / 10.0f;
+    uint8_t duty      = calcPumpDuty(hot, wTarget, 0, NAN);
+    uint8_t finalDuty = applyPumpSpeedOverrides(duty, hot, cold, wTarget);
+    if (hasHPacket && lastH.heaterPowerPct > 0 && lastH.hPumpDutyPct > finalDuty && hot < wTarget)
+        finalDuty = 0;
+    setSolarPumpDuty(finalDuty);
 
     // Overspeed fault: pump above minimum for > 10s AND cold > tankBottom + 10°C
     // If tank bottom is stale: skip fault check
@@ -1136,6 +1223,7 @@ void updateWinterSolar(float tankBottomC) {
     // Stop condition: hot no longer > cold + 2°C
     if ((hot - cold) <= 2.0f) {
         solarColdValve.setClose();
+        resetSolarPumpOverrides();
         setSolarPumpDuty(0);
         solarPumpActive = false;
     }
@@ -1161,6 +1249,7 @@ void updateSummerSolar() {
             solarDumpActive  = true;
             solarDumpUFHOn   = true;
         }
+        resetSolarPumpOverrides();
         setSolarPumpDuty(100);
         solarPumpActive = false;
         return;
@@ -1220,12 +1309,10 @@ void updateSummerSolar() {
 
     SolarTargetMode tgtMode = hasHPacket ? (SolarTargetMode)lastH.solarTargetMode : SOLAR_TANK_PLUS5;
     float solarTarget  = (tgtMode == SOLAR_MAX) ? 80.0f : min(tankTopC + 5.0f, 80.0f);
-    float heaterTarget = (tgtMode == SOLAR_MAX) ? 89.0f : min(tankTopC + 5.0f, 89.0f);
 
     // Cal override: H sets calPumpActive=1 and drives solarTarget remotely
     if (hasHPacket && lastH.calPumpActive) {
         solarTarget  = (float)lastH.calSolarTargetC / 10.0f;
-        heaterTarget = 89.0f;
         if (!solarPumpActive) {
             solarColdValve.setOpen();
             solarPumpActive   = true;
@@ -1233,10 +1320,7 @@ void updateSummerSolar() {
         }
     }
 
-    uint8_t htrPct  = hasHPacket ? lastH.heaterPowerPct : 0;
-    float   htrOutC = (hasHPacket && lastH.tempHeaterOut != TEMP_FAULT)
-                      ? (float)lastH.tempHeaterOut / 10.0f : NAN;
-    uint8_t duty = calcPumpDuty(hot, solarTarget, htrPct, htrOutC);
+    uint8_t duty = calcPumpDuty(hot, solarTarget, 0, NAN);
 
     bool tankBotStale = !hasHPacket || (millis() - lastRxMs > 10000UL)
                          || lastH.tempTankBot == TEMP_FAULT;
@@ -1245,7 +1329,7 @@ void updateSummerSolar() {
     // Allow full stop only when both solar pipes are below tank bottom,
     // heater off, sequence done, 2-port on heater side, and solar far below target.
     // In all other cases hold at minimum 1%.
-    if (duty <= 1 && solarPumpActive && htrPct == 0) {
+    if (duty <= 1 && solarPumpActive) {
         bool bothBelowTankBot = !tankBotStale
                                 && !sFault[SENSOR_SOLAR_HOT] && !sFault[SENSOR_SOLAR_COLD]
                                 && hot < tankBotC && cold < tankBotC;
@@ -1260,7 +1344,12 @@ void updateSummerSolar() {
             duty = 1;
         }
     }
-    setSolarPumpDuty(duty);
+    {
+        uint8_t finalDuty = applyPumpSpeedOverrides(duty, hot, cold, solarTarget);
+        if (hasHPacket && lastH.heaterPowerPct > 0 && lastH.hPumpDutyPct > finalDuty && hot < solarTarget)
+            finalDuty = 0;
+        setSolarPumpDuty(finalDuty);
+    }
 
     // Overspeed overheat fault (same as winter)
     bool pumpAboveMin = (duty > 1);
@@ -1300,6 +1389,7 @@ void updateSummerSolar() {
     if (!pvActive && pipeCool && arrayLow) {
         solarColdValve.setClose();
         ufhColdValve.setClose();
+        resetSolarPumpOverrides();
         setSolarPumpDuty(0);
         solarPumpActive = false;
         summerPhase     = SUMPH_IDLE;
@@ -2613,12 +2703,7 @@ void loop() {
     }
     prevFanBtn = fanBtn;
 
-    // Start new sensor conversion every ~1.1s
-    static unsigned long lastConvStartMs = 0;
-    if (!sensorConvStarted && now - lastConvStartMs >= 1100UL) {
-        startSensorConversion();
-        lastConvStartMs = now;
-    }
+    if (!sensorConvStarted) startSensorConversion();
     readSensors();
 
     // Valve & winch state machines (non-blocking)

@@ -121,7 +121,7 @@ ILI9488 driver, SPI pins, and display dimensions configured via `build_flags` in
 
 ### Heater SSR — SOC-based charge rate control (summer mode)
 Spec: heater modulates purely on PV export, starts at 500W export.
-Code: two independent signals can drive SSR power up, whichever demands more wins.
+Code: duty calculated every RS485 packet (~250ms) from net grid flow, battery balance, and the heater's own current consumption.
 
 **Manual modes** (`ManualHeaterMode` enum):
 - `MHM_OFF` — heater stays off
@@ -134,19 +134,41 @@ Code: two independent signals can drive SSR power up, whichever demands more win
 - `growattValid = 1` AND combined PV1+PV2 ≥ 200W (end-of-day gate)
 
 **Charge rate target (SOC-based):**
-- SOC < 60%: no charge rate control; existing 500W export start threshold applies
+- SOC < 60%: no charge rate contribution; battery discharge still penalises duty
 - SOC 60%→80%: target = 3000W linearly interpolated to 1000W (100W per 1% SOC)
 - SOC 80%→100%: target = 1000W flat
 
-**Start conditions (either triggers heater on):**
-- Export ≥ 500W, OR
-- SOC ≥ 60% AND `battChargeW` (from `WToHPacket`) > SOC target
+**Duty calculation (every packet):**
 
-**Stop condition:** export < 100W AND (SOC < 60% OR charge rate ≤ target)
+```
+netGridW       = pvExportW − gridImportW          // +ve = exporting
+battW          = battChargeW − chargeTarget        // if SOC ≥ 60%
+               = min(0, battChargeW)               // if SOC < 60% (discharge-only penalty)
+heaterCurrentW = heaterTargetPct × 3000 / 100     // heater's own load already in Growatt readings
+available      = netGridW + heaterCurrentW + battW − 100
+rawPct         = clamp(available × 100 / 3000, 0, 100)
+```
 
-**Duty calculation:** `max(exportPct, chargePct)` where:
-- `exportPct = max(0, pvExportW − 100) × 100 / 3000`
-- `chargePct = max(0, battChargeW − chargeTarget) × 100 / 3000` (0 when SOC < 60%)
+Adding `heaterCurrentW` back reconstructs the system balance as if the heater weren't running, so the formula converges to the correct stable duty in one step rather than hunting.
+
+**Start:** `rawPct ≥ 5` (~150W net surplus)  
+**Stop:** `rawPct = 0` immediately
+
+### Solar pump direct drive (D46)
+
+Not in spec. H drives the solar pump MOSFET gate directly via D46, connected via a 40m spare wire and 1N4148 diodes (wired-OR) to W's D44 gate drive. The gate sees whichever signal is higher — both controllers are independent and failsafe.
+
+**H pump duty** (`hPumpDutyPct`, added to `HToWPacket`):
+- 0 when heater is off or `heaterTargetPct = 0`
+- When heater is on: ramps from a protective minimum toward 100% based on heater outlet vs heater target
+  - Minimum = `max(2, heaterPct/5)`, slightly boosted above 70°C outlet, capped at 25%
+  - Ramp starts at target − 2°C, reaches 100% at target + 2°C
+  - At target + 2°C or above: 100% immediately
+  - Heater target = tank top + 5°C (SOLAR_TANK_PLUS5) or 89°C (SOLAR_MAX)
+- Uses same 3-zone clocking algorithm as W's `updateSolarPump`
+- H always drives this when heater is on; heater on always implies summer mode (pvExportOverride), so no winter-specific branch needed
+
+**H pin:** D46 (added after `PIN_RS485_DE_LINK`)
 
 ### 2-port valve mid-tank threshold — hysteresis added
 Spec: switch at 30°C (no hysteresis)
@@ -160,6 +182,15 @@ Code: in phase 3, 2-port tracks hot pipe vs tank top with ±1°C hysteresis:
 
 ### Fault log size — 80 entries not 200
 Spec suggested ~200 entries. Code uses 80 (`~40 bytes × 80 = 3.2KB`) to stay within ATmega2560 8KB RAM budget with headroom for other state.
+
+---
+
+## Both controllers — DS18B20 resolution
+
+Spec assumed 12-bit (750ms conversion, 0.0625°C precision).
+Code: 11-bit (375ms conversion, 0.125°C precision) — adequate for all thresholds in use.
+
+Conversion restarts immediately after each read (no inter-conversion gap). Average data age ~190ms vs ~550ms previously.
 
 ---
 
@@ -251,7 +282,7 @@ Separate `ocDumpActive` flag (static, inside `checkSolarPumpFault`) tracks the o
 
 Replaces `calcPumpDuty` (simple ±2°C ramp) and `clockPeriodForDiff` (3-step period lookup).
 
-**Heater off:**
+W calculates duty purely from solar hot vs solar target. No heater floor — heater-on pump control is handled by H via direct wire (see H controller section below).
 
 | Solar hot vs target | Duty |
 |---|---|
@@ -260,15 +291,30 @@ Replaces `calcPumpDuty` (simple ±2°C ramp) and `clockPeriodForDiff` (3-step pe
 | target − 2°C to target + 2°C | 4% → 100% linear (over 4°C) |
 | ≥ target + 2°C | 100% |
 
-**Heater on:**
-- Floor = `heaterMinPumpPct(heaterPct, heaterOutC)` = `max(2, heaterPct/5)`, boosted slightly if heater outlet > 70°C, capped at 25%. Needs on-site calibration.
-- Solar hot < target − 2°C: hold at floor
-- Solar hot target − 2°C to target + 2°C: linear floor → 100%
-- Solar hot ≥ target + 2°C: 100%
-
 Winter trigger (18°C) unchanged — pump will not start below this regardless of duty calc.
 
-`calcPumpDuty` signature changed to `(float hot, float targetC, uint8_t heaterPct, float heaterOutC)`. Summer solar's separate `dutyHeater` path (heater outlet vs heater target) removed; heater state now handled via the unified heaterMinPumpPct floor.
+`calcPumpDuty` signature changed to `(float hot, float targetC, uint8_t heaterPct, float heaterOutC)`.
+
+### Solar pump speed — overrides
+
+Three transient override modes applied on top of base duty each loop:
+
+**Rule 1 — 60s kick:** when either solar pipe > 60°C and base duty < 4%, fire a 1s full-speed kick every 60s to prevent stagnation at very low flow.
+
+**Rule 2 — fast-rise burst:** when solar hot crosses from ≥ target − 2.5°C upward AND reaches target − 2.0°C within 15s, run pump at 100% for 5s. Only triggers if hot was genuinely below target − 2.0°C at the crossing point.
+
+**Rule 3 — fast-drop pause:** when solar hot was > target + 2.5°C then drops to ≤ target + 2.0°C, set pump to 0% for 10s. Rule 3 takes priority over Rule 2 if both would fire simultaneously.
+
+Override state (`pumpSpdOvMode`) is reset at all solar pump stop points (sensor fault, trigger not met, season end).
+
+### Solar pump — H back-off
+
+W suppresses its own MOSFET output (D44 → 0) when all three conditions hold:
+- H has a valid packet and heater is running (`lastH.heaterPowerPct > 0`)
+- H's pump duty (`lastH.hPumpDutyPct`) exceeds W's calculated duty
+- Solar hot is below target
+
+W resumes output when solar hot reaches target or W's duty is ≥ H's. Diode-OR on the MOSFET gate means the higher of the two signals drives the pump regardless.
 
 ### Solar pump timing — three-zone clocking
 
