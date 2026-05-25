@@ -1766,12 +1766,18 @@ static void updateHPump() {
         return;
     }
     uint32_t onMs, offMs;
-    if (hPumpDuty <= 20) {
+    if (hPumpDuty <= 4) {
         onMs  = 200UL;
-        offMs = 19800UL - 1000UL * (hPumpDuty - 1);
+        offMs = 200UL * (100 - hPumpDuty) / hPumpDuty;
+    } else if (hPumpDuty <= 8) {
+        onMs  = 200UL + (uint32_t)(hPumpDuty - 4) * 50UL;
+        offMs = 4800UL - (uint32_t)(hPumpDuty - 4) * 50UL;
+    } else if (hPumpDuty <= 20) {
+        onMs  = 400UL;
+        offMs = 400UL * (100 - hPumpDuty) / hPumpDuty;
     } else if (hPumpDuty <= 50) {
-        onMs  = (uint32_t)hPumpDuty * 800UL / (100 - hPumpDuty);
-        offMs = 800UL;
+        onMs  = 400UL + (uint32_t)(hPumpDuty - 20) * 400UL / 30UL;
+        offMs = onMs * (100 - hPumpDuty) / hPumpDuty;
     } else {
         onMs  = 800UL;
         offMs = 800UL * (100 - hPumpDuty) / hPumpDuty;

@@ -228,9 +228,11 @@ unsigned long lastKick60Ms      = 0;
 bool          kick60Active      = false;
 unsigned long kick60StartMs     = 0;
 
-// Clocking: zone 1 (1-20%)  fixes on=200ms,  shrinks off 19800→800ms.
-//           zone 2 (20-50%) fixes off=800ms,  grows   on  200→800ms.
-//           zone 3 (50-100%)fixes on=800ms,   shrinks off 800→0ms.
+// Clocking: zone 0 (1-4%)   on=200ms,  off=200*(100-d)/d  — actual duty = input% exactly
+//           zone A (4-8%)   on 200→400ms, off 4800→4600ms (period=5000ms constant)
+//           zone B (8-20%)  on=400ms,  off=400*(100-d)/d  — actual duty = input% exactly
+//           zone C (20-50%) on 400→800ms, off=on*(100-d)/d
+//           zone D (50-100%)on=800ms,  off=800*(100-d)/d  — actual duty = input% exactly
 //           100% = continuous.
 
 // ============================================================
@@ -799,16 +801,19 @@ void updateSolarPump() {
         return;
     }
 
-    // Zone 1 (1–20%):  on=200ms fixed,  off shrinks 19800→800ms linearly.
-    // Zone 2 (20–50%): off=800ms fixed, on  grows  200→800ms via duty/(1−duty).
-    // Zone 3 (50–100%):on=800ms fixed,  off shrinks 800→0ms  via (1−duty)/duty.
     uint32_t onMs, offMs;
-    if (pumpTargetDuty <= 20) {
+    if (pumpTargetDuty <= 4) {
         onMs  = 200UL;
-        offMs = 19800UL - 1000UL * (pumpTargetDuty - 1);
+        offMs = 200UL * (100 - pumpTargetDuty) / pumpTargetDuty;
+    } else if (pumpTargetDuty <= 8) {
+        onMs  = 200UL + (uint32_t)(pumpTargetDuty - 4) * 50UL;
+        offMs = 4800UL - (uint32_t)(pumpTargetDuty - 4) * 50UL;
+    } else if (pumpTargetDuty <= 20) {
+        onMs  = 400UL;
+        offMs = 400UL * (100 - pumpTargetDuty) / pumpTargetDuty;
     } else if (pumpTargetDuty <= 50) {
-        onMs  = (uint32_t)pumpTargetDuty * 800UL / (100 - pumpTargetDuty);
-        offMs = 800UL;
+        onMs  = 400UL + (uint32_t)(pumpTargetDuty - 20) * 400UL / 30UL;
+        offMs = onMs * (100 - pumpTargetDuty) / pumpTargetDuty;
     } else {
         onMs  = 800UL;
         offMs = 800UL * (100 - pumpTargetDuty) / pumpTargetDuty;

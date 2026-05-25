@@ -320,11 +320,13 @@ W resumes output when solar hot reaches target or W's duty is ≥ H's. Diode-OR 
 
 Replaces `pumpClockPeriodMs` / `pumpMinOnMs` dynamic period scheme. Variables and `minClockingDuty()` function removed.
 
-| Zone | Duty range | On time | Off time |
-|---|---|---|---|
-| 1 | 1–20% | 200ms fixed | 19,800ms → 800ms (linear) |
-| 2 | 20–50% | 200ms → 800ms (`duty×800/(100−duty)`) | 800ms fixed |
-| 3 | 50–100% | 800ms fixed | 800ms → 0ms (`800×(100−duty)/duty`) |
-| — | 100% | continuous | — |
+| Zone | Duty range | On time | Off time | Actual duty |
+|---|---|---|---|---|
+| 0 | 1–4% | 200ms fixed | `200×(100−d)/d` | exact |
+| A | 4–8% | 200→400ms linear | 4800→4600ms linear (period=5000ms constant) | exact |
+| B | 8–20% | 400ms fixed | `400×(100−d)/d` | exact |
+| C | 20–50% | 400→800ms (`+(d−20)×400/30`) | `on×(100−d)/d` | exact at 20% and 50%, ±2% mid-range |
+| D | 50–100% | 800ms fixed | `800×(100−d)/d` | exact |
+| — | 100% | continuous | — | — |
 
-Zones 1/2 transition smoothly at 20% (on=200ms, off=800ms). Zones 2/3 transition smoothly at 50% (on=800ms, off=800ms). At high duty (e.g. 90%) the pump runs 800ms on / 89ms off rather than the old 7.2s on / 800ms off.
+All zone boundaries transition smoothly (same on/off at crossover points). Zones 0, A, B, D give actual duty = input% exactly. Zone C uses on growing linearly 400→800ms with off derived from the ratio, giving near-exact tracking.
