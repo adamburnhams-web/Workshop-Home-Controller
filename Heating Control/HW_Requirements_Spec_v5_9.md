@@ -1,13 +1,11 @@
 # H & W Integrated Control System — Complete Project Reference
-**Version 5.9** — Requirements Specification
-
-> **Note:** This document is the baseline requirements spec. Post-spec changes are captured in [SPEC_CHANGES.md](SPEC_CHANGES.md).
+**Version 6.0** — Requirements Specification
 
 ---
 
 ## 1. Project Status
 
-Requirements gathering complete. Hardware specification complete. Software implementation is the next stage.
+Implementation complete and running. Hardware commissioned at H side; W-side RS485 link and Growatt Modbus pending MAX485 installation. DS18B20 addresses filled in for all 13 sensors. `HEATER_ENABLED = true`.
 
 ---
 
@@ -18,17 +16,18 @@ Requirements gathering complete. Hardware specification complete. Software imple
 | Cable | Use |
 |---|---|
 | 6mm T&E | Mains power in both directions (grid feed to W from H, PV export from W back to H) |
-| 2.5mm T&E | Live + Neutral carry 15VDC power to both mid-point momentary switches (unlock and outside light). Earth wire carries buzzer trigger signal from W relay to buzzer at H. |
+| 2.5mm T&E | Live + Neutral carry 15VDC power to both mid-point momentary switches. Earth wire carries buzzer trigger signal from W relay to buzzer at H. |
 | 1mm T&E cable 1 | Live = unlock switch output signal to W / holds LED high when W is unlocked; Neutral = outside light switch output signal to W; Earth = spare |
-| 1mm T&E cable 2 | Both conductors and earth fully spare — intended for inter-controller RS485 communication between H and W controllers |
-| RS485 screened 24AWG cable | Carries SDM230 meter data to Growatt inverter only. SDM230 physically at W; read by Growatt to calculate grid export |
+| 1mm T&E cable 2 | Spare live + neutral used for inter-controller RS485 communication (A and B lines). Earth spare. |
+| RS485 screened 24AWG cable | Carries SDM230 meter data to Growatt inverter only. SDM230 physically at W. |
+| Spare wire on cable 2 | H D46 solar pump direct drive — routed from H to W gate junction via 1N4148 diode |
 | 4 × 15mm pipes in vacuum-insulated outer pipe | Hot heating system pipe, cold heating system pipe, DHW pipe (future), cold fresh water pipe |
 | 10mm earth cable | Earthing between H and W |
 
 ### 2.2 Pipe Bundle Detail
 
 - The vacuum-insulated outer pipe maintains thermal insulation of the 4 inner pipes
-- Vacuum pump at W runs to maintain this vacuum whenever the heating system is actively transferring heat in either direction
+- Vacuum pump at W runs to maintain this vacuum whenever the heating system is actively transferring heat
 
 ---
 
@@ -38,7 +37,7 @@ Requirements gathering complete. Hardware specification complete. Software imple
 |---|---|
 | H | The house/dwelling — contains heat store tank, log burner, electric heater, and associated valves and controls |
 | W | The workshop — contains solar thermal array, PV inverter, UFH, and associated valves and controls. 40m from H |
-| Mid-point | Near the back door of the dwelling. Contains: unlock button, outside light switch, and unlocked LED indicator. Treated as a separate node from H in system topology |
+| Mid-point | Near the back door of the dwelling. Contains: unlock button, outside light switch, and unlocked LED indicator. |
 
 ---
 
@@ -48,8 +47,8 @@ Requirements gathering complete. Hardware specification complete. Software imple
 
 **Heating**
 - Thermal solar array: 2 × 30 evacuated tubes by Navitron, rated 3.6kW, south-facing wall
-- 12VDC brushless pump, under 10W, 2-wire, on cold side of thermal solar. Speed controlled by MOSFET switching 15VDC supply at clocking rate — no separate PWM signal wire
-- 2 × 12VDC motorised valves on cold heating system pipe (2-wire, reverse voltage to close): one feeds UFH cold side, one feeds solar cold side via flap non-return valve
+- 12VDC brushless pump, under 10W, 2-wire, on cold side of thermal solar. Speed controlled by clocking the 15VDC supply via MOSFET. Gate driven by W D44 and H D46 in a wired-OR circuit (1N4148 diodes).
+- 2 × 12VDC motorised valves on cold heating system pipe: one feeds UFH cold side (direction relay SPDT), one feeds solar cold side via flap non-return valve (direction relay SPDT)
 - 230VAC central heating pump with thermostatic mixing valve (TMV) for UFH
 
 **PV**
@@ -62,12 +61,11 @@ Requirements gathering complete. Hardware specification complete. Software imple
 **Sensors**
 - DS18B20: solar hot side
 - DS18B20: solar cold side
-- DS18B20: UFH supply (at UFH pump — return from UFH circuit. Used for logging and pump-off check at 28°C)
-- DS18B20: UFH post TMV (after thermostatic mixing valve — supply to UFH pipes. Used for 45°C hard lockout only)
+- DS18B20: UFH supply (at UFH pump return. Used for logging and pump-off check at 28°C)
+- DS18B20: UFH post TMV (after thermostatic mixing valve. Used for 45°C hard lockout only)
 - DS18B20: Workshop air temperature
 - DS18B20: outside air temperature
 - PIR sensor: 15VDC output when activated — voltage divider required
-- Summer/winter mode — REMOVED: now controlled via display at H
 - Door reed switch: dry contact, normally open, closes when door opens (opens when door closed)
 - Door handle reed switch: dry contact, closed when handle is pushed down
 - Window winch reed switches: fully open, fully closed, manual lock
@@ -76,14 +74,16 @@ Requirements gathering complete. Hardware specification complete. Software imple
 - INA219 current sensor module (I2C) on solar pump positive feed
 
 **Other**
-- Electric door lock (15VDC) — 2 relay H-bridge required, pulsed 1s to unlock then de-energised
-- 230VAC wall axial fan (S&P HCBB/4-450/H, 480W) with BES fan speed controller (manual dial) and external flap actuator (15VDC)
+- Electric door lock (15VDC) — 2 relay H-bridge, pulsed 1s to unlock/lock then de-energised
+- 230VAC wall axial fan (S&P HCBB/4-450/H, 480W) with BES fan speed controller and external flap actuator (15VDC)
 - 230VAC window winch
-- 230VAC vacuum pump with 15VDC motorised isolation valve (2-wire, reverse voltage to close, 2 relays required)
+- 230VAC vacuum pump with 15VDC motorised isolation valve (H-bridge, 2 relays)
 - 230VAC external LED lights
 - 15VDC alarm sounder (sounds when PIR detects intruder whilst W is locked, auto-stops after 1 minute)
 - Manual latching switch at W — suppresses auto-relock whilst ON
-- 2 × Fractal Design Dynamic X2 GP-14 (140mm, 3-pin, 12VDC). MOSFET (IRLZ44N) switches 12VDC supply at 25kHz PWM. Powered from 12V DC-DC buck converter from 15V bus. Momentary push button at W sets 8-hour full speed timer.
+- 2 × Fractal Design Dynamic X2 GP-14 (140mm, 3-pin, 12VDC). MOSFET switches 12VDC supply at 25kHz PWM. Powered from 12V DC-DC buck converter from 15V bus. Momentary push button at W sets 8-hour full speed timer.
+- Hen house door (H-bridge, 2 relays on 4-ch board) — OPEN and CLOSE relays, 7s pulse
+- 2 × manual window buttons at W (D38 open, D39 close) — hold-to-run, reed lockouts apply
 
 ### 4.2 At H (House)
 
@@ -91,11 +91,11 @@ Requirements gathering complete. Hardware specification complete. Software imple
 - 1000L heat store tank with bottom, middle and top pipe connections
 - 3kW electric heater: cold side fed by 2-port valve from hot heating pipe from W; output connects to shared manifold with top of tank and log burner hot pipe
 - Log burner with 70L water jacket
-- 12VDC motorised valve on log burner cold pipe (2-wire, reverse voltage to close, 2 relays)
-- 12VDC motorised valve on bottom-of-tank pipe (2-wire, reverse voltage to close, 2 relays)
-- 2-port 12VDC motorised valve on hot heating system pipe from W (2-wire, reverse voltage to close, 2 relays): switches between → electric heater cold side OR → middle of tank
-- SSR-40DA zero-crossing solid state relay for heater power control (cycle-burst method)
-- AC zero-crossing detector module wired to H Mega INT0 pin — serves three functions: (1) cycle-level heater burst timing, (2) instant grid outage detection, (3) grid restore detection
+- 12VDC motorised valve on log burner cold pipe (H-bridge, 2 relays)
+- 12VDC motorised valve on bottom-of-tank pipe (H-bridge, 2 relays)
+- 2-port 12VDC motorised valve on hot heating system pipe from W (H-bridge, 2 relays): switches between → electric heater cold side (top-of-tank path) OR → middle of tank
+- SSR-40DA zero-crossing solid state relay for heater power control (Bresenham spread firing)
+- AC zero-crossing detector module on INT4 (D2): cycle-level heater timing, instant grid outage detection
 
 **Sensors**
 - DS18B20: tank bottom
@@ -103,14 +103,15 @@ Requirements gathering complete. Hardware specification complete. Software imple
 - DS18B20: tank top
 - DS18B20: hot heating system pipe to W
 - DS18B20: cold heating system pipe to W
-- DS18B20: heater hot side output
+- DS18B20: heater hot side output (primary)
+- DS18B20: heater hot side output 2 (secondary, redundant — both mounted at heater outlet)
 - 12VDC temperature module: outputs 12VDC when log burner water jacket exceeds 28°C — voltage divider required
-- 15VDC bus voltage monitor: resistor divider (10kΩ + 4.7kΩ) on H Mega ADC pin
+- 15VDC bus voltage monitor: resistor divider on H Mega ADC A0
 
 **Controls & Indicators**
 - 3 × panel-mount buttons at H display: SELECT, ↑ (UP), ↓ (DOWN)
 - 3.5" ILI9488 TFT display 480×320 SPI — see Section 9 for full display specification
-- MicroSD card module (SPI) for data logging
+- MicroSD card module (SPI) for data logging (log.csv, ISO datetime timestamps)
 - DS3231 RTC module (I2C) — essential for 5am heating trigger and time-gated security alerts
 - 12VDC backup PSU relay — switched by H Mega when bus voltage drops below 12V
 
@@ -118,12 +119,10 @@ Requirements gathering complete. Hardware specification complete. Software imple
 
 - Momentary unlock button (15VDC from 2.5mm T&E live, output on 1mm cable 1 live)
 - Momentary outside light switch (15VDC from 2.5mm T&E live, output on 1mm cable 1 neutral)
-- LED indicator: controlled entirely by W Mega on D34. Priority order (highest first):
+- LED indicator: controlled entirely by W Mega on D49 (via relay on 4-ch board). Priority order (highest first):
   1. Fault active — 1s on / 1s off continuous flash
-  2. Manual heater active (no fault) — 1s on / 5s off slow single flash
-  3. Workshop unlocked, no fault, no manual heater — steady HIGH
-  4. Workshop locked, no fault, no manual heater — off
-  - LED clears to next priority state when higher priority clears.
+  2. Workshop unlocked, no fault — steady HIGH
+  3. Workshop locked, no fault — off
 
 ---
 
@@ -135,7 +134,7 @@ Feeds from H: log burner cold valve OR bottom-of-tank valve (both connect to sam
 
 ### 5.2 Hot Heating System Pipe (W to H)
 
-From W: UFH hot output and solar hot output. At H: enters 2-port valve → switches to heater cold side OR middle of tank. Heater output joins shared manifold → top of tank + log burner hot pipe.
+From W: UFH hot output and solar hot output. At H: enters 2-port valve → switches to heater cold side (top-of-tank path) OR middle of tank. Heater output joins shared manifold → top of tank + log burner hot pipe.
 
 ---
 
@@ -145,7 +144,6 @@ From W: UFH hot output and solar hot output. At H: enters 2-port valve → switc
 
 - W door locked by default (15VDC electric lock, 2-relay H-bridge, pulsed 1s to unlock then de-energised)
 - Unlock: pressing momentary button at mid-point sends signal to W Mega → door lock pulsed 1s → 1mm T&E live held HIGH → LED at mid-point lights steady
-- Door reed switch: dry contact, normally open, closes when door opens, opens when door closes
 
 ### 6.2 Auto-Relock Logic
 
@@ -155,14 +153,22 @@ Auto-relock is prevented while ANY of the following conditions are true:
 - Manual suppression switch at W is ON
 - Window is not fully closed AND locked (fully closed reed switch not active OR manual lock reed switch not active)
 
-Relock timer: starts only when ALL four conditions are simultaneously clear. If any condition becomes active during the 5-minute countdown, timer resets to zero. After 5 continuous minutes of all four conditions clear → door relocks.
-
-Log entries: `Auto-relock prevented — door open` / `— PIR active` / `— suppression switch on` / `— window not closed/locked`
+Relock timer: starts only when ALL four conditions are simultaneously clear. After 5 continuous minutes of all four clear → door relocks.
 
 ### 6.3 Security Alerts
 
 - **Intruder alert:** PIR detects movement whilst W is locked → alarm at W sounds for 1 minute then auto-stops; buzzer at H sounds while PIR is active; logged
-- **Door handle alert:** door handle reed switch closes whilst W is locked → between 23:00–06:00 buzzer sounds minimum 10s (continues while held if longer); between 06:00–23:00 buzzer sounds only while handle held; logged with timestamp in both cases
+- **Door handle alert:** door handle reed switch closes whilst W is locked → between 23:00–06:00 buzzer sounds minimum 10s (continues while held if longer); between 06:00–23:00 buzzer sounds only while handle held; logged with timestamp
+
+### 6.4 Fire Alarm
+
+New logic — not in original spec:
+- **Trigger A (absolute):** workshop air > 25°C AND outside air has not been ≥ 25°C in the last 24 hours
+- **Trigger B (rate-of-rise):** workshop air rising ≥ 0.5°C/min AND door closed AND window fully closed
+- **Phase 1 (60s):** external lights flash 250ms, buzzer at H active, no local sounder
+- **Phase 2:** local sounder on 60s / off 60s, up to 5 cycles or until rate-of-rise stops
+- Clears on alert reset from H display (page 4)
+- Fault flag: `FAULT_W_FIRE_ALARM`
 
 ---
 
@@ -174,9 +180,9 @@ Controlled by: momentary switch at mid-point OR momentary switch at W. 230VAC LE
 
 ### 7.2 Workshop Fan (S&P HCBB/4-450/H)
 
-- 230VAC axial fan with BES manual speed controller (dial-set speed) and external flap actuator (15VDC)
+- 230VAC axial fan with BES manual speed controller and external flap actuator (15VDC)
 - Fan on/off controlled by relay on W 230VAC relay board
-- **Automatic night cooling** (230VAC fan only — PC fans are unaffected by night cooling logic): fan ON when outside air is more than 5°C below Workshop air temp; fan OFF when gap closes to 2°C or less
+- **Automatic night cooling** (230VAC fan only — PC fans unaffected): fan ON when outside air is more than 5°C below Workshop air temp; fan OFF when gap closes to 2°C or less
 - Night Cooling can be disabled via display toggle at H (page 4). State shown in status bar.
 - Flap actuator opens before fan relay energises; closes after fan relay de-energises
 
@@ -184,48 +190,41 @@ Controlled by: momentary switch at mid-point OR momentary switch at W. 230VAC LE
 
 Manual trigger only — 3 relays on W 230VAC relay board (direction open, direction close, power).
 
-Valid relay states — firmware treats as atomic group only:
+Valid relay states:
 
-| State | Relay 1 (direction open) | Relay 2 (direction close) | Relay 3 (power) | Notes |
+| State | Direction open (D31) | Direction close (D33) | Power (D29) | Notes |
 |---|---|---|---|---|
 | STOP | OFF | OFF | OFF | Only safe stop state. Power-up default. |
 | OPEN | ON | OFF | ON | Relay 1 and 3 energised simultaneously |
 | CLOSE | OFF | ON | ON | Relay 2 and 3 energised simultaneously |
 | FORBIDDEN | ON | ON | any | Hard interlock — must never occur |
-| FORBIDDEN | OFF | OFF | ON | Hard interlock — power without direction |
-| FORBIDDEN | ON | OFF | OFF | Hard interlock — direction without power |
-| FORBIDDEN | OFF | ON | OFF | Hard interlock — direction without power |
 
-Direction change: always STOP (all three OFF) → 1 second pause → new direction.
+Direction change: always STOP → 1 second pause → new direction.
 
-Firmware implementation: single function `setWinch(STOP/OPEN/CLOSE)` — never set individual relays independently.
+Immediate stop triggers:
+- Fully open reed switch activates → STOP + lock out OPEN direction
+- Fully closed reed switch activates → STOP + lock out CLOSE direction
+- Manual lock reed switch activates → STOP + lock out BOTH directions
+- Safety limit switch activates → STOP + lock out OPEN direction + fault log
 
-Immediate stop triggers — de-energise all three relays instantly then apply lockout:
-- Fully open reed switch activates → STOP + lock out OPEN direction. Lockout clears when switch deactivates.
-- Fully closed reed switch activates → STOP + lock out CLOSE direction. Lockout clears when switch deactivates.
-- Manual lock reed switch activates → STOP + lock out BOTH directions. Lockout clears when switch deactivates.
-- Safety limit switch activates → STOP + lock out OPEN direction + flash LED + log `Window Winch Over Open`. Close direction still available. Clears when switch opens.
+Manual buttons at W (D38/D39): hold-to-run. Reed lockouts still apply. Release = immediate stop.
 
-### 7.4 PC Cooling Fans at W (Fractal Design Dynamic X2 GP-14)
+### 7.4 PC Cooling Fans at W
 
-2 × 140mm 3-pin 12VDC fans. MOSFET (IRLZ44N) switches 12VDC supply at 25kHz PWM. Powered from 12V DC-DC buck converter from 15V bus.
+2 × 140mm 3-pin 12VDC fans. MOSFET switches 12VDC supply at 25kHz PWM.
 
 Fan control modes — priority order:
 
 | Priority | Mode | Speed | Trigger / Duration |
 |---|---|---|---|
 | 1 | Full speed timer | 100% | W button press = 8hrs. Adjustable at H display in 1-hour increments (0–24hrs). Counts down regardless of lock status. |
-| 2 | Base speed timer | Base % | Set at H display in 1-day increments (0–30 days). Counts down continuously regardless of lock status. When expires → fans off until workshop unlocked. |
+| 2 | Base speed timer | Base % | Set at H display in 1-day increments (0–30 days). Counts down continuously. When expires → fans off until workshop unlocked. |
 | 3 | Workshop unlocked | Base % | Fans run at base speed whenever workshop is unlocked. Off when locked. |
 | 4 | Off | 0% | Workshop locked, no timers active. |
 
-If full speed timer and base speed timer both active: full speed until full speed timer expires → base speed until base speed timer expires → off until unlocked.
+Base speed: set at H display in 10% increments (0–100%). Firmware enforces minimum speed if fan stall detected.
 
-Base speed: set at H display in 10% increments (0–100%). Firmware enforces minimum speed if fan stall detected at low duty cycle.
-
-Tachometer fault: if either fan reads zero RPM when commanded above minimum speed for >5s → flash LED, log fault. No buzzer.
-
-Status bar on all display pages: `FAN FULL 07:23` / `FAN BASE 3d 14h` / `FAN BASE` / `FAN OFF`
+Tachometer fault: if either fan reads zero RPM when commanded above minimum speed for >5s → flash LED, log fault.
 
 ---
 
@@ -237,90 +236,210 @@ Active when Mode is set to Winter via display at H. UFH heating operates normall
 
 **Thermal Solar — Winter**
 - Solar sequence triggers when solar hot side ≥ 18°C
-- Open UFH cold valve, open solar cold valve, start solar pump clocking 200ms ON every 2s
-- Solar pump speed ramps up starting 2°C below target, reaching 100% at 2°C above target. Winter solar target: 20°C (UFH circuit temperature)
-- Fault condition: pump running above clocking speed for >10s AND solar cold side >10°C above tank bottom temperature → thermal solar overheat alert (see Section 11). If tank bottom reading is stale due to RS485 comms fault: do not trigger this fault — assume solar is operating normally.
-- When solar hot side is no longer >2°C warmer than cold side: close solar cold valve, stop pump
-- Frost protection: if either solar side drops below 2°C → open UFH valve, run solar pump at full speed until solar output reaches 8°C → stop pump but leave UFH valve open until next heating cycle begins or solar reaches 18°C. Runs regardless of heating lockout state.
+- Open UFH cold valve, open solar cold valve, start solar pump clocking
+- Solar pump duty calculated by `calcPumpDuty(hot, targetC)`. Winter target: 20°C (UFH circuit temperature)
+- Fault condition: pump running above clocking speed for >10s AND solar cold side >10°C above tank bottom → thermal solar overheat alert
+- When solar hot side ≤ solar cold side + 2°C: close solar cold valve, stop pump
+- Frost protection: if either solar side drops below 2°C → open UFH valve, run solar pump at full speed until solar output reaches 8°C → stop pump but leave UFH valve open
 
 **Morning Heating Cycle (5am daily, RTC-triggered)**
-- Trigger: RTC reaches 05:00. No catch-up on power-cut restart — wait for next 5am.
-- Normal mode: if W air temp < 13.5°C → open UFH valve + start W central heating pump. Heating stops when W air temp reaches 13.5°C. Once target reached, UFH locked out until next 5am regardless of temperature drop.
-- Boost at 5am mode: heating triggers at boost target temp (13–20°C, default 15.5°C), turns OFF at boost target +0.5°C. Active until 10am the following day.
-- 8hr boost mode: heating starts immediately regardless of time, runs at boost target temp for 8 hours. UFH lockout still applies once target reached.
-- Frost protection during heating: if solar cold side < 2°C → open solar cold valve, run solar pump at full speed until 8°C reached. Runs regardless of heating lockout state.
-- UFH overheat: if UFH post TMV temp exceeds 45°C while UFH pump is running → stop pump, close UFH valve, flash LED, log `UFH Overheat`, hard lockout (does not restart until system restart). Frost protection may still use UFH regardless of this lockout.
-- Once W air temp reaches target: open log burner cold valve + ensure top-of-tank path is open, close bottom-of-tank valve. W UFH pump continues running until UFH supply thermistor drops below 28°C → everything stops until 5am next day.
+- Trigger: RTC reaches 05:00. No catch-up on power-cut restart.
+- Normal mode: if W air temp < 13.5°C → open UFH valve + start W central heating pump. Stops when W air temp reaches 13.5°C. UFH locked out until next 5am once target reached.
+- Boost at 5am mode: triggers at boost target temp (13–20°C, default 15.5°C), stops at boost target +0.5°C. Active until 10am the following day.
+- 8hr boost mode: starts immediately, runs at boost target temp for 8 hours.
+- UFH overheat: if UFH post TMV temp exceeds 45°C while UFH pump running → stop pump, close UFH valve, hard lockout until system restart
+- Once W air temp reaches target: open log burner cold valve + ensure top-of-tank path open (2-port to heater side), close bottom-of-tank valve. UFH pump continues until UFH supply drops below 28°C → everything stops.
 
 **Heat Source Selection at H (when morning heating is ON)**
-- If log burner temp module active (jacket > 28°C, hysteresis off below 25°C): open log burner cold valve; set 2-port valve to heater cold side (circulates heat from log burner through manifold to top of tank)
-- If log burner temp module NOT active: close log burner cold valve, open bottom-of-tank valve
-- If middle-of-tank temp > 30°C: switch 2-port valve to middle of tank
-- If middle-of-tank temp < 30°C: switch 2-port valve to heater cold side (connects to top of tank via heater)
-- Log burner and solar thermal can run simultaneously in winter — both circulate through UFH circuit. This is a valid and expected state requiring no special handling.
-
-**PV Export Override (winter day)**
-If PV export reaches 0.5kW during winter mode: switch entirely to summer mode logic (including heater activation). Summer mode continues until PV production drops to zero, then revert to winter mode.
+- If `hotTankProtection` is active: selection function skipped entirely
+- If log burner temp module active (jacket > 28°C, deactivates below 25°C): open log burner cold valve; set 2-port to heater side
+- If log burner NOT active: close log burner cold valve, open bottom-of-tank valve
+- 2-port valve position: switch to mid-tank at temp > 32°C, switch back to heater side at temp < 28°C (4°C hysteresis on middle-of-tank temperature)
+- Log burner and solar can run simultaneously in winter — valid expected state
 
 ### 8.2 Summer Mode
 
-Active when Mode is set to Summer via display at H, OR when PV export override is active. UFH is completely disabled in summer mode.
+Active when Mode is set to Summer via display at H. UFH is completely disabled in summer mode.
 
 **Summer Startup Sequence**
 
-Triggered when: PV export reaches 0.5kW OR solar hot side OR solar cold side reaches 50°C.
+Triggered when: solar hot side OR solar cold side ≥ 50°C, OR electric heater is powered.
 
-1. Open log burner cold valve + 2-port valve to top-of-tank path → solar pump starts clocking minimum speed → circulate until hot heating pipe reaches bottom-of-tank temperature
-2. Close log burner cold valve, open bottom-of-tank valve → circulate until hot heating pipe reaches top-of-tank temperature OR electric heater becomes powered
-3. Once hot pipe matches top-of-tank temperature: switch 2-port valve to heater cold side (water circulates through heater to top-of-tank manifold)
+Phase 0 → Phase 3 directly: collector at ≥ 50°C already exceeds tank bottom, so intermediate phases are bypassed. This also handles H rebooting mid-session cleanly.
 
-If both triggers fire simultaneously: sequence runs once only (double-start prevention flag). If solar triggers but PV export not yet at 0.5kW: valve startup sequence runs, heater activation waits for export threshold.
+On trigger: open log_burner_cold valve (false), open bottom-of-tank valve, 2-port valve to heater side (top-of-tank path). Solar pump starts.
+
+If `morningHeatActive` is true: startup sequence aborts and resets.
+
+**2-port valve — dynamic tracking (phase 3 onwards)**
+- Hot pipe > tank top + 1°C → heater/top-of-tank side
+- Hot pipe < tank top − 1°C → mid-tank side
+- Hold between ±1°C
+
+**Additional zero condition:** while `twoPortHeaterSide = true` AND summer startup phase ≥ 3 AND both solar hot and solar cold are below target AND below 65°C → set solar pump duty to 0. Prevents W fighting H for pump when H has the two-port on heater side and both solar sides are cold.
 
 **Thermal Solar — Summer**
-- Solar pump clocks 500ms ON every 20s at minimum speed once summer startup triggered
-- Solar pump speed controlled by whichever sensor is closest to or exceeding its target:
-  - Solar hot side: target = top-of-tank temp + 5°C (Tank+5 mode) OR 80°C max (Max mode). Ramps from 2°C below target to 100% at 2°C above. 80°C absolute maximum prevents overheating.
-  - Heater output (only when heater powered): target = top-of-tank temp + 5°C (Tank+5 mode) OR 89°C max (Max mode). Pump reaches 100% at 91°C.
-- Solar target mode (Tank+5 vs Max) toggled from display page 4. Greyed out in winter mode.
-- Solar system stays active while: hot heating pipe is >5°C warmer than cold heating pipe, OR PV panels are producing any power
-- When top-of-tank valve held open but heater not powered AND solar temp >15°C below target: solar pump does not clock
-- Fault condition: pump running above clocking speed for >10s AND solar cold side >10°C above tank bottom temperature → thermal solar overheat alert (see Section 11). If tank bottom reading is stale due to RS485 comms fault: do not trigger this fault.
 
-**Electric Heater Control**
-- Heater powers ON when PV export first reaches 0.5kW (trigger threshold with hysteresis)
-- Once running: heater power modulated via SSR cycle-burst to maintain PV export at ~100W
-- Heater switches OFF if PV export drops below 0.1kW and cannot be maintained. Must reach 0.5kW again to re-engage.
-- Above 91°C heater output: heater power begins reducing
-- At 92°C heater output: heater fully off
-- When heater stops being powered: 2-port valve remains open (stays connected to heater cold side)
-- Once heater no longer powered and solar reaches its own target: top-of-tank valve no longer held open
-- Minimum solar pump speed when heater powered: set by heater power level and hot pipe supply temperature — calibration required on-site
+Solar pump duty calculated by `calcPumpDuty(hot, solarTarget)`:
 
-**Overheat Protection (summer)**
-If heater output >92°C for >1 minute AND heater is off: close bottom-of-tank valve, open log burner cold valve, ensure top-of-tank path open. Hold until solar goes off (PV = zero) → restart from beginning of summer sequence.
-
-### 8.3 Manual Heater Mode
-
-Activated from display page 4. Three states:
-
-| State | Behaviour |
+| Solar hot vs target | Duty |
 |---|---|
-| Off | Heater off, no manual control |
-| Manual — SOC limited | Heater on, modulated via SSR cycle-burst to keep grid import at ~100W. Auto-off if battery SOC drops to 50%. SOC read from Growatt Modbus. If SOC data older than 10s — force heater off. |
-| Manual — override SOC | Full 3kW continuous — SSR held fully ON every cycle. No SOC check, no modulation. Runs until manually cancelled. Display shows red `MANUAL HTR — FULL 3kW` warning. |
+| < target − 8°C | 4% |
+| target − 8°C to target | 4% → 50% linear |
+| target to target + 2°C | 50% → 100% linear |
+| ≥ target + 2°C | 100% |
 
-All heater safety limits apply in all manual states: overheat (91°C), element fail, zero-crossing SSR control. Grid outage forces heater off in all manual states. Manual heater state is NOT stored in EEPROM — resets to Off on power cycle.
+Solar target = `min(tankTop + 8°C, 87°C)` (SOLAR_TANK_PLUS8 mode) or 87°C flat (SOLAR_MAX mode).
 
-Logs: `Manual heater on — SOC limited` / `Manual heater on — SOC override` / `Manual heater off` / `Manual heater auto-off — SOC limit reached`
+Solar target mode toggled from display page 4.
 
-### 8.4 Solar Pump Speed — General Rules
+**Solar pump overrides** (applied on top of base duty each loop):
+- **Rule 1 — 60s kick:** when either solar pipe > 60°C and base duty < 4%, fire a 1s full-speed kick every 60s
+- **Rule 2 — fast-rise burst:** when solar hot crosses up through target − 2°C AND reaches that level within 15s, run pump at 100% for 5s
+- **Rule 3 — fast-drop pause:** when solar hot was > target + 2.5°C then drops to ≤ target + 2°C, set pump to 0% for 10s. Takes priority over Rule 2.
 
-- Speed ramps linearly: 0% at 2°C below target, 100% at 2°C above target
-- In winter: target is W UFH temperature (20°C)
-- In summer: target is the lower of the two sensor targets (solar hot side or heater output when powered)
-- Minimum pump speed in summer when heater powered: set by heater power level and hot pipe supply temperature — to be calibrated by on-site testing
-- Pump controlled by MOSFET (IRLZ44N) switching 15VDC supply at clocking rate. Minimum ON pulse 200ms ensures pump spins reliably.
-- INA219 current sampled during ON period only, after 50ms spin-up delay, to avoid false zero readings during OFF periods
+**H back-off:** W suppresses its own pump output when H has a valid packet, H's heater is running, and H's pump duty exceeds W's calculated duty, and solar hot is below target. W resumes when solar hot reaches target or W's duty is ≥ H's. Wired-OR gate means the higher of the two signals drives the pump regardless.
+
+**Solar cold valve:** always open when heater is running (`lastH.heaterPowerPct > 0`).
+
+**Hot side overheat:**
+- Solar hot > 91°C AND pump at 100% AND tank bottom < 70°C → set `FAULT_W_SOLAR_OVERHEAT_HOT`; clears when solar hot ≤ 91°C
+- UFH dump: when `91°C < solar hot < 93°C` AND solar cold < 93°C → open `ufhColdValve`; close otherwise. Independent of fault flag.
+
+### 8.3 Electric Heater Control
+
+**Pre-conditions** (all must pass, in order):
+1. Grid present AND `HEATER_ENABLED = true`
+2. Solar cold valve open (`VSTATE_SOLAR_COLD_OPEN`)
+3. No W solar sensor fault
+4. No heater hard lockout (`heaterHardLockout = false`)
+5. `hotTankProtection = false` (tank_bot ≤ 83°C — see §8.4)
+6. `morningHeatActive = false`
+7. Valves not currently mid-close stroke (prevents starting while bot_tank or two_port is moving toward closed)
+
+**Manual heater modes** (`ManualHeaterMode` enum):
+
+| Mode | Value | Behaviour |
+|---|---|---|
+| `MHM_OFF` | 0 | Heater off |
+| `MHM_SOC_LIM` | 1 | Run at 100% drawing from battery+grid. Enter at SOC ≥ 55%; leave below 50% (5% hysteresis). Budget: 4 kW combined bat+grid. heater gets all remaining headroom. |
+| `MHM_FORCE_ON` | 2 | Full 3kW continuous. Also requests log_cold close, bot_tank and two_port open. No SOC check. |
+
+Manual heater state NOT stored in EEPROM — resets to Off on power cycle.
+
+**Auto mode duty calculation** (per RS485 packet, ~250ms):
+
+SOC-based reservation reduces the available power to preserve battery charge:
+
+```
+post-noon (hour ≥ 12):
+  soc > 97% → reservationW = 200W
+  soc > 90% → reservationW = 500W
+  soc > 80% → reservationW = 1100W
+  otherwise → reservationW = 0
+
+pre-noon (hour < 12):
+  soc > 97% → reservationW = 200W
+  soc > 90% → reservationW = 500W
+  soc > 50% → reservationW = 1100W    // lower threshold before noon
+  otherwise → reservationW = 0
+
+heaterCurrentW = heaterTargetPct × 3000 / 100
+
+If reservation > 0:
+  available = pvExportW − gridImportW + battChargeW + heaterCurrentW − reservationW
+Else:
+  available = pvExportW − gridImportW + min(0, battChargeW) + heaterCurrentW − 100
+
+rawPct = clamp(available × 100 / 3000, 0, 100)
+```
+
+Adding `heaterCurrentW` back corrects for the heater's own load already appearing in Growatt readings, so the formula solves for the correct duty in one step.
+
+**Start hysteresis:** rawPct ≥ 17% (~500W surplus) sustained for 5 seconds.
+
+**Stop hysteresis:** 5 consecutive zero-rawPct packets before heater turns off (prevents brief cloud cover from cycling the heater).
+
+**Smoothing:** 8-packet running average applied before assigning to `heaterTargetPct`.
+
+**Hot pipe cap** (applied after smoothing):
+- hot_pipe ≥ 90°C → heaterTargetPct = 0
+- hot_pipe 60–90°C → cap at `(90 − hot_pipe) × 3.33%/°C` (100% at 60°C, 0% at 90°C)
+
+**`botTankValve.request(true)`** called whenever heater is running.
+
+**RS485 stale check:** if RS485 comms stale > 60s while heater is running → `heaterTargetPct = 0`, `heaterRunning = false`.
+
+### 8.4 Hot Tank Protection
+
+Prevents the heater from running into an already-hot tank.
+
+`checkHotTankProtection()` monitors `tank_bot`:
+- **Enter** (tank_bot > 83°C): `hotTankProtection = true`, log_burner_cold opens, bot_tank valve closes, two_port opens. Heat source selection logic skipped while active.
+- **Leave** (tank_bot < 82°C, 1°C hysteresis): `hotTankProtection = false`.
+
+### 8.5 H-Side Solar Pump Direct Drive
+
+H drives the solar pump MOSFET gate directly via D46, connected through a 40m spare wire and 1N4148 diode wired-OR with W's D44 output. The gate sees whichever signal is higher — both controllers are independent and failsafe.
+
+`calcHPumpDuty()` returns a float (0.0–100.0):
+- 0 when heater is off, both heater sensors faulted, or hot pipe sensor faulted
+- 100 during `heaterHardLockout` (maximum flow when fault triggers safety shutdown)
+
+**Predictive base formula** (`calcPred`):
+```
+excess   = heaterPct − 20
+pt       = max(0, excess²) × 0.0025        // plateau term (power delivery above 20%)
+tr       = 0.09 + max(0, excess) × 0.022   // thermal rise slope
+raw      = 4 + pt + tr × (hotPipeC − 30)
+minDuty  = 4 + heaterPct × 0.05
+pred     = max(raw, minDuty)               // 4% minimum
+```
+
+**SOLAR_TANK_PLUS8 mode** (when tank top ≤ 75°C and sensor valid):
+- target = `min(tankTop + 8°C, 87°C)`
+- heaterOut < target − 7°C: `pred × 0.9`
+- target − 7°C to target: ramp 0.9 → 1.0 × pred
+- target to 90°C: `pred + (hOut − target) × 0.2%/°C`
+- 90°C to 91°C: ramp from `dutyAt90` to 100%
+- ≥ 91°C: 100%
+
+**MAX mode** (or tank top sensor fault):
+- `upper = pred × (1.3 − clamp((pred−5)/25, 0, 1) × 0.2)`
+- heaterOut < 78°C: `pred × 0.9`
+- 78°C to 85°C: ramp pred × 0.9 → pred
+- 85°C to 90°C: ramp pred → upper
+- 90°C to 91°C: ramp upper → 100%; ≥ 91°C: 100%
+
+`updateHPump()` runs in a 50ms Timer1 ISR, independent of loop() timing.
+
+**Clocking zones:**
+
+| Zone | Duty | On time | Off time |
+|---|---|---|---|
+| A | 0–20% | 400ms | `400×(100−d)/d` ms |
+| B | 20–50% | `400+(d−20)×400/30` ms | `on×(100−d)/d` ms |
+| C | 50–100% | 800ms | `800×(100−d)/d` ms |
+| — | 100% | continuous | — |
+
+### 8.6 Heater Fault Handling
+
+**Dual heater output sensors:** `H_SENSOR_HEATER_OUT` (primary) and `H_SENSOR_HEATER_OUT_2` (secondary). `getHeaterOutC()` arbitrates: both valid → max of the two; one faulted → remaining sensor; both faulted → NAN.
+
+Heater output sensors excluded from the `sensorFaultMaskH` array — handled separately by `checkHeaterFaults()` with a 5s grace period.
+
+**Per-sensor fault logic:**
+- Both sensors faulted → `heaterPowerCapPct = 0` immediately, set both fault flags
+- Single sensor faulted → raise that sensor's fault flag after 5s grace; continue on remaining sensor
+- Hot pipe sensor faulted → `heaterPowerCapPct = 0` immediately
+
+**Overheat power cap** (ISR-level, via `heaterPowerCapPct`):
+- 91°C to 93°C: `heaterPowerCapPct` reduced linearly 100→0; valves requested open; `FAULT_H_HEATER_OVERHEAT_WARN` set
+- ≥ 93°C: `heaterPowerCapPct = 0`, `heaterHardLockout = true`, SSR pin cleared, `FAULT_H_HEATER_OVERHEAT_SHUT` set
+
+**Hard lockout auto-clear:** clears automatically when effective heater temp < 88°C AND at least one sensor is live. Also cleared by Page 5 Ack action (allows manual recovery without reboot).
+
+**Element fail detection:** removed. The old 30s/no-temp-rise check has been removed; dual sensor arbitration makes it redundant.
 
 ---
 
@@ -330,126 +449,109 @@ Logs: `Manual heater on — SOC limited` / `Manual heater on — SOC override` /
 
 - 3.5" ILI9488 TFT 480×320 SPI display at H
 - 3 panel-mount buttons: SELECT, ↑ (UP), ↓ (DOWN)
+- Driver: TFT_eSPI with ILI9488_DRIVER configured in platformio.ini build_flags
 
 ### 9.2 Button Behaviour
 
-Three navigation modes. SELECT moves one level deeper; scrolling past boundaries then pressing SELECT moves one level back.
-
 | Mode | UP ↑ | DOWN ↓ | SELECT |
 |---|---|---|---|
-| Page scroll mode | Previous page | Next page | Enter item mode — highlights first item on current page |
-| Item mode — on an item | Move to previous item | Move to next item | Enter option mode for highlighted item |
-| Item mode — past top boundary | No action (at boundary) | Move to first item | Exit item mode → return to page scroll mode |
-| Item mode — past bottom boundary | Move to last item | No action (at boundary) | Exit item mode → return to page scroll mode |
-| Option mode | Previous option / decrement | Next option / increment | Confirm choice → return to item mode |
+| Page scroll mode | Previous page | Next page | Enter item mode |
+| Item mode — on an item | Previous item | Next item | Enter option mode |
+| Item mode — past top boundary | No action | Move to first item | Exit to page scroll |
+| Item mode — past bottom boundary | Move to last item | No action | Exit to page scroll |
+| Option mode | Previous option / decrement | Next option / increment | Confirm → return to item mode |
 
-**Visual feedback:**
-- Current page indicated by page number in status bar
-- Highlighted item shown with amber border or inverted background
-- Boundary state: highlight clears, subtle exit indicator shown (e.g. `< back to pages >` hint). UP/DOWN still navigates back to items from boundary state.
-- Option mode: selected item shows current value cycling with each press
+**Inactivity:** 30s no press in item/option mode → return to page scroll. 1hr no press with no fault → backlight off. Any press wakes display. If any fault active: backlight stays on.
 
-**Inactivity and wake:**
-- 30 seconds no button press in item or option mode → exit to page scroll mode, clear highlight
-- 1 hour no button press with no active fault → display backlight turns off
-- Any button press wakes display from backlight-off state
-- If any fault is active: display stays on, backlight never turns off
-- After 1 hour no input: display returns to page 1
+**Boost shortcut:** Double-press SELECT from page scroll mode → toggles Boost at 5am on/off from any page.
 
-**Alert reset:** Physical RESET button removed. Alert reset is an item on page 4 controls — navigate to it with SELECT + UP/DOWN, then press SELECT to acknowledge and clear the flashing LED. Alert reset item only visible on page 4 when a fault alert is active. If fault condition still present when reset selected: LED re-triggers immediately.
-
-**Boost shortcut:** Double-press SELECT from page scroll mode (not item mode) → toggles Boost at 5am on/off from any page.
+**Alert reset:** item on page 4. Navigate to it and press SELECT to acknowledge and clear the flashing LED. If fault still present: LED re-triggers immediately.
 
 ### 9.3 Persistent Elements (all pages)
 
-- **Top status bar:** Mode (Winter/Summer), Boost status + countdown, Night Cooling on/off, Solar Target mode (Tank+5/Max), Clock (from RTC)
-- **Bottom fault bar:** all active faults shown with elapsed time. Scrolls if multiple active. Grid Outage shown here, not in status bar.
-- **Manual override active:** red `MANUAL OVERRIDE ACTIVE — automatic valve control suspended` banner below status bar on all pages
-- **Manual heater — SOC limited:** amber `MANUAL HEATER — SOC limited` banner below status bar on all pages while active
-- **Manual heater — Override SOC:** red `MANUAL HEATER — FULL 3kW — no SOC limit` banner below status bar on all pages while active
-- If both manual heater and manual valve override are active simultaneously: both banners stack below status bar
+**Status bar (top):** Mode (Winter/Summer), Boost status + countdown, Night Cooling on/off, Solar Target mode (`TK+8` or `MAX`), Clock from RTC.
+
+**Fault bar (bottom):** all active faults shown with elapsed time. Scrolls if multiple active.
+
+**Banners (below status bar):**
+- Manual override active: red `MANUAL OVERRIDE ACTIVE — automatic valve control suspended`
+- SOC-Lim heater: red `SOC-LIM: XX% — HEATING` or `SOC-LIM: XX% — DONE`
+- Force-on heater: red `HEATER MANUAL ON — FULL 3kW`
+- Both manual heater and manual valve override active: both banners stack
 
 ### 9.4 Page 1 — Heating System
 
-- Solar / Workshop temperatures: solar hot, solar cold, UFH supply, UFH post TMV, Workshop air, outside air
-- Tank / House temperatures: tank top, tank middle, tank bottom, hot pipe, cold pipe, heater output
-- Power: heater kW, solar pump %
-- Boost panel (when active): Workshop target temp
-- Valve states overview: all 6 valves shown as open/closed badges
-- Window winch state: open / closed / opening / closing / manual lock / over-open fault
+**Left column (W temperatures, 6 rows):** solar hot, solar cold, UFH supply, UFH post TMV, Workshop air, outside air
+
+**Right column (H temperatures, 7 rows):** tank bot, tank mid, tank top, hot pipe, cold pipe, Heater (htr_out_2), Htr Out (htr_out)
+
+**Power row:** `Heater: XXXX W` | `Sol H: XX%` (H pump duty) | `Sol W: XX%` (W pump duty)
+
+**Valve state badges:** all 6 valves shown open/closed
+
+**Window winch state:** open / closed / opening / closing / manual lock / over-open fault
 
 ### 9.5 Page 2 — Power & Inverter
 
 - PV: string 1 kW, string 2 kW, total PV kW, today's generation kWh
-- Grid: import/export kW with direction indicator (+/−), load power kW, grid voltage V, grid frequency Hz
-- Battery: SOC %, charge/discharge power kW (with direction), battery voltage V
-- Inverter: status (normal/fault/EPS/standby), temperature °C, fault code if active
+- Grid: import/export kW with direction indicator, load power kW
+- Battery: SOC %, charge/discharge power kW, battery voltage V
 - 15V bus voltage V
-- Note: all data sourced from Growatt Modbus at 850ms poll interval.
 
 ### 9.6 Page 3 — Fault History
 
-- Shows all faults logged since last system restart, most recent first
-- Each entry shows: fault name, time first occurred, time resolved, duration
-- Active faults shown in red. Resolved faults shown in grey.
-- Active faults show elapsed time since onset, updating live
-- Resolved faults show total duration (resolved time minus onset time)
-- If no faults since restart: shows `No faults recorded since restart`
-- Scrollable list — UP/DOWN buttons scroll entries when on this page and no item is highlighted
-- Fault data held in RAM — built in memory as faults occur and resolve. Clears on power cycle.
-- Maximum ~200 entries before RAM pressure on ATmega2560 (8KB RAM, ~40 bytes per entry). Sufficient for any normal session.
+- All faults logged since last system restart, most recent first
+- Each entry: fault name, time first occurred, time resolved, duration
+- Active faults in red. Resolved faults in grey.
+- Scrollable list — UP/DOWN buttons scroll entries
+- Fault data held in RAM. Clears on power cycle. Maximum 80 entries (~40 bytes × 80 = 3.2KB).
 
 ### 9.7 Page 4 — System Controls
 
-| Order | Item | UP/DOWN action | Values / notes |
+| Order | Item | UP/DOWN action | Values |
 |---|---|---|---|
-| 1 | Boost | Cycles: Off → Boost at 5am → 8hr boost → Off | Default: Off. NOT stored in EEPROM. Double-press SELECT from page scroll mode also toggles Boost at 5am. |
+| 1 | Boost | Cycles: Off → Boost at 5am → 8hr boost → Off | NOT stored in EEPROM |
 | 2 | Boost target | +/−0.5°C per press | 13°C – 20°C. Default: 15.5°C. NOT stored in EEPROM |
 | 3 | Mode | Toggle | Winter ↔ Summer |
-| 4 | Manual heater | Cycles: Off → SOC limited → Override SOC → Off | NOT stored in EEPROM |
+| 4 | Manual heater | Cycles: Off → SOC-Lim → Manual On → Off | NOT stored in EEPROM |
 | 5 | Night Cooling | Toggle | On ↔ Off |
-| 6 | Solar Target | Toggle (greyed out in winter) | Tank+5°C ↔ Max |
-| 7 | Fan base speed | +/−10% per press | 0–100%. Firmware enforces minimum if stall detected. |
-| 8 | Fan full speed timer | +/−1 hour per press | 0–24hrs. W button sets 8hrs directly. 0 = cancel timer. |
-| 9 | Fan base speed timer | +/−1 day per press | 0–30 days. Counts down regardless of lock status. 0 = off. |
+| 6 | Solar Target | Toggle | Tank+8°C ↔ Max |
+| 7 | Fan base speed | +/−10% per press | 0–100% |
+| 8 | Fan full speed timer | +/−1 hour per press | 0–24hrs |
+| 9 | Fan base speed timer | +/−1 day per press | 0–30 days |
 | 10 | Display brightness | +/−10% per press | 10–100% |
-| 11 | SD safe remove | SELECT to eject | Flushes writes, closes filesystem. Auto-reinitialises on card reinsert. |
-| 12 | Alert reset | SELECT to acknowledge | Only visible when a fault alert is active. Clears flashing LED. Re-triggers immediately if fault still present. |
+| 11 | SD safe remove | SELECT to eject | Flushes writes, closes filesystem |
+| 12 | Alert reset / Ack | SELECT to acknowledge | Visible when fault alert active. Also clears heater hard lockout to allow restart. |
 
-EEPROM storage: Mode, Night Cooling, Solar Target, Display brightness written after 30s timeout following last change. Boost state, Boost target, Manual heater state NOT stored in EEPROM.
+EEPROM storage: Mode, Night Cooling, Solar Target, Display brightness (30s timeout). All others NOT stored.
 
 ### 9.8 Page 5 — Valve States & Manual Override
 
-- All valve states displayed: UFH cold (Workshop), solar cold (Workshop), vacuum isolation (Workshop), log burner cold (House), bottom-of-tank (House), 2-port (House)
-- Window winch status: direction state (idle/opening/closing), reed switch states (fully open, fully closed, manual lock engaged), safety limit switch state
-- Manual override entered via SELECT when override item is highlighted. Must be explicitly entered — prevents accidental valve changes.
-- In override: UP/DOWN scroll between valves, SELECT toggles valve state, actuates immediately
-- Workshop valve override commands sent via RS485 to W Mega for actuation
-- Safety faults still function in override — safety always overrides manual state
-- Override state NOT stored in EEPROM — always reverts to automatic on power cycle
-- Log: `Manual override entered`, `Manual override exited`, with timestamps and valves changed
+- All valve states displayed: UFH cold, solar cold, vacuum isolation, log burner cold, bottom-of-tank, 2-port
+- Window winch status with reed switch states
+- Manual override: explicit entry via SELECT. UP/DOWN scrolls between valves, SELECT toggles state, actuates immediately
+- Workshop valve overrides sent via RS485 to W for actuation
+- Override NOT stored in EEPROM — always reverts to automatic on power cycle
 
 ### 9.9 Page Summary
 
-| Page | Content | Notes |
-|---|---|---|
-| 1 | Heating system | All temps, heater kW, solar pump %, boost panel, valve overview. Default page on power-on and after 1hr inactivity. |
-| 2 | Power & inverter | All Growatt data, PV strings, battery, grid, inverter status, bus voltage |
-| 3 | Fault history | All faults since restart, most recent first. Red = active, grey = resolved. |
-| 4 | System controls | Boost, mode, manual heater, night cooling, solar target, brightness, SD eject |
-| 5 | Valve states & manual override | All valve states. Manual override requires explicit entry. |
+| Page | Content |
+|---|---|
+| 1 | Heating system: all temps, heater W, Sol H %, Sol W %, valve overview, winch state |
+| 2 | Power & inverter: all Growatt data, PV strings, battery, grid, bus voltage |
+| 3 | Fault history: all faults since restart, most recent first |
+| 4 | System controls: boost, mode, manual heater, night cooling, solar target, fans, brightness, SD eject, ack |
+| 5 | Valve states & manual override |
 
 ---
 
 ## 10. Vacuum System
 
-- Vacuum pump (230VAC) with 15VDC motorised isolation valve (2-wire, reverse voltage to close, 2-relay H-bridge)
-- Vacuum sensor: dry contact, normally open (Mega reads HIGH via pull-up = low vacuum), closes when full vacuum achieved (Mega reads LOW)
-- System activates when heating or solar becomes active (either direction of heat transfer)
-- Sequence: open isolation valve → start vacuum pump → run until vacuum sensor confirms full vacuum (LOW)
+- Activates when heating or solar becomes active (either direction of heat transfer)
+- Sequence: open isolation valve → start vacuum pump → run until vacuum sensor confirms full vacuum
 - Once full vacuum achieved: run pump for additional 5 minutes, then close isolation valve 10 seconds before pump stops
-- Once full vacuum achieved in a session: do not restart pump even if vacuum is subsequently lost. Isolation valve remains closed. Resets at next day's heating/solar activation.
-- Maximum runtime: 30 minutes. If full vacuum not achieved within 30 minutes → stop pump, flash LED, log `Vac Pump Over Runtime`. No buzzer.
+- Once full vacuum achieved in a session: do not restart pump even if vacuum subsequently lost. Resets at next heating activation.
+- Maximum runtime: 30 minutes. If not achieved in 30 min → stop pump, set `FAULT_W_VAC_PUMP_OVERTIME`.
 
 ---
 
@@ -457,102 +559,104 @@ EEPROM storage: Mode, Night Cooling, Solar Target, Display brightness written af
 
 **Global alert rules:**
 - Buzzer at H sounds while fault condition is active — stops automatically when condition clears
-- Mid-point LED flashes 1s on/1s off from fault onset — continues until Alert Reset is selected on page 4 of H display
+- Mid-point LED flashes 1s on/1s off from fault onset — continues until Alert Reset selected on page 4
 - If fault still present when Alert Reset selected: LED re-triggers immediately
 - All faults shown on H display fault bar with elapsed time
 - All faults logged with timestamp to SD card
-- Alert Reset does not affect any heating, pump, or valve states
 
-| Error code | Trigger condition | Actions | Clears / resets |
+| Fault | Trigger | Actions | Clears |
 |---|---|---|---|
-| Thermal Solar Overheat — cold side high | Pump above clocking speed >10s AND solar cold side >10°C above tank bottom | Buzzer + LED flash + Display + Log. If both sides ≥90°C: open UFH valve, close tank valves, remove heater power, run UFH pump + solar pump until clears | Buzzer stops when clears. LED until Alert Reset selected on page 4. |
-| Thermal Solar Overheat — hot side high | Tank bottom <70°C AND solar hot >83°C AND pump at 100% | Buzzer + LED flash + Display + Log. UFH dump if both sides ≥90°C | Buzzer stops when clears. LED until Alert Reset selected on page 4. |
-| Solar Pump Fault | Pump commanded ON, current below calibrated minimum for >5s | Buzzer + LED flash + Display + Log. UFH dump if both sides ≥90°C | Buzzer stops when clears. LED until Alert Reset selected on page 4. |
-| Heater Overheat — power reduction sustained | Heater reducing power due to >91°C output for >20s AND hot pipe <80°C | Log + Display only | Auto-clears when condition resolves. |
-| Heater Overheat — heater shut down | Above condition continues >1 minute | Buzzer + LED flash + Display + Log + Heater off | Buzzer stops when clears. LED until Alert Reset selected on page 4. Heater off until restart. |
-| Heater Element Fail | Power applied >30s with no temperature rise on heater output | LED flash + Display + Log + Heater off (no buzzer) | LED until Alert Reset selected on page 4. Heater off until system restart. |
-| UFH Overheat | UFH post TMV temp >45°C while UFH pump running | LED flash + Display + Log + UFH pump stop + UFH valve close (no buzzer). Hard lockout — does not restart until system restart. Frost protection may still use UFH regardless. | LED until Alert Reset selected on page 4. UFH locked out until restart. |
-| Frost Protection — cold side not recovering | Frost protection active >1 min AND solar cold side not yet reached 4°C | LED flash + Display + Log (no buzzer) | LED until Alert Reset selected on page 4. |
-| Vac Pump Over Runtime | Vacuum pump running >30 min without achieving full vacuum | LED flash + Display + Log + Pump stopped (no buzzer) | LED until Alert Reset selected on page 4. |
-| 15V Bus Low | Bus voltage below 14V for >10s | LED flash + Display + Log (no buzzer) | Clears automatically above 14V. LED until Alert Reset selected on page 4. |
-| 12VDC PSU Activated | Bus voltage drops below 12V | Display + Log + 12VDC PSU relay ON | PSU relay off above 12.5V. Logged as `12VDC PSU Deactivated`. |
-| 15V Bus Restored | Bus voltage recovers above 14V | Display + Log | LED clears automatically. |
-| Grid Outage | Zero-crossing pulses absent >50ms | Display fault bar + Log + Heater forced off (no buzzer, no LED flash) | Auto-clears when grid restored. Logged as `Grid Restored`. |
-| Inverter Fault | Non-zero fault code from Growatt Modbus | LED flash + Display + Log with fault code (no buzzer) | LED until Alert Reset selected on page 4. Clears when fault code returns zero. |
-| Growatt Comms Fault | 5+ consecutive failed Modbus polls (~4.25s) | LED flash + Display + Log + Heater forced off (no buzzer) | Clears when comms restore. LED until Alert Reset selected on page 4. |
-| Intruder Alert | PIR detects movement whilst W is locked | Buzzer at H (while PIR active) + W alarm 1 min auto-stop + Log | Buzzer stops when PIR clears. No LED flash. |
-| Door Handle Alert 23:00–06:00 | Handle reed switch active whilst locked, night hours | Buzzer minimum 10s (continues while held if >10s) + Log | Buzzer stops when handle released (after minimum 10s). |
-| Door Handle Alert 06:00–23:00 | Handle reed switch active whilst locked, day hours | Buzzer only while handle held + Log | Buzzer stops immediately on release. |
-| Window Winch Over Open | Safety limit switch closes while winch opening | LED flash + Display + Log + Winch open direction locked out (no buzzer) | LED until Alert Reset selected on page 4. Close direction still available. Clears when switch opens. |
-| RS485 Comms Fault | 5+ consecutive missed H↔W packets (~1.25s) | LED flash + Display + Log (no buzzer) | Clears when comms resume. LED until Alert Reset selected on page 4. |
-| Workshop Fan 1 Fault | Fan 1 tach zero while commanded above minimum speed for >5s | LED flash + Display + Log (no buzzer) | LED until Alert Reset selected on page 4. |
-| Workshop Fan 2 Fault | Fan 2 tach zero while commanded above minimum speed for >5s | LED flash + Display + Log (no buzzer) | LED until Alert Reset selected on page 4. |
+| Solar Overheat — cold side high | Pump above clocking speed >10s AND cold side >10°C above tank bottom | Buzzer + LED + Display + Log | Buzzer stops on clear; LED until Ack |
+| Solar Overheat — hot side high | Tank bottom <70°C AND solar hot >91°C AND pump at 100% | LED + Display + Log | LED until Ack; clears when solar hot ≤ 91°C |
+| Solar pump fault | Current below calibrated minimum for >5s while pump commanded ON | Buzzer + LED + Display + Log. UFH dump if both sides < 93°C | LED until Ack |
+| Solar pump overcurrent | Current above maximum for >3s | Stop pump. LED + Display + Log. UFH dump if both sides < 93°C | LED until Ack; pump restarts when current normalises |
+| Heater Overheat — power reduction | Heater output rising above 91°C | ISR power cap engages; fault flag set. Valve open requested | Auto-clears below 91°C. Flag cleared on Ack. |
+| Heater Overheat — shutdown | Heater output ≥ 93°C | Heater hard lockout. SSR cleared. `FAULT_H_HEATER_OVERHEAT_SHUT`. Buzzer + LED | Auto-clears when temp < 88°C. Also clears on page 4 Ack. |
+| UFH Overheat | UFH post TMV temp >45°C while UFH pump running | LED + Display + Log + UFH stop + UFH valve close. Hard lockout until restart. Frost protection bypasses. | LED until Ack. UFH locked until restart. |
+| Frost — cold side not recovering | Frost protection active >1 min AND cold side not yet 4°C | LED + Display + Log | LED until Ack |
+| Vac Pump Overtime | Vacuum pump running >30 min without full vacuum | LED + Display + Log + Pump stopped | LED until Ack |
+| 15V Bus Low | Bus voltage below 14V for >10s | LED + Display + Log | Clears above 14V; LED until Ack |
+| 12VDC PSU Activated | Bus voltage drops below 12V | Display + Log + PSU relay ON | PSU relay off above 12.5V |
+| Grid Outage | Zero-crossing absent >50ms | Fault bar + Log + Heater off. No buzzer, no LED. | Auto-clears on grid restore |
+| Growatt Comms Fault | 5+ consecutive failed Modbus polls | LED + Display + Log + Heater off | Clears when comms restore |
+| Intruder Alert | PIR active whilst W locked | Buzzer at H (while PIR active) + W alarm 1 min auto-stop + Log | Buzzer stops when PIR clears |
+| Door Handle Alert (night) | Handle active whilst locked, 23:00–06:00 | Buzzer minimum 10s | Stops after ≥10s when handle released |
+| Door Handle Alert (day) | Handle active whilst locked, 06:00–23:00 | Buzzer while held | Stops on release |
+| Window Winch Over Open | Safety limit switch while opening | LED + Display + Log + Open direction locked out | LED until Ack. Close direction still available. |
+| RS485 Comms Fault | 5+ consecutive missed H↔W packets | LED + Display + Log | Clears when comms resume |
+| Fan 1 / Fan 2 Fault | Tach zero while commanded >min speed for >5s | LED + Display + Log | LED until Ack |
+| Fire Alarm | See §6.4 | Lights flash + buzzer at H + local sounder phase 2 | Alert reset on page 4 |
+| Heater sensor fault | One sensor: 5s grace then flag; both sensors: immediate cap | LED + Display. Heater continues on remaining sensor if one remains | Clears on sensor recovery |
 
-### 11.2 Sensor Fault Behaviour
+### 11.1 Sensor Fault Behaviour
 
-DS18B20 fault detection: discard readings of exactly 85.00°C, −127°C, or −128°C. A sensor is considered failed after 3 consecutive invalid readings. Clears when 3 consecutive valid readings received. Log `[sensor] sensor recovered` on recovery.
+DS18B20 fault detection: discard readings of exactly 85.00°C, −127°C, −128°C, or outside physically plausible range. Sensor considered failed after 3 consecutive invalid readings. Clears after 3 consecutive valid readings. 11-bit mode adds a single retry on transient CRC errors.
 
 | Sensor | Action on fault |
 |---|---|
-| Solar hot side | Close log burner cold valve, bottom-of-tank valve, 2-port valve. Open UFH cold valve and solar cold valve. Start UFH pump. Force heater off (must stay off while dump is active). Flash LED. Log `Solar hot sensor fault — tank valves closed, UFH dump active, heater off`. |
-| Solar cold side | Same as solar hot side fault. |
-| Heater output | Heater immediately off and locked out until sensor recovers. Flash LED. Log `Heater output sensor fault — heater locked out`. |
-| UFH post TMV | Flash LED + log `UFH post TMV sensor fault` only. UFH continues but 45°C lockout cannot function — firmware must make this explicit in fault message. |
-| UFH supply | Flash LED + log `UFH supply sensor fault` only. No automatic action. 28°C pump-off check disabled until sensor recovers. |
-| Tank top / mid / bot | Flash LED + log `[sensor] sensor fault` only. No automatic action. |
-| Hot pipe / cold pipe | Flash LED + log `[sensor] sensor fault` only. No automatic action. |
-| Workshop air | Flash LED + log `Workshop air sensor fault` only. No automatic action. |
-| Outside air | Flash LED + log `Outside air sensor fault` only. No automatic action. |
-| Inverter temperature | Flash LED + log `Inverter temp sensor fault` only. No automatic action. |
+| Solar hot / solar cold | Close log_cold and bot_tank valves, open two_port. Open UFH cold + solar cold valves. Start UFH pump. Force heater off. LED + Log. |
+| Heater output (primary) | 5s grace. Raise `FAULT_H_SENSOR_HEATER_OUT`. Continue on sensor 2 if valid. If both faulted: immediate heaterPowerCapPct=0. |
+| Heater output 2 (secondary) | 5s grace. Raise `FAULT_H_SENSOR_HEATER_OUT_2`. Continue on sensor 1 if valid. |
+| Hot pipe | LED + Log. Immediate heaterPowerCapPct=0 while faulted. |
+| UFH post TMV | LED + Log only. UFH continues but 45°C lockout disabled. |
+| UFH supply | LED + Log only. 28°C pump-off check disabled. |
+| Tank top / mid / bot | LED + Log only. No automatic action. |
+| Hot pipe / cold pipe | LED + Log only. No automatic action. |
+| Workshop air | LED + Log only. No automatic action. |
+| Outside air | LED + Log only. No automatic action. |
 
 ---
 
 ## 12. Power Supply & Voltage Management
 
-System nominal bus voltage: 15VDC (battery-backed). Both Mega controllers powered from 15VDC bus via barrel jack. Voltage monitoring at H only via resistor divider on H Mega ADC pin.
-
 | Threshold | Action |
 |---|---|
-| Below 14V for >10s | Flash LED + Log `15V Bus Low`. System keeps running. Buzzer does not sound. |
-| Below 12V | Activate 12VDC backup PSU relay at H + Log `12VDC PSU Activated`. |
-| Recovers above 12.5V | Deactivate PSU relay + Log `12VDC PSU Deactivated` |
-| Recovers above 14V | Clear LED flash + Log `15V Bus Restored` |
+| Below 14V for >10s | LED + Log `15V Bus Low`. System keeps running. |
+| Below 12V | Activate 12VDC backup PSU relay + Log |
+| Recovers above 12.5V | Deactivate PSU relay + Log |
+| Recovers above 14V | Clear LED. Log. |
 
-Grid outage detected instantly via zero-crossing detector at H (≤50ms) — no separate grid voltage monitor needed. Heater forced off on grid outage regardless of manual mode.
+Grid outage detected via zero-crossing detector at H (≤50ms). Heater forced off on grid outage regardless of manual mode.
 
 ---
 
 ## 13. Inter-Controller Communications
 
 - RS485 link over spare 1mm T&E cable between H and W (40m)
-- Both MAX485 modules at 9600 baud. Poll interval: 250ms (4 times per second)
-- Full cycle time at 9600 baud: Growatt Modbus (~75ms) + W→H packet (~36ms) + H→W packet (~36ms) + processing (~20ms) = ~167ms. Comfortably within 250ms window.
-- Growatt Modbus polled at 850ms (manufacturer minimum command period). Separate UART from inter-controller link.
-- RS485 line bias: 560Ω pull-up on A line to 5V, 560Ω pull-down on B line to GND at one end of each RS485 run.
-- If 5 or more consecutive packets missed (~1.25s): RS485 Comms Fault triggered
-- On comms failure: W continues on last known H values. H continues on last known W values. Both flag fault.
+- 9600 baud. Poll interval: 250ms (4 times per second). Custom binary framing in `rs485_packet.h`.
+- Frame: `[0xAA][0x55][DIR][SEQ][LEN_LO][LEN_HI][PAYLOAD][CRC_LO][CRC_HI]`
+- CRC-16/Modbus over DIR+SEQ+LEN+PAYLOAD
+- If 5+ consecutive packets missed (~1.25s): RS485 Comms Fault triggered
+- On failure: W continues on last known H values. H continues on last known W values.
+- Growatt stale: `growattValid = 0` after 60s without a valid Modbus response (reduced from 120s)
+- H RS485 rx timeout: 150ms. W RS485 rx timeout: 200ms.
 
 ### 13.1 W → H Packet (every 250ms)
 
-- Solar hot temp, solar cold temp, UFH supply temp, UFH post TMV temp, Workshop air temp, outside air temp
-- Solar pump duty %, PV export kW, grid import kW
-- Fault flags (all W-side faults)
-- Valve states: UFH cold, solar cold, vacuum isolation, door lock, fan flap
-- Vacuum pump state, vacuum sensor state
-- Door state (open/closed), door lock state (locked/unlocked), PIR state, manual relock switch state
-- Window winch state: direction (idle/opening/closing), reed switch states (fully open, fully closed, manual lock), safety limit switch state
-- Fan state: current speed %, full speed timer remaining, base speed timer remaining
+- 6 W temperatures (solar hot, solar cold, UFH supply, UFH post TMV, workshop air, outside air)
+- Growatt data: PV1/PV2/output/load/export/import power, battery voltage/SOC/charge, daily gen, growattValid flag
+- Solar pump duty %, solarPumpActive flag
+- Valve state bitmask (VSTATE_* flags)
+- Security: workshopLocked, doorOpen, pirActive, manualRelockOn
+- Window winch state, reed flags
+- Fan: duty %, full timer secs, base timer secs
+- UFH: ufhPumpRunning, ufhTargetReached, solarDumpActive
+- W fault flags (32-bit)
+- Time sync request flag
 
 ### 13.2 H → W Packet (every 250ms)
 
-- Tank bottom temp, tank middle temp, tank top temp
-- Hot pipe temp, cold pipe temp, heater output temp
-- Heater power %, boost status, boost mode (off/5am/8hr), boost target temp
-- Mode (winter/summer), night cooling state, solar target mode
-- Fan speed command: target duty cycle % (W executes autonomously using this + its own lock state knowledge)
-- Actuator override commands: valve states to override at W (from manual override mode on page 5). Includes a command type field to distinguish override commands from normal state data.
-- Alert reset acknowledgement
-- Time sync (on W request at boot and every hour thereafter)
+- 5 H temperatures (tank bot, mid, top, hot pipe, cold pipe) + effective heater output temp (max of both sensors)
+- Heater state: heaterPowerPct (min 1 when running), heaterRestricted
+- System config: systemMode, boostMode, ufhStopTemp, morningHeatActive, summerStartupPhase, nightCoolingEnabled, solarTargetMode, manualHeaterMode
+- Fan settings: fanBaseSpeedPct, fanFullTimerDeltaHr, fanBaseTimerDeltaDay
+- Manual override: overrideActive, overrideValves bitmask
+- Alert reset sequence number
+- Time sync payload
+- H fault flags (32-bit)
+- 2-port valve state (twoPortHeaterSide)
+- Cal fields (DEBUG_SERIAL only): calPumpActive, calSolarTargetC (calSolarTargetC=0 signals pump-stop)
+- hPumpDutyPct (0–100)
 
 ---
 
@@ -560,47 +664,31 @@ Grid outage detected instantly via zero-crossing detector at H (≤50ms) — no 
 
 SD card at H only. All W data received via RS485 and logged centrally.
 
-**Continuous log** (every 250ms): all 12 DS18B20 temperatures (tank top/mid/bot, hot pipe, cold pipe, heater output, solar hot, solar cold, UFH supply, UFH post TMV, Workshop air, outside air), solar pump %, heater kW, heater restricted flag, PV string 1 & 2, total PV, import/export, load, battery SOC, charge/discharge, battery voltage, grid voltage, grid frequency, inverter temp, inverter status, 15V bus voltage, fan 1 RPM, fan 2 RPM, fan speed %
+**Continuous log** (`log.csv`, 250ms interval): 22 columns — datetime (ISO `YYYY-MM-DD HH:MM:SS` from RTC), solar_hot, solar_cold, ufh_sup, ufh_tmv, w_air, out_air, tank_bot, tank_mid, tank_top, hot_pipe, cold_pipe, htr_out, htr_out_2, pump_pct, htr_pct, export_w, import_w, bus_v, fan1rpm, fan2rpm, fan_pct.
 
-**Event log:** all error codes with timestamp, all system state changes (boost on/off, mode change, manual override, grid outage etc.)
+Column header is validated on startup: if the comma count in the existing file's first line doesn't match expected, the file is replaced with a fresh header. This prevents stale column layouts from corrupting the log after firmware updates.
 
-**SD card safe remove:** page 4 option flushes writes and closes filesystem cleanly before card removal. Auto-reinitialises on card reinsert.
+**SD card state:** if file open fails, `sdAvailable` is set false to prevent repeated open attempts after card removal.
 
-Log format: CSV for easy import to spreadsheet or analysis tool.
+**SD safe remove:** page 4 option flushes writes and closes filesystem. Auto-reinitialises on card reinsert.
 
 ---
 
 ## 15. Data Analysis — SD Card & SQLite
 
-### 15.1 Overview
+### 15.1 Workflow
 
-The SD card logs at 250ms intervals producing approximately 345,600 rows per day and ~126 million rows per year — too large for Excel. A SQLite database on a PC provides fast queries across the full dataset with no specialist software required.
-
-### 15.2 Workflow
-
-1. Remove SD card from H controller (use SD safe remove option on page 4 first)
+1. Remove SD card from H controller (use SD safe remove on page 4 first)
 2. Insert SD card into PC
-3. Run Python import script — reads CSV and imports into SQLite database file on PC (takes a few minutes for a year of data)
+3. Run Python import script — reads CSV and imports into SQLite database
 4. Run analysis scripts to produce graphs and reports
-5. Reinsert SD card into H controller (auto-reinitialises)
+5. Reinsert SD card into H controller
 
-### 15.3 Planned Analysis Scripts
+### 15.2 Planned Analysis Scripts
 
-- **kWh to heater per day** — line/bar graph over 1 year. SQL sums heater power readings per day and converts to kWh.
-- **Daily temperature graph** — for a user-specified date: line graph showing tank bottom/mid/top, solar hot/cold, heating pipe hot/cold, heater output temp. X axis = time, Y axis = 0–100 (degrees °C and pump/heater %). Solar pump % and heater power % also plotted. Heater line shown thicker when power is restricted by temperature (>91°C condition).
-- Down-sampling: full 250ms resolution stored on SD card, but daily graphs display 1-minute averages (1,440 points per day) for performance.
-- **Fault history report** — query all fault events, durations, and frequency from database. Useful for identifying recurring faults or patterns.
-- Additional analysis scripts to be added as requirements emerge.
-
-### 15.4 Database Schema
-
-**Table: readings** — timestamp (Unix ms), solar_hot, solar_cold, ufh_pipe, w_air, outside_air, tank_top, tank_mid, tank_bot, hot_pipe, cold_pipe, heater_out, solar_pump_pct, heater_kw, heater_restricted (boolean), pv_string1_kw, pv_string2_kw, pv_export_kw, grid_import_kw, battery_soc_pct, battery_kw, grid_voltage, inverter_temp, bus_voltage_v
-
-**Table: faults** — fault_code (text), onset_timestamp, resolved_timestamp (null if still active), duration_seconds
-
-**Table: events** — timestamp, event_type, detail (for state changes: boost on/off, mode change, manual override etc.)
-
-Index on timestamp column in readings table for fast date range queries.
+- **kWh to heater per day** — bar graph over 1 year
+- **Daily temperature graph** — all temperatures + pump/heater % for a given date. Both heater output sensors plotted.
+- **Fault history report** — query all fault events, durations, frequency
 
 ---
 
@@ -608,83 +696,56 @@ Index on timestamp column in readings table for fast date range queries.
 
 Platform: Arduino C++ on Elegoo Mega 2560 (ATmega2560), PlatformIO build system.
 
-- **Watchdog timer:** enable hardware watchdog on both Megas. If main loop hangs >8s, processor resets automatically.
-- **EEPROM write endurance:** write to EEPROM only after 30s timeout following last button press, not on every change. ATmega2560 EEPROM rated ~100,000 write cycles per address.
-- **Manual override persistence:** NEVER store override state in EEPROM. Always revert to automatic control on power cycle.
-- **Boost state and target:** NOT stored in EEPROM. Reset to Off and default target on power cycle.
-- **Time sync:** W requests time sync from H on first boot and every hour thereafter. H responds with RTC time.
-- **Summer startup double-start prevention:** use a `sequence active or complete` flag. Reset flag when both solar and PV drop to idle.
-- **Log burner temp module hysteresis:** activate at 28°C, deactivate below 25°C to prevent valve chattering.
-- **PV export sign convention:** verify Growatt Modbus register sign convention during commissioning before enabling heater control.
-- **DS18B20 addressing:** each sensor has a unique 64-bit address. Scan and map all sensors to physical locations during commissioning. Store addresses as firmware constants.
-- **INA219 solar pump current:** sample during ON period only, after 50ms spin-up delay. Calibrate minimum current threshold during commissioning with 20% margin below lowest normal reading.
-- **Heater cycle-burst control:** SSR controlled by toggling D27 at H on/off at each zero-crossing interrupt (every 20ms). Outer control loop updates target ON-cycle ratio every 850ms from Growatt Modbus data.
-- **UFH overheat hard lockout:** set a persistent flag on UFH overheat fault. Cleared only on system restart. Frost protection bypasses this flag unconditionally.
-- **RS485 comms resilience:** if packet missed, continue on last known values. After 5 consecutive misses, trigger RS485 Comms Fault. Clear fault immediately when comms restore.
-- **Growatt comms resilience:** if 5 consecutive Modbus polls fail, trigger Growatt Comms Fault and force heater off. Resume when comms restore.
-- **Battery SOC validity:** if SOC reading is older than 10s while manual heater SOC-limited mode is active, force heater off.
-- **Display backlight:** PWM-dim backlight via Mega PWM pin. Off after 1hr inactivity with no fault. Any button press wakes display. Never turn off if fault active.
-- **RTC fallback:** if RTC coin cell fails but Mega stays powered, use last known RTC time + millis() elapsed. Log `RTC battery low — time approximate`. If Mega loses power and RTC has no backup time, log `RTC fault — time unknown. Awaiting sync.` and disable time-dependent functions until valid time received via RS485 from H.
-- **millis() overflow:** ATmega2560 millis() counter overflows after ~49 days. Always compare elapsed time using subtraction: `if (millis() - lastTime >= interval)`.
-- **Growatt heater control commissioning flag:** firmware constant `HEATER_ENABLED` (default false). Heater modulation only activates when set true. Log `Heater control disabled — commissioning flag` when false.
-- **Power-up safe state sequence:** strictly sequential. Approximate total time ~60 seconds minimum before heating logic starts. Do not attempt to parallelise.
-- **Fan speed control:** W controls fan speed autonomously using its own lock state combined with fan speed settings received from H via RS485.
-- **Window winch state machine:** strict 3-state machine (STOP/OPEN/CLOSE). All transitions through STOP with 1s pause.
-- **RS485 packet format:** structured binary packet with header byte, sequence number, payload fields, and CRC checksum. Sequence numbers allow missed packet detection. CRC allows corrupted packet detection.
-- **Thermal solar cold side overheat:** fault only triggers when pump running above clocking speed for more than 10 seconds AND cold side more than 10°C above tank bottom.
-- **DS18B20 validity checks:** discard any reading of exactly 85.00°C, −127°C, or −128°C, or any reading outside a physically plausible range for that sensor's location.
-- **UFH cold valve and solar cold valve at W:** single direction relay (SPDT). NO = open (Wire A, +15V). NC = close (Wire B, +15V). GND permanently connected. No power relay needed — auto-cutout at end stop.
-- **PC fan control:** MOSFET switches 12VDC supply at 25kHz PWM. Fan base speed stored in EEPROM (written after 30s timeout). Fan timer values NOT stored in EEPROM — reset to zero on power cycle.
+- **Watchdog timer:** 8s hardware WDT on both Megas. All loop operations must complete within WDT period.
+- **Non-blocking:** no `delay()` in main loop. All timing via `millis()` subtraction. `millis()` overflow safe after ~49 days: always subtract.
+- **EEPROM:** write after 30s timeout following last change. Never store manual override or boost state.
+- **`#ifdef DEBUG_SERIAL`:** wraps all debug code. Remove `#define DEBUG_SERIAL` at top of each main.cpp for production builds.
+- **`F()` macros:** all string literals in debug/display code use `F()` to keep them in Flash, not RAM.
+- **No `String` class:** char arrays and `snprintf` only.
+- **Simulation overrides:** `simXxxActive` + `simXxxVal` pairs applied after sensor reads (DEBUG_SERIAL only).
+- **`HEATER_ENABLED`:** compile-time constant (now `true`). Heater modulation and ISR gate both check this.
+- **Heater ISR:** ZC ISR on INT4 (D2). Uses `PORTA |= (1 << PA5)` / `PORTA &= ~(1 << PA5)` to toggle D27 (PA5). Gate condition: `HEATER_ENABLED || simHeaterActive`, `heaterRunning`, `VSTATE_SOLAR_COLD_OPEN`, `!heaterHardLockout`, Bresenham fire.
+- **Timer1 ISR:** 50ms COMPA interrupt drives `updateHPump()`. Prevents pump stalling during TFT SPI operations.
+- **Power-up safe state:** all valves driven to known-closed state before control logic starts. UFH/solar cold valves get 30s wait for auto-cutout. Door lock always pulsed to locked state.
+- **RS485 packet format:** custom binary, CRC-16/Modbus. `PktReceiver` state machine handles byte-by-byte receive with automatic resync on error. ArduinoRS485 library not used.
+- **DS18B20 resolution:** 11-bit (375ms conversion, 0.125°C). Conversion restarted immediately after read. Single retry on transient CRC errors (500µs delay before retry).
+- **Log burner temp module hysteresis:** activate at 28°C, deactivate below 25°C.
+- **INA219 solar pump current:** sampled during ON period only, after 50ms spin-up.
+- **Fan speed control:** W controls fan autonomously using its own lock state combined with settings received from H.
+- **Window winch:** strict 3-state machine (STOP/OPEN/CLOSE). All transitions through STOP with 1s pause.
+- **Serial monitor:** `monitor_filters = log2file` active on controller_h — serial output saved automatically during `pio device monitor` sessions.
 
-### 16.1 Valve & Lock Wiring — H-Bridge
-
-All 2-wire motorised valves and the door lock use the same H-bridge wiring with 2 SPDT relay channels:
+### 16.1 Valve & Lock H-Bridge Wiring
 
 | State | Terminal A | Terminal B | Result |
 |---|---|---|---|
 | Both relays OFF | GND (via NC) | GND (via NC) | Device holds position. No power drawn. |
 | Relay 1 ON, Relay 2 OFF | +15VDC (via NO) | GND (via NC) | Current flows A→B. Valve opens / lock unlocks. |
 | Relay 1 OFF, Relay 2 ON | GND (via NC) | +15VDC (via NO) | Current flows B→A. Valve closes / lock locks. |
-| Both relays ON | +15VDC | +15VDC | No current flows — harmless but avoid. Use dead-time. |
+
+Dead-time: 200ms between de-energising one relay and energising the other. `HBridgeValve::request()` is idempotent: returns immediately if valve is already at the requested position or already moving there.
 
 ### 16.2 Valve & Lock Pulse Timings
 
-| Device | Location | Wiring | Control |
+| Device | Location | Wiring | Pulse |
 |---|---|---|---|
-| Log burner cold valve | H | H-bridge (2 relays) | 7s pulse open or close. Both relays OFF after pulse. Holds position. |
-| Bottom-of-tank valve | H | H-bridge (2 relays) | 7s pulse open or close. Both relays OFF after pulse. Holds position. |
-| 2-port valve | H | H-bridge (2 relays) | 7s pulse open or close. Both relays OFF after pulse. Holds position. |
-| Vacuum isolation valve | W | H-bridge (2 relays) | 7s pulse open or close. Both relays OFF after pulse. Holds position. |
-| UFH cold valve | W | Single direction relay (SPDT) | NO = open (Wire A). NC = close (Wire B). GND permanent. Auto-cutout at end stop. No timed pulse. 1 relay only. |
-| Solar cold valve | W | Single direction relay (SPDT) | NO = open (Wire A). NC = close (Wire B). GND permanent. Auto-cutout at end stop. No timed pulse. 1 relay only. |
-| Door lock | W | H-bridge (2 relays) | 1s pulse to lock, 1s pulse to unlock. Both relays OFF after pulse. Motor-driven, no spring return. |
+| Log burner cold valve | H | H-bridge (2 relays) | 7s open or close. Both OFF after pulse. |
+| Bottom-of-tank valve | H | H-bridge (2 relays) | 7s open or close. Both OFF after pulse. |
+| 2-port valve | H | H-bridge (2 relays) | 7s open or close. Both OFF after pulse. |
+| Vacuum isolation valve | W | H-bridge (2 relays) | 7s open or close. Both OFF after pulse. |
+| Hen house door | W | H-bridge (2 relays, 4-ch board) | 7s open or close. Both OFF after pulse. |
+| UFH cold valve | W | Single SPDT relay | NO = open (Wire A). NC = close (Wire B). GND permanent. Auto-cutout — no timed pulse. |
+| Solar cold valve | W | Single SPDT relay | NO = open (Wire A). NC = close (Wire B). GND permanent. Auto-cutout — no timed pulse. |
+| Door lock | W | H-bridge (2 relays) | 1s pulse to lock, 1s pulse to unlock. Both OFF after pulse. |
 
-### 16.3 Valve & Lock Control Rules
+### 16.3 Power-Up Safe State Sequence
 
-- **Dead-time:** 200ms between de-energising one relay and energising the other. Always apply regardless of direction change.
-- **Interrupt handling:** if a new command arrives before the current pulse has completed, apply 200ms dead-time then start the new command for the full pulse duration. 7 seconds from any intermediate position will always reach the end stop.
-- Never interrupt a pulse for anything other than a hard safety fault (e.g. UFH overheat, thermal solar overheat).
-- After pulse completes: both relays return to OFF. Valve/lock holds position with no power drawn.
-
-### 16.4 Power-Up Safe State Sequence
-
-On every power-up, before any heating logic runs, drive all devices to a defined safe state in this order:
-
-1. Door lock → send 1s lock pulse. If door reed switch shows door open: log `Lock pulse sent — door open` but proceed. Record state as locked.
-2. All tank valves at H (log burner cold, bottom-of-tank, 2-port) → send 7s close pulse. Wait for completion.
-3. Vacuum isolation valve at W → send 7s close pulse. Wait for completion.
-4. UFH cold valve and solar cold valve at W → set direction relay to close, wait 30 seconds (conservative allow for auto-cutout to trip and motor to stop), then leave relay in close position. No current feedback available.
-5. Window winch → no power-up action. State determined from reed switches.
-6. Begin normal heating logic only after all devices are in known state.
-
-Rationale: valve and lock positions are unknown after a power cut. Always establishing a known state before starting control logic prevents incorrect valve configurations.
-
-### 16.5 Lock State Tracking
-
-- Lock state tracked in software only — no position feedback from lock mechanism
-- On power-up: always send lock pulse regardless of previous state
-- If door reed switch shows door open when lock pulse is due: log anomaly but send pulse and record state as locked
-- Lock state NOT stored in EEPROM — power-up always triggers lock pulse
+1. Door lock → 1s lock pulse. If door reed open: log anomaly, still send pulse. Record state as locked.
+2. All tank valves at H → 7s close pulse. Wait for completion.
+3. Vacuum isolation valve at W → 7s close pulse. Wait for completion.
+4. UFH cold + solar cold valves at W → set direction relay to close, wait 30s (`VALVE_POWERUP_WAIT_MS`), then hold relay in close position.
+5. Window winch → no power-up action. State from reed switches.
+6. Begin normal heating logic only after all devices in known state.
 
 ---
 
@@ -692,67 +753,58 @@ Rationale: valve and lock positions are unknown after a power cut. Always establ
 
 Default baud rate: 9600. Minimum command period: 850ms. Max read: 125 words.
 
-SPH register ranges: 03 (holding) 0–124, 1000–1124. 04 (input) 0–124, 1000–1124.
-
-### 17.1 Input Registers (Function 04) — 0–124 range (live inverter data)
+### 17.1 Input Registers (Function 04) — 0–124 range
 
 | Register | Description | Scale | Notes |
 |---|---|---|---|
 | 0 | Inverter status | | 0=standby, 1=normal, 3=fault, 5=PV+batt online, 6=batt only |
 | 3 | PV string 1 voltage (Vpv1) | ×0.1V | |
 | 4 | PV string 1 current (Ipv1) | ×0.1A | |
-| 5–6 | PV string 1 power (Ppv1 H/L) | ×0.1W | 32-bit value across 2 registers |
+| 5–6 | PV string 1 power (Ppv1 H/L) | ×0.1W | 32-bit |
 | 7 | PV string 2 voltage (Vpv2) | ×0.1V | |
 | 8 | PV string 2 current (Ipv2) | ×0.1A | |
 | 9–10 | PV string 2 power (Ppv2 H/L) | ×0.1W | 32-bit |
 | 35–36 | Total output power (Pac H/L) | ×0.1W | 32-bit |
 | 37 | Grid frequency (Fac) | ×0.01Hz | |
 | 38 | Grid voltage (Vac1) | ×0.1V | |
-| 53–54 | Energy today (Eac_today H/L) | ×0.1kWh | 32-bit. Note: may undercount on hybrid — use PV string registers for accurate daily total |
-| 55–56 | Energy total (Eac_total H/L) | ×0.1kWh | 32-bit |
+| 53–54 | Energy today (Eac_today H/L) | ×0.1kWh | 32-bit. May undercount — use PV string registers for accurate daily total |
 
-### 17.2 Input Registers (Function 04) — 1000 range (battery & hybrid data)
+### 17.2 Input Registers (Function 04) — 1000 range
 
 | Register | Description | Scale | Notes |
 |---|---|---|---|
-| 1000 | System work mode | | 0=waiting, 1=self-test, 3=fault, 5=PV+batt online, 6=batt only |
-| 1009–1010 | Battery discharge power (H/L) | ×0.1W | 32-bit. Non-zero when battery is discharging. |
-| 1011–1012 | Battery charge power (H/L) | ×0.1W | 32-bit. Non-zero when battery is charging. |
+| 1000 | System work mode | | |
+| 1009–1010 | Battery discharge power (H/L) | ×0.1W | 32-bit. Non-zero when discharging. |
+| 1011–1012 | Battery charge power (H/L) | ×0.1W | 32-bit. Non-zero when charging. |
 | 1013 | Battery voltage | ×0.1V | |
-| 1014 | Battery SOC | % | Direct percentage. No scaling. ⚠ Verify correct SOC register during commissioning. |
-| 1021–1022 | Grid import power (H/L) | ×0.1W | 32-bit. ⚠ Verify sign convention during commissioning before enabling heater. |
-| 1023–1024 | Grid export power (H/L) | ×0.1W | 32-bit. ⚠ Verify sign convention during commissioning before enabling heater. |
+| 1014 | Battery SOC | % | Direct percentage. ⚠ Verify correct register during commissioning. |
+| 1021–1022 | Grid import power (H/L) | ×0.1W | 32-bit. ⚠ Verify sign convention before enabling heater. |
+| 1023–1024 | Grid export power (H/L) | ×0.1W | 32-bit. ⚠ Verify sign convention before enabling heater. |
 
-> Battery charge and discharge are in separate registers — direction determined by which register is non-zero. Grid import and export are also in separate registers. Verify all register addresses and scaling against Protocol V1.20 during commissioning. Enable `HEATER_ENABLED` flag only after confirming export/import sign convention on your specific unit.
+> Battery charge and discharge are in separate registers. Grid import and export are also in separate registers. Verify all addresses against Protocol V1.20 during commissioning.
 
 ---
 
-## 19. Outstanding / To Be Determined
+## 18. Outstanding / To Be Determined
 
 | Item | Notes |
 |---|---|
-| UFH cold valve pulse / travel | Power until end stop — no timed pulse. Verify end-stop protection during commissioning. |
-| Solar cold valve pulse / travel | Power until end stop — no timed pulse. Verify end-stop protection during commissioning. |
-| PC fan minimum PWM duty cycle | Calibrate minimum duty cycle before stall during commissioning. Set as firmware constant. |
-| UFH/solar cold valve 30s power-up wait | 30s conservative wait assumed for auto-cutout to trip. Verify during commissioning and adjust firmware constant if needed. |
-| Solar pump minimum current threshold | Calibrate during commissioning with 20% margin below lowest normal reading |
-| Summer mode solar pump minimum speed | Minimum speed vs heater power level and supply temperature — calibrate by on-site testing |
-| Vacuum sensor polarity | Confirmed: dry contact, normally open (HIGH via pull-up = low vacuum), closes = full vacuum. Verify wiring polarity during commissioning. |
-| Growatt Modbus register addresses | Verify correct register addresses against protocol document during commissioning. Verify 850ms minimum poll period. Verify export/import sign convention before enabling `HEATER_ENABLED` flag. |
-| RS485 line bias resistors | Check if MAX485 boards include internal bias. Add external 560Ω resistors if not. |
+| Growatt Modbus RS485 link | Install MAX485 at W, test over full cable run. Verify export/import sign convention. |
+| Inter-controller RS485 | Install MAX485 hardware at both ends. Test over 40m 1mm T&E. Verify line bias. |
+| Solar pump minimum current | Calibrate `SOLAR_PUMP_MIN_CURRENT_A` during commissioning |
+| PC fan minimum duty | Calibrate `FAN_MIN_DUTY_PCT` during commissioning |
+| Fan flap travel time | Calibrate `FAN_FLAP_OPEN_MS` during commissioning |
+| Valve power-up wait | Verify `VALVE_POWERUP_WAIT_MS` (30s conservative) on-site |
+| H-pump calibration curve | Run `cal_pump` to derive data; update `calcPred()` formula parameters |
+| W solar pump duty curve | Run cal_pump, then replace temporary `calcPumpDuty()` with data-derived curve |
 | DHW pipe control | To be added at a later date |
-| Auto-relock reliability | Verify all 4 conditions (door, PIR, switch, window) work correctly during installation |
-| VFD for workshop fan | Deferred — BES manual speed controller selected instead. |
 
 ---
 
-## 20. Document Changelog
+## 19. Document Changelog
 
 | Version | Changes |
 |---|---|
-| 1.0 | Initial complete requirements specification |
-| 2.0–4.0 | Display, alerts, solar, heating refinements |
-| 5.0 | Major update: 15VDC, display, valves, fans, RS485, Growatt, all firmware notes |
-| 5.1–5.7 | Iterative refinements: fault history, button redesign, valve wiring, fan control, RS485 packets, RTC fallback, pre-coding review |
-| 5.8 | UFH sensors: UFH supply (at pump, 28°C pump-off) and UFH post TMV (45°C lockout); W sensors 5→6, total DS18B20 11→12; sensor fault behaviour table; solar dump forces heater off; relock now 4-condition (adds window not closed/locked); Growatt register reference appendix (section 17); window relock log entries added |
-| 5.9 | Heat source selection: explicit if/else conditions; log burner + solar simultaneous confirmed valid; RS485 fallback for solar cold overheat check (stale tank bottom = no fault); night cooling explicitly 230VAC fan only; power-up sequence timing noted (~60s, strictly sequential) |
+| 1.0–5.0 | Initial through major update: 15VDC, display, valves, fans, RS485, Growatt, firmware notes |
+| 5.1–5.9 | Iterative refinements: fault history, button redesign, valve wiring, fan control, RS485 packets, RTC fallback, DS18B20 sensor additions |
+| 6.0 | Full update to match implemented code: DS18B20 13 total (7 at H, 6 at W); dual heater sensor with arbitration (`getHeaterOutC`); solar target SOLAR_TANK_PLUS5 → SOLAR_TANK_PLUS8 (target = tankTop+8, capped 87°C); summer startup straight to phase 3; heater duty algorithm rework (8-packet averaging, 5s start delay, hot pipe cap, SOC reservation tiers, hysteresis stop); `MHM_SOC_LIM` mode added (3 modes total); hot tank protection (83°C); H-side solar pump direct drive (`calcHPumpDuty` predictive formula, float, Timer1 ISR); heater element-fail detection removed; dual sensor 5s grace; ISR power cap `heaterPowerCapPct`; hard lockout auto-clear at 88°C and via page 4 Ack; UFH dump threshold 90°C→93°C; solar overheat threshold 83→91°C; fire alarm documented; hen house door and window manual buttons documented; SD logging: datetime column, header validation; `HEATER_ENABLED` now true; wired-OR solar pump circuit documented; TFT_eSPI library; serial log2file |
