@@ -133,7 +133,7 @@ static const uint16_t VALVE_POWERUP_WAIT_MS = 30000;
 #define HANDLE_ALERT_NIGHT_MIN_MS 10000UL
 #define INTER_CTRL_POLL_MS  250UL
 #define DS18B20_CONV_MS     375UL
-#define RS485_RX_TIMEOUT_MS 150UL
+#define RS485_RX_TIMEOUT_MS 200UL
 #define COMMS_FAULT_THRESHOLD 20
 #define FAN_RPM_FAULT_DELAY_MS 5000UL
 #define VAC_PUMP_MAX_MS    1800000UL // 30 minutes
@@ -559,6 +559,7 @@ bool  simDoorActive      = false, simDoorVal      = false;
 bool  simWinchClsActive  = false, simWinchClsVal  = false;
 bool  simWinchLockActive = false, simWinchLockVal = false;
 bool  simPumpCurrentActive = false; float simPumpCurrentVal = 0.0f;
+bool  simPumpSpdActive = false; uint8_t simPumpSpdVal = 0;
 #endif // DEBUG_SERIAL
 
 
@@ -655,7 +656,7 @@ static uint16_t sdmCRC16(const uint8_t* buf, uint8_t len) {
 //  Each call either sends a request or collects bytes; never blocks >5ms.
 // ============================================================
 
-#define GROWATT_STALE_MS  120000UL
+#define GROWATT_STALE_MS  60000UL
 
 static inline int16_t reg16(const uint8_t* data, uint8_t regOffset) {
     return (int16_t)(((uint16_t)data[regOffset * 2] << 8) | data[regOffset * 2 + 1]);
@@ -835,40 +836,19 @@ void updateSolarPump() {
     }
 }
 
-// Minimum pump % when heater is on. Proportional to heater power;
-// hotter outlet (heater working hard) slightly raises the floor.
-// Calibrate divisor and offset on-site.
-static uint8_t heaterMinPumpPct(uint8_t heaterPct, float heaterOutC) {
-    uint8_t base = max(2, heaterPct / 5);
-    if (!isnan(heaterOutC) && heaterOutC > 70.0f)
-        base = max(base, (uint8_t)((heaterOutC - 70.0f) / 5.0f + 2));
-    return min(base, (uint8_t)25);
-}
-
 // Pump duty % given solar hot-side temperature vs target.
-// heaterPct==0 → heater off branch; otherwise heater-on branch applies a floor.
-static uint8_t calcPumpDuty(float hot, float targetC,
-                             uint8_t heaterPct, float heaterOutC) {
-    if (heaterPct == 0) {
-        // Heater off: 1% far below target, slow ramp to 100% above target
-        if (hot < targetC - 8.0f) return 1;
-        if (hot < targetC - 2.0f) {
-            // 2% → 4% linear over 6°C (target-8 to target-2)
-            float t = (hot - (targetC - 8.0f)) / 6.0f;
-            return (uint8_t)(2.0f + t * 2.0f);
-        }
-        if (hot >= targetC + 2.0f) return 100;
-        // 4% → 100% linear over 4°C (target-2 to target+2)
-        float t = (hot - (targetC - 2.0f)) / 4.0f;
-        return (uint8_t)(4.0f + t * 96.0f);
-    } else {
-        // Heater on: hold floor below target-2, ramp floor→100% in upper 4°C band
-        uint8_t minPct = heaterMinPumpPct(heaterPct, heaterOutC);
-        if (hot >= targetC + 2.0f) return 100;
-        if (hot < targetC - 2.0f)  return minPct;
-        float t = (hot - (targetC - 2.0f)) / 4.0f;
-        return (uint8_t)(minPct + t * (100.0f - minPct));
+// TEMPORARY calibration curve — replace with data-derived curve after cal_pump run
+static uint8_t calcPumpDuty(float hot, float targetC) {
+    if (hot >= targetC + 2.0f) return 100;
+    if (hot >= targetC) {
+        float t = (hot - targetC) / 2.0f;
+        return (uint8_t)(50.0f + t * 50.0f);
     }
+    if (hot >= targetC - 8.0f) {
+        float t = (hot - (targetC - 8.0f)) / 8.0f;
+        return (uint8_t)(4.0f + t * 46.0f);
+    }
+    return 4;
 }
 
 static void resetSolarPumpOverrides() {
@@ -1195,7 +1175,7 @@ void updateWinterSolar(float tankBottomC) {
 
     // Speed ramp: hot side targets 20°C
     float   wTarget   = (float)WINTER_UFH_TARGET_C / 10.0f;
-    uint8_t duty      = calcPumpDuty(hot, wTarget, 0, NAN);
+    uint8_t duty      = calcPumpDuty(hot, wTarget);
     uint8_t finalDuty = applyPumpSpeedOverrides(duty, hot, cold, wTarget);
     if (hasHPacket && lastH.heaterPowerPct > 0 && lastH.hPumpDutyPct > finalDuty && hot < wTarget)
         finalDuty = 0;
@@ -1285,8 +1265,7 @@ void updateSummerSolar() {
     bool pvActive = lastPvActive;
 
     // Summer solar startup condition (PV export >= 500W, solar >= 50°C, or heater powered)
-    bool startTrigger = (growatt.valid && growatt.pvExportW >= 500)
-                         || hot >= 50.0f || cold >= 50.0f
+    bool startTrigger = hot >= 50.0f || cold >= 50.0f
                          || (hasHPacket && lastH.heaterPowerPct > 0);
 
     if (!startTrigger && !solarPumpActive) return;
@@ -1308,15 +1287,21 @@ void updateSummerSolar() {
         summerSeqDone = true;
     }
 
-    // Determine pump target: solar hot vs target (tank+5 from H data)
+    // Determine pump target: solar hot vs target (tank+5 or tank+8 from H data)
     bool tankTopFault = (lastH.tempTankTop == TEMP_FAULT);
     float tankTopC    = tankTopFault ? 60.0f : (float)lastH.tempTankTop / 10.0f;
 
-    SolarTargetMode tgtMode = hasHPacket ? (SolarTargetMode)lastH.solarTargetMode : SOLAR_TANK_PLUS5;
-    float solarTarget  = (tgtMode == SOLAR_MAX) ? 80.0f : min(tankTopC + 5.0f, 80.0f);
+    SolarTargetMode tgtMode = hasHPacket ? (SolarTargetMode)lastH.solarTargetMode : SOLAR_TANK_PLUS8;
+    float solarTarget  = (tgtMode == SOLAR_MAX) ? 87.0f : min(tankTopC + 8.0f, 87.0f);
 
-    // Cal override: H sets calPumpActive=1 and drives solarTarget remotely
+    // Cal override: H sets calPumpActive=1 and drives solarTarget remotely.
+    // calSolarTargetC==0 during PRE_RAMP: stop pump so heater can heat up unimpeded.
     if (hasHPacket && lastH.calPumpActive) {
+        if (lastH.calSolarTargetC == 0) {
+            setSolarPumpDuty(0);
+            solarPumpActive = false;
+            return;
+        }
         solarTarget  = (float)lastH.calSolarTargetC / 10.0f;
         if (!solarPumpActive) {
             solarColdValve.setOpen();
@@ -1325,7 +1310,7 @@ void updateSummerSolar() {
         }
     }
 
-    uint8_t duty = calcPumpDuty(hot, solarTarget, 0, NAN);
+    uint8_t duty = calcPumpDuty(hot, solarTarget);
 
     bool tankBotStale = !hasHPacket || (millis() - lastRxMs > 10000UL)
                          || lastH.tempTankBot == TEMP_FAULT;
@@ -1350,8 +1335,18 @@ void updateSummerSolar() {
         }
     }
     {
+#ifdef DEBUG_SERIAL
+        uint8_t finalDuty = (hasHPacket && lastH.calPumpActive)
+                            ? duty
+                            : applyPumpSpeedOverrides(duty, hot, cold, solarTarget);
+#else
         uint8_t finalDuty = applyPumpSpeedOverrides(duty, hot, cold, solarTarget);
+#endif
         if (hasHPacket && lastH.heaterPowerPct > 0 && lastH.hPumpDutyPct > finalDuty && hot < solarTarget)
+            finalDuty = 0;
+        if (hasHPacket && lastH.twoPortHeaterSide && lastH.summerStartupPhase >= 3
+            && hot < solarTarget && hot < 65.0f
+            && cold < solarTarget && cold < 65.0f)
             finalDuty = 0;
         setSolarPumpDuty(finalDuty);
     }
@@ -1373,15 +1368,17 @@ void updateSummerSolar() {
         }
     }
 
-    // Hot side overheat: tank bottom < 70°C AND solar hot > 83°C AND pump at 100%
-    if (!tankBotStale && tankBotC < 70.0f && hot > 83.0f && duty == 100) {
+    // Hot side overheat: tank bottom < 70°C AND solar hot > 91°C AND pump at 100%
+    if (!tankBotStale && tankBotC < 70.0f && hot > 91.0f && duty == 100) {
         setFault(FAULT_W_SOLAR_OVERHEAT_HOT);
-        // Dump through UFH if both sides ≤ 90°C
-        if (hot <= 90.0f && sTemp[SENSOR_SOLAR_COLD] <= 90.0f) {
-            ufhColdValve.setOpen();
-        }
-    } else if (hot <= 83.0f) {
+    } else if (hot <= 91.0f) {
         clearFault(FAULT_W_SOLAR_OVERHEAT_HOT);
+    }
+
+    // Dump through UFH between 91°C and 93°C; close above 93°C (too hot for UFH)
+    if (hot > 91.0f && hot < 93.0f && sTemp[SENSOR_SOLAR_COLD] < 93.0f) {
+        ufhColdValve.setOpen();
+    } else {
         ufhColdValve.setClose();
     }
 
@@ -1925,7 +1922,7 @@ void checkSolarPumpFault() {
             setFault(FAULT_W_SOLAR_PUMP_OVERCURRENT);
             setSolarPumpDuty(0);
             if (!ocDumpActive && !sFault[SENSOR_SOLAR_HOT] && !sFault[SENSOR_SOLAR_COLD]) {
-                if (sTemp[SENSOR_SOLAR_HOT] <= 90.0f && sTemp[SENSOR_SOLAR_COLD] <= 90.0f) {
+                if (sTemp[SENSOR_SOLAR_HOT] < 93.0f && sTemp[SENSOR_SOLAR_COLD] < 93.0f) {
                     ufhColdValve.setOpen();
                     solarColdValve.setOpen();
                     digitalWrite(PIN_UFH_PUMP, RELAY_ON);
@@ -1958,7 +1955,7 @@ void checkSolarPumpFault() {
                 ucPhase = PUC_FAULT;
                 setFault(FAULT_W_SOLAR_PUMP);
                 if (!sFault[SENSOR_SOLAR_HOT] && !sFault[SENSOR_SOLAR_COLD]) {
-                    if (sTemp[SENSOR_SOLAR_HOT] <= 90.0f && sTemp[SENSOR_SOLAR_COLD] <= 90.0f) {
+                    if (sTemp[SENSOR_SOLAR_HOT] < 93.0f && sTemp[SENSOR_SOLAR_COLD] < 93.0f) {
                         ufhColdValve.setOpen();
                         solarColdValve.setOpen();
                         digitalWrite(PIN_UFH_PUMP, RELAY_ON);
@@ -2460,6 +2457,8 @@ static void dbgSet(char* key, char* val) {
     if (!strcmp_P(key, PSTR("growatt_clear"))){ simGrowattActive = false; Serial.println(F("cleared")); return; }
     if (!strcmp_P(key, PSTR("pump_current")))      { simPumpCurrentActive = true;  simPumpCurrentVal = fval; Serial.println(F("ok")); return; }
     if (!strcmp_P(key, PSTR("pump_current_clear"))) { simPumpCurrentActive = false; Serial.println(F("cleared")); return; }
+    if (!strcmp_P(key, PSTR("pump_spd")))          { simPumpSpdActive = true;  simPumpSpdVal = (uint8_t)constrain((int)fval, 0, 100); Serial.println(F("ok")); return; }
+    if (!strcmp_P(key, PSTR("pump_spd_clear")))    { simPumpSpdActive = false; Serial.println(F("cleared")); return; }
     if (!strcmp_P(key, PSTR("heater_pct")))        { simHtrPctActive = true;  simHtrPctVal = (uint8_t)constrain((int)fval, 0, 100); Serial.println(F("ok")); return; }
     if (!strcmp_P(key, PSTR("heater_pct_clear")))  { simHtrPctActive = false; Serial.println(F("cleared")); return; }
     Serial.print(F("unknown key: ")); Serial.println(key);
@@ -2487,6 +2486,7 @@ static void handleDebugCommand(char* buf) {
         Serial.println(F("set pv_out|pv_export|batt_soc|batt_charge <val>  (Growatt sim)"));
         Serial.println(F("set growatt_clear 0  (clears all Growatt sim)"));
         Serial.println(F("set heater_pct <val>  set heater_pct_clear 0"));
+        Serial.println(F("set pump_spd <0-100>  set pump_spd_clear 0"));
     }
     else if (!strcmp_P(cmd, PSTR("temps")))    dbgTemps();
     else if (!strcmp_P(cmd, PSTR("valves")))   dbgValves();
@@ -2727,15 +2727,31 @@ void loop() {
     float tankBotC  = (hasHPacket && lastH.tempTankBot != TEMP_FAULT)
                        ? (float)lastH.tempTankBot / 10.0f : NAN;
 
+#ifdef DEBUG_SERIAL
+    if (hasHPacket && lastH.calPumpActive) {
+        if (lastH.calSolarTargetC == 0) {
+            setSolarPumpDuty(0);
+            solarPumpActive = false;
+        } else {
+            updateSummerSolar();
+        }
+    } else {
+#endif
     if (mode == MODE_WINTER) {
         updateWinterSolar(tankBotC); // NAN = RS485 stale; function handles this safely
     } else {
         updateSummerSolar();
     }
+#ifdef DEBUG_SERIAL
+    }
+#endif
+    if (hasHPacket && lastH.heaterPowerPct > 0)
+        solarColdValve.setOpen();
     updateUFHHeating();
     // Fault check after solar+UFH so it can override both pump duty and UFH pump pin
     checkSolarPumpFault();
     updateSolarPump();
+    if (simPumpSpdActive) setSolarPumpDuty(simPumpSpdVal);
 
     // Vacuum system
     updateVacuum();

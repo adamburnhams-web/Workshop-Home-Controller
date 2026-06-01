@@ -6,7 +6,7 @@ Allow without asking: `cd`, `dir`, `type`, `git status`, `git log`, `git diff`, 
 ## Project overview
 Home heating controller split across two Arduino Mega 2560s communicating over RS485.
 
-- **H controller** (house side): hot water tank, immersion heater, TFT display, RTC, SD card, 6× DS18B20 sensors
+- **H controller** (house side): hot water tank, immersion heater, TFT display, RTC, SD card, 7× DS18B20 sensors
 - **W controller** (workshop side): solar thermal pump, UFH pump, PC fans, door lock, window winch, vacuum system, Growatt inverter Modbus, 6× DS18B20 sensors
 
 Source lives in `Heating Control/` as a PlatformIO project.
@@ -65,12 +65,12 @@ Scans the 1-Wire bus and prints all DS18B20 addresses in array-literal format, r
 ## DS18B20 sensor addresses
 All addresses are currently **TODO placeholders** — must be filled in after running `scan` on each controller and physically identifying sensors.
 
-- H controller: [src/h_controller/main.cpp ~line 60](Heating Control/src/h_controller/main.cpp) — `tank_bot`, `tank_mid`, `tank_top`, `hot_pipe`, `cold_pipe`, `htr_out`
+- H controller: [src/h_controller/main.cpp ~line 60](Heating Control/src/h_controller/main.cpp) — `tank_bot`, `tank_mid`, `tank_top`, `hot_pipe`, `cold_pipe`, `htr_out`, `htr_out_2`
 - W controller: [src/w_controller/main.cpp ~line 82](Heating Control/src/w_controller/main.cpp) — `solar_hot`, `solar_cold`, `ufh_supply`, `ufh_post_tmv`, `workshop_air`, `outside_air`
 
 ## Commissioning TODOs
 - [ ] Run `scan` on W controller, identify and fill in 6 DS18B20 addresses
-- [ ] Run `scan` on H controller, identify and fill in 6 DS18B20 addresses
+- [ ] Run `scan` on H controller, identify and fill in remaining 6 DS18B20 addresses (`htr_out_2` done)
 - [ ] Calibrate `SOLAR_PUMP_MIN_CURRENT_A` (INA219, W controller)
 - [ ] Calibrate `FAN_MIN_DUTY_PCT` (W controller)
 - [ ] Calibrate `FAN_FLAP_OPEN_MS` (motorized damper travel time, W controller)

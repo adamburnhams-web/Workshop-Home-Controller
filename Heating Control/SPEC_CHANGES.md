@@ -119,56 +119,158 @@ ILI9488 driver, SPI pins, and display dimensions configured via `build_flags` in
 
 ## H Controller — logic changes
 
-### Heater SSR — SOC-based charge rate control (summer mode)
-Spec: heater modulates purely on PV export, starts at 500W export.
-Code: duty calculated every RS485 packet (~250ms) from net grid flow, battery balance, and the heater's own current consumption.
+### Heater SSR — duty algorithm rework
 
-**Manual modes** (`ManualHeaterMode` enum):
-- `MHM_OFF` — heater stays off
-- `MHM_FORCE_ON` — heater forced to 100% (was `MHM_OVERRIDE_SOC`; `MHM_SOC_LIMITED` removed)
+`HEATER_ENABLED` changed to `true` (heater now active in production).
 
-**Pre-conditions (all must pass before any start logic):**
-- Grid present AND `HEATER_ENABLED = true`
-- No W solar sensor fault
-- No heater hard lockout
-- `growattValid = 1` AND combined PV1+PV2 ≥ 200W (end-of-day gate)
+**Manual modes** (`ManualHeaterMode` enum) — three modes now:
+- `MHM_OFF` (0) — heater stays off
+- `MHM_SOC_LIM` (1) — NEW: run at 100% drawing from battery+grid until SOC drops to 50%; enters at 55% (5% hysteresis). Budget: 4 kW combined bat+grid; heater gets all headroom.
+- `MHM_FORCE_ON` (2) — heater forced to 100%; also requests log_cold close, bot_tank and two_port open
 
-**Charge rate target (SOC-based):**
-- SOC < 60%: no charge rate contribution; battery discharge still penalises duty
-- SOC 60%→80%: target = 3000W linearly interpolated to 1000W (100W per 1% SOC)
-- SOC 80%→100%: target = 1000W flat
+**Pre-conditions (checked before any start logic, in order):**
+1. Grid present AND `HEATER_ENABLED = true`
+2. No W solar sensor fault
+3. No heater hard lockout
+4. `hotTankProtection = false` (tank_bot ≤ 83°C — see below)
+5. `morningHeatActive = false`
+6. Valves not closing (heater stays off while bot_tank or two_port is mid-close stroke)
+7. Auto mode only: `growattValid = 1` AND PV1+PV2 ≥ 200W (end-of-day gate)
 
-**Duty calculation (every packet):**
-
+**Auto mode duty calculation** (per RS485 packet, ~250ms):
 ```
-netGridW       = pvExportW − gridImportW          // +ve = exporting
-battW          = battChargeW − chargeTarget        // if SOC ≥ 60%
-               = min(0, battChargeW)               // if SOC < 60% (discharge-only penalty)
-heaterCurrentW = heaterTargetPct × 3000 / 100     // heater's own load already in Growatt readings
-available      = netGridW + heaterCurrentW + battW − 100
+SOC reservation:
+  post-noon (hour ≥ 12) AND soc > 80%: reservationW = 1100W
+  post-noon AND soc > 90%:             reservationW = 500W
+  post-noon AND soc > 97%:             reservationW = 200W
+  pre-noon (hour < 12) AND soc > 50%:  reservationW = 1100W  (same values, lower SOC threshold)
+  otherwise:                            reservationW = 0
+
+If reservation > 0:
+  available = pvExportW − gridImportW + battChargeW + heaterCurrentW − reservationW
+Else:
+  available = pvExportW − gridImportW + min(0, battChargeW) + heaterCurrentW − 100
+
+heaterCurrentW = heaterTargetPct × 3000 / 100
 rawPct         = clamp(available × 100 / 3000, 0, 100)
 ```
 
-Adding `heaterCurrentW` back reconstructs the system balance as if the heater weren't running, so the formula converges to the correct stable duty in one step rather than hunting.
+**Start:** rawPct ≥ 17% (~500W) AND sustained for 5s  
+**Stop:** 5 consecutive zero packets (was immediate)  
+**Smoothing:** 8-packet running average before applying to `heaterTargetPct`
 
-**Start:** `rawPct ≥ 5` (~150W net surplus)  
-**Stop:** `rawPct = 0` immediately
+**Hot pipe cap** (applied after smoothing):
+- `hot_pipe ≥ 90°C` → 0%
+- `hot_pipe 60–90°C` → linear cap: `(90 − hot_pipe) × 3.33%/°C` (100% at 60°C, 0% at 90°C)
 
-### Solar pump direct drive (D46)
+**`botTankValve.request(true)`** called whenever heater is running.
 
-Not in spec. H drives the solar pump MOSFET gate directly via D46, connected via a 40m spare wire and 1N4148 diodes (wired-OR) to W's D44 gate drive. The gate sees whichever signal is higher — both controllers are independent and failsafe.
+### Hot tank protection (new)
 
-**H pump duty** (`hPumpDutyPct`, added to `HToWPacket`):
-- 0 when heater is off or `heaterTargetPct = 0`
-- When heater is on: ramps from a protective minimum toward 100% based on heater outlet vs heater target
-  - Minimum = `max(2, heaterPct/5)`, slightly boosted above 70°C outlet, capped at 25%
-  - Ramp starts at target − 2°C, reaches 100% at target + 2°C
-  - At target + 2°C or above: 100% immediately
-  - Heater target = tank top + 5°C (SOLAR_TANK_PLUS5) or 89°C (SOLAR_MAX)
-- Uses same 3-zone clocking algorithm as W's `updateSolarPump`
-- H always drives this when heater is on; heater on always implies summer mode (pvExportOverride), so no winter-specific branch needed
+New `hotTankProtection` flag managed by `checkHotTankProtection()`:
+- **Enter** (tank_bot > 83°C): heater off, `logBurnerCold` open, `botTankValve` closed, `twoPortValve` open. `updateHeatSourceSelection()` skipped while active.
+- **Leave** (tank_bot < 82°C): flag cleared.
 
-**H pin:** D46 (added after `PIN_RS485_DE_LINK`)
+### Dual heater output sensor (htr_out_2)
+
+Seventh DS18B20 added: `H_SENSOR_HEATER_OUT_2 = 6`, `H_NUM_SENSORS = 7`, sensor 13 (address filled in).
+
+`getHeaterOutC()` arbitrates: both valid → `max(sensor1, sensor2)`; one faulted → remaining sensor; both faulted → `NAN`.
+
+`FAULT_H_SENSOR_HEATER_OUT_2` (bit 12) added to fault flags.
+
+### Heater fault handling rework
+
+**Element-fail detection removed.** The previous 30s/no-temp-rise lockout was unreliable. Replaced by:
+
+- Both sensors faulted → `heaterPowerCapPct = 0` immediately (ISR-level cap), set both fault flags
+- Single sensor faulted → raise fault flag after 5s grace; continue on the remaining sensor
+- Hot pipe sensor fault → `heaterPowerCapPct = 0` immediately
+- RS485 stale > 60s while running → `heaterTargetPct = 0`, `heaterRunning = false`
+
+**Overheat sequencing** (replaces warn→shutdown threshold at 91°C):
+- **91–93°C**: ramp `heaterPowerCapPct` 100→0 (ISR-level cap); request valves open; set `FAULT_H_HEATER_OVERHEAT_WARN`
+- **≥ 93°C**: `heaterPowerCapPct = 0`, `heaterHardLockout = true`, SSR pin cleared, set `FAULT_H_HEATER_OVERHEAT_SHUT`
+- **Auto-clear** hard lockout when effective heater temp < 88°C AND at least one sensor live (clears fault too)
+- **Page 5 Ack** also clears hard lockout immediately (allows manual recovery without reboot)
+
+`heaterPowerCapPct` is a `volatile uint8_t` applied in the ZC ISR: `heaterSpreadAcc += min(heaterTargetPct, heaterPowerCapPct)`.
+
+Heater gate in ISR also requires `VSTATE_SOLAR_COLD_OPEN` — heater cannot fire if the solar cold valve is closed.
+
+### H-side solar pump direct drive — rework
+
+**`calcHPumpDuty()` now returns `float`** (was `uint8_t`).
+
+New predictive formula `calcPred(heaterPct, hotPipeC)`:
+```
+excess   = heaterPct − 20
+pt       = max(0, excess²) × 0.0025        // plateau term
+tr       = 0.09 + max(0, excess) × 0.022   // thermal rise slope
+raw      = 4 + pt + tr × (hotPipeC − 30)
+minDuty  = 4 + heaterPct × 0.05
+pred     = max(raw, minDuty)
+```
+
+**Two operating branches:**
+
+*SOLAR_TANK_PLUS8 mode* (tank top ≤ 75°C):
+- Target = `min(tankTop + 8°C, 87°C)`
+- Below target − 7°C: `pred × 0.9` (floor)
+- target − 7°C to target: ramp 0.9→1.0 × pred
+- target to 90°C: `pred + (hOut − target) × 0.2%/°C`
+- 90–91°C: ramp from `dutyAt90` to 100%
+- ≥ 91°C: 100%
+
+*MAX mode* (or tank top fault):
+- Fixed 85°C reference
+- Upper = `pred × (1.3 − clamp((pred−5)/25, 0, 1) × 0.2)`
+- Below 78°C: `pred × 0.9`
+- 78–85°C: ramp pred × 0.9 → pred
+- 85–90°C: ramp pred → upper
+- 90–91°C: ramp upper → 100%; ≥ 91°C: 100%
+
+Returns 0 when heater is off/lockout applies; 100 during `heaterHardLockout`; minimum 4% when heater running.
+
+**`updateHPump()` moved to Timer1 COMPA ISR** (50ms tick, hardware timer). No longer called from main loop; also called explicitly during `drawFullPage()` strip fills and at end of full redraw to prevent pump stalling during long SPI operations.
+
+Low-duty clocking simplified: zone 0 (< 4%) removed; minimum on-time now 400ms at ≤ 20%.
+
+**Solar target** renamed `SOLAR_TANK_PLUS8` (was `SOLAR_TANK_PLUS5`). Default target = tank top + 8°C, capped at 87°C (was +5°C, capped at 89°C). Status bar and page 4 display updated accordingly.
+
+### Summer startup sequence simplified
+
+Phase 0 now jumps directly to phase 3 (skips phases 1/2). Rationale: solar hot ≥ 50°C means the collector is already above tank bottom; the phase 1/2 gate conditions are trivially met. `botTankValve` opens immediately. This also handles H rebooting mid-session cleanly.
+
+`updateSummerStartup()` aborts and resets on `morningHeatActive` (was: abort on non-summer mode).
+
+### SD logging — header validation and datetime column
+
+On startup, if `log.csv` exists the header row is read and comma-counted. If the count does not match `LOG_EXPECTED_COMMAS` (21 commas, 22 columns), the file is deleted and a new header is written. This prevents stale column layouts from silently corrupting the log after a firmware update.
+
+Column changes:
+- `ts_ms` → `datetime` (ISO `YYYY-MM-DD HH:MM:SS` from RTC, or `INVALID` if RTC not set)
+- Column order: `tank_bot` now before `tank_mid` and `tank_top`
+- Added `htr_out_2` column (after `htr_out`)
+
+`sdAvailable` set false on open failure (prevents repeated open attempts after card removed).
+
+### Page 1 display — 7-row temperature block
+
+Right column expanded from 6 to 7 rows to show both heater sensors (`Heater` = htr_out_2, `Htr Out` = htr_out). Power row updated: shows `Sol H:<pct>%` (H pump) and `Sol W:<pct>%` (W pump) side-by-side.
+
+### RS485 per-packet Growatt/heater debug print (DEBUG_SERIAL only)
+
+On each received W packet, H prints a timestamped summary to Serial:
+`[HH:MM:SS] W pkt | growatt=OK pv1=...W ... soc=...% chg=...W | htr=...% pump=...%`
+
+### `HBridgeValve::request()` — idempotent
+
+Returns immediately if already at the requested position (phase=IDLE, isOpen matches) or already moving there (phase≠IDLE, pendingOpen matches). Prevents redundant pulse re-triggering when called repeatedly.
+
+### `dbgValves()` — shows pending state
+
+Now displays in-motion valve state (pending direction + phase) rather than only final position. New `dbgValveState()` helper handles formatting.
 
 ### 2-port valve mid-tank threshold — hysteresis added
 Spec: switch at 30°C (no hysteresis)
@@ -182,6 +284,67 @@ Code: in phase 3, 2-port tracks hot pipe vs tank top with ±1°C hysteresis:
 
 ### Fault log size — 80 entries not 200
 Spec suggested ~200 entries. Code uses 80 (`~40 bytes × 80 = 3.2KB`) to stay within ATmega2560 8KB RAM budget with headroom for other state.
+
+---
+
+## W Controller — solar pump control rework (second pass)
+
+### `calcPumpDuty()` — heater floor removed, new curve (temporary)
+
+Signature changed from `(float hot, float targetC, uint8_t heaterPct, float heaterOutC)` to `(float hot, float targetC)`. `heaterMinPumpPct()` function removed. Heater-on minimum floor logic removed from W entirely — heater-on pump control is now solely handled by H via direct wire.
+
+New temporary calibration curve (to be replaced with data-derived curve after `cal_pump` run):
+| Solar hot vs target | Duty |
+|---|---|
+| < target − 8°C | 4% |
+| target − 8°C to target | 4% → 50% linear (over 8°C) |
+| target to target + 2°C | 50% → 100% linear (over 2°C) |
+| ≥ target + 2°C | 100% |
+
+### Solar target — SOLAR_TANK_PLUS8
+
+`SOLAR_TANK_PLUS5` → `SOLAR_TANK_PLUS8` throughout. Summer solar target = `min(tankTop + 8°C, 87°C)` (was `+5°C / 80°C`). Default `solarTargetMode` changed accordingly.
+
+### Overheat hot threshold raised 83°C → 91°C
+
+`FAULT_W_SOLAR_OVERHEAT_HOT` now triggers at solar hot > 91°C (was > 83°C) with pump at 100% and tank bottom < 70°C. Clears when solar hot ≤ 91°C.
+
+UFH dump separated from overheat fault flag: open `ufhColdValve` when `91°C < hot < 93°C` AND solar cold < 93°C; close otherwise. Previously dump was paired with the overheat flag and closed on recovery.
+
+Overcurrent and stall dump safety guard raised from `≤ 90°C` to `< 93°C` (matches new UFH dump threshold).
+
+### Summer startup trigger — PV export gate removed
+
+`(growatt.valid && pvExportW >= 500)` removed from start condition. Heater power or collector temperature alone now sufficient to start summer solar.
+
+### Cal mode — pump-stop state (calSolarTargetC == 0)
+
+When H sets `calPumpActive = 1` with `calSolarTargetC = 0`, W immediately stops the solar pump and returns. This allows H to halt W's pump during heater warm-up phases of the calibration sequence.
+
+In `DEBUG_SERIAL` builds, the cal mode check wraps the seasonal routing (`updateWinterSolar` / `updateSummerSolar`) — cal target 0 skips both paths entirely.
+
+### solarColdValve opened when heater running
+
+`solarColdValve.setOpen()` called unconditionally when `lastH.heaterPowerPct > 0`. Ensures the heater-to-solar circuit has a return path regardless of seasonal mode.
+
+### Two-port valve back-off condition added (summer solar)
+
+`finalDuty = 0` when all of: H packet valid, `twoPortHeaterSide = true`, summer startup phase ≥ 3, `hot < solarTarget`, `hot < 65°C`, `cold < solarTarget`, `cold < 65°C`. Prevents W from fighting H for pump control when H has the two-port valve on the heater side and both solar sides are cold.
+
+### `simPumpSpdActive` / `simPumpSpdVal` — new debug override
+
+`set pump_spd <0–100>` / `set pump_spd_clear 0` — directly forces solar pump duty at end of loop. Useful for benching the pump driver independently of control logic.
+
+### RS485 rx timeout and Growatt stale threshold
+
+- `RS485_RX_TIMEOUT_MS` increased from 150ms to 200ms (reduces spurious timeouts on slow bytes)
+- `GROWATT_STALE_MS` reduced from 120s to 60s (faster invalidation of stale inverter data)
+
+---
+
+## Serial monitor — log2file enabled (platformio.ini)
+
+`monitor_filters = log2file` added to `controller_h` environment. Serial output is now automatically saved to a timestamped file in `.pio/` during `pio device monitor` sessions.
 
 ---
 

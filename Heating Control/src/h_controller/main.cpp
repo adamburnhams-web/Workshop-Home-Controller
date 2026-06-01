@@ -65,28 +65,31 @@
 //  DS18B20 SENSOR ADDRESSES  — fill in during commissioning
 // ============================================================
 
-static const uint8_t DS18B20_ADDRS[6][8] = {
-    { 0x28, 0xA4, 0xD1, 0x14, 0x00, 0x00, 0x00, 0x3B }, // tank bottom    (sensor 7)
-    { 0x28, 0xB7, 0x37, 0x15, 0x00, 0x00, 0x00, 0xF0 }, // tank middle    (sensor 8)
-    { 0x28, 0xB2, 0x99, 0x12, 0x00, 0x00, 0x00, 0x0C }, // tank top       (sensor 9)
-    { 0x28, 0x11, 0x6C, 0x12, 0x00, 0x00, 0x00, 0x7D }, // hot pipe       (sensor 10)
-    { 0x28, 0x5C, 0x8E, 0x12, 0x00, 0x00, 0x00, 0x1B }, // cold pipe
-    { 0x28, 0xEA, 0x8F, 0x12, 0x00, 0x00, 0x00, 0x63 }, // heater output  (sensor 12)
-};
 #define H_SENSOR_TANK_BOT    0
 #define H_SENSOR_TANK_MID    1
 #define H_SENSOR_TANK_TOP    2
 #define H_SENSOR_HOT_PIPE    3
 #define H_SENSOR_COLD_PIPE   4
 #define H_SENSOR_HEATER_OUT  5
-#define H_NUM_SENSORS        6
+#define H_SENSOR_HEATER_OUT_2 6
+#define H_NUM_SENSORS        7
+
+static const uint8_t DS18B20_ADDRS[H_NUM_SENSORS][8] = {
+    { 0x28, 0xA4, 0xD1, 0x14, 0x00, 0x00, 0x00, 0x3B }, // tank bottom    (sensor 7)
+    { 0x28, 0xB7, 0x37, 0x15, 0x00, 0x00, 0x00, 0xF0 }, // tank middle    (sensor 8)
+    { 0x28, 0xB2, 0x99, 0x12, 0x00, 0x00, 0x00, 0x0C }, // tank top       (sensor 9)
+    { 0x28, 0x11, 0x6C, 0x12, 0x00, 0x00, 0x00, 0x7D }, // hot pipe       (sensor 10)
+    { 0x28, 0x5C, 0x8E, 0x12, 0x00, 0x00, 0x00, 0x1B }, // cold pipe
+    { 0x28, 0xEA, 0x8F, 0x12, 0x00, 0x00, 0x00, 0x63 }, // heater output  (sensor 12)
+    { 0x28, 0x55, 0xBE, 0x27, 0x79, 0x25, 0x0B, 0xBF }, // heater output 2 (sensor 13)
+};
 
 // ============================================================
 //  COMMISSIONING FLAGS
 // ============================================================
 
 // Set true after verifying Growatt Modbus sign convention via W controller
-static const bool HEATER_ENABLED = false;
+static const bool HEATER_ENABLED = true;
 
 // ============================================================
 //  EEPROM ADDRESSES
@@ -115,7 +118,6 @@ static const bool HEATER_ENABLED = false;
 #define BUS_PSU_HYSTERESIS_DV   125      // 12.5V
 #define BUS_RESTORE_THRESH_DV   140      // 14.0V
 #define BUS_LOW_DELAY_MS        10000UL  // 10s before fault
-#define HEATER_ELEM_FAIL_MS     30000UL  // 30s no temp rise = element fault
 #define HEATER_OVERHEAT_WARN_MS 20000UL  // 20s above 91°C = warning
 #define HEATER_OVERHEAT_SHUT_MS 60000UL  // 1 min warning → shutdown
 
@@ -164,6 +166,8 @@ struct HBridgeValve {
     }
 
     void request(bool open) {
+        if (phase == HBP_IDLE   && isOpen      == open) return; // already there
+        if (phase != HBP_IDLE   && pendingOpen == open) return; // already moving there
         if (phase == HBP_PULSING) { digitalWrite(pinA, RELAY_OFF); digitalWrite(pinB, RELAY_OFF); }
         pendingOpen  = open;
         hasPending   = true;
@@ -228,26 +232,28 @@ static inline bool tempValid(float t) {
 // ============================================================
 
 volatile unsigned long lastZCMicros  = 0;
-volatile uint8_t       heaterSpreadAcc = 0;   // Bresenham accumulator for spread firing
+volatile uint8_t       heaterSpreadAcc    = 0;    // Bresenham accumulator for spread firing
+volatile uint8_t       heaterPowerCapPct  = 100;  // ISR-level power ceiling (reduced 91–92°C)
 volatile uint8_t       heaterTargetPct = 0;   // 0–100, written by outer loop
 volatile uint32_t      zcFireCount   = 0;
 #ifdef DEBUG_SERIAL
-volatile bool simHeaterActive = false;
+volatile bool simHeaterActive    = false;
+bool          pumpTestHeaterActive = false;  // true while pump_test/stress_test owns the heater
 #else
 static const bool simHeaterActive = false;
 #endif
 
 bool heaterRunning    = false;
 bool heaterHardLockout = false;   // set on element fail / UFH hard lockout — clears on restart
+bool hotTankProtection = false;
+bool morningHeatActive = false;
 bool heaterOvheatWarn = false;
 unsigned long heaterOvheatWarnMs = 0;
-unsigned long heaterElemFailMs   = 0;
-float heaterOutAtElemCheck       = NAN;
 bool gridPresent                 = true;
 unsigned long lastGridLossMs     = 0;
 bool gridOutageFault             = false;
 
-uint8_t       hPumpDuty        = 0;
+float         hPumpDuty        = 0.0f;
 bool          hPumpOutputState = false;
 unsigned long hPumpOnMs        = 0;
 unsigned long hPumpOffMs       = 0;
@@ -260,11 +266,13 @@ void zeroCrossISR() {
     lastZCMicros = micros();
     zcFireCount++;
 
-    heaterSpreadAcc += heaterTargetPct;
+    heaterSpreadAcc += min(heaterTargetPct, heaterPowerCapPct);
     bool fire = (heaterSpreadAcc >= 100);
     if (fire) heaterSpreadAcc -= 100;
 
-    bool on = (HEATER_ENABLED || simHeaterActive) && heaterRunning && !heaterHardLockout && fire;
+    bool on = (HEATER_ENABLED || simHeaterActive) && heaterRunning
+              && (lastWPkt.valveStates & VSTATE_SOLAR_COLD_OPEN)
+              && !heaterHardLockout && fire;
     if (on) PORTA |= (1 << PA5);    // D27 = PA5
     else    PORTA &= ~(1 << PA5);
 }
@@ -274,6 +282,8 @@ uint8_t rtcHour();   // defined after RTC section
 #ifdef DEBUG_SERIAL
 uint8_t simHeaterVal = 0;
 #endif
+
+static inline float getHeaterOutC();  // defined after sensorFaultMaskH
 
 // Called every RS485 packet (~250ms); Growatt data arrives via W.
 void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
@@ -285,6 +295,7 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
         heaterTargetPct = simHeaterVal;
         return;
     }
+    if (pumpTestHeaterActive) return;  // pump_test/stress_test own heaterRunning
 #endif
     if (!gridPresent || !HEATER_ENABLED) {
         heaterTargetPct = 0; heaterRunning = false; return;
@@ -297,54 +308,127 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
     if (heaterHardLockout) {
         heaterTargetPct = 0; heaterRunning = false; return;
     }
+    if (hotTankProtection) {
+        heaterTargetPct = 0; heaterRunning = false; return;
+    }
+    if (morningHeatActive) {
+        heaterTargetPct = 0; heaterRunning = false; return;
+    }
     if (manualMode == MHM_FORCE_ON) {
+        logBurnerCold.request(false);
+        botTankValve.request(true);
+        twoPortValve.request(true);
         heaterRunning = true; heaterTargetPct = 100; return;
     }
+    if ((twoPortValve.busy() && !twoPortValve.pendingOpen) ||
+        (botTankValve.busy() && !botTankValve.pendingOpen)) {
+        heaterTargetPct = 0; heaterRunning = false; return;
+    }
 
-    // End of day: total PV (PV1+PV2) below 200W → heater off
-    if (!lastWPkt.growattValid || (lastWPkt.pv1W + lastWPkt.pv2W) < 200) {
+    bool     growattOk     = lastWPkt.growattValid;
+    int32_t  heaterCurrentW = (int32_t)heaterTargetPct * 3000 / 100;
+    int16_t  rawPct;
+
+    static bool          lastHighSoc    = false;
+    static unsigned long surplusStartMs = 0;
+    static uint8_t       zeroCount      = 0;
+    static uint16_t      rawPctAccum    = 0;
+    static uint8_t       accumCount     = 0;
+
+    // SOC-limited mode: 5% hysteresis, enter at 55%, leave at 50%
+    uint8_t soc     = lastWPkt.battSocPct;
+    bool    highSoc = (manualMode == MHM_SOC_LIM) && growattOk
+                      && (lastHighSoc ? soc >= 50 : soc >= 55);
+
+    if (highSoc) {
+        // 4 kW budget from bat+grid combined; heater gets the headroom.
+        // Growatt readings include heater load, so add back heaterCurrentW to find
+        // non-heater draw, then subtract from budget.
+        int16_t battChgW       = lastWPkt.battChargeW;
+        int32_t battDischargeW = battChgW < 0 ? (int32_t)(-battChgW) : 0L;
+        int32_t available      = 4000L - ((int32_t)gridImportW + battDischargeW - heaterCurrentW);
+        rawPct = (int16_t)constrain(available * 100L / 3000L, 0L, 100L);
+    } else if (manualMode == MHM_SOC_LIM) {
+        // SOC mode but below threshold — heater off
         heaterRunning = false; heaterTargetPct = 0; return;
+    } else {
+        // Normal auto mode: requires PV generating.
+        if (!growattOk || (lastWPkt.pv1W + lastWPkt.pv2W) < 200) {
+            heaterRunning = false; heaterTargetPct = 0; return;
+        }
+        int16_t battChgW   = lastWPkt.battChargeW;
+        int32_t netGridW   = (int32_t)pvExportW - gridImportW;
+        int32_t battW      = (int32_t)min((int16_t)0, battChgW);
+        // When battery is well charged, include charging power in available headroom
+        // so the heater can absorb PV that would otherwise just top off a full battery.
+        // Reservation reduces as SOC rises to protect remaining charge capacity.
+        // Before noon the threshold is lower (50%) to front-load hot water earlier.
+        bool    socReserve    = (rtcHour() < 12) ? (soc > 50) : (soc > 80);
+        int32_t reservationW  = socReserve ? 1100L : 0L;
+        if      (soc > 97) reservationW = 200L;
+        else if (soc > 90) reservationW = 500L;
+        int32_t available = (reservationW > 0)
+            ? (int32_t)pvExportW - gridImportW + (int32_t)battChgW + heaterCurrentW - reservationW
+            : netGridW + heaterCurrentW + battW - 100L;
+        rawPct = (int16_t)constrain(available * 100L / 3000L, 0L, 100L);
     }
 
-    uint8_t soc         = lastWPkt.battSocPct;
-    int16_t battChargeW = lastWPkt.battChargeW;  // +ve=charging, -ve=discharging
-    bool    socControl  = (soc >= 60);
+    if (highSoc != lastHighSoc) {
+        heaterRunning = false; heaterTargetPct = 0;
+        surplusStartMs = 0; zeroCount = 0; rawPctAccum = 0; accumCount = 0;
+        lastHighSoc = highSoc;
+    }
 
-    // SOC-based charge rate target: 3000W→1000W between 60–80%, flat 1000W above 80%
-    int16_t chargeTarget = 0;
-    if (soc >= 80)      chargeTarget = 1000;
-    else if (soc >= 60) chargeTarget = (int16_t)(3000 - (int32_t)(soc - 60) * 100);
-
-    // Net grid flow (positive = exporting, negative = importing).
-    // The Growatt readings already include the heater as a load, so adding back
-    // heaterCurrentW gives the system balance as if the heater weren't running,
-    // letting us solve directly for the correct operating duty in one step.
-    int32_t netGridW       = (int32_t)pvExportW - gridImportW;
-    int32_t battW          = socControl ? (int32_t)battChargeW - chargeTarget
-                                        : (int32_t)min((int16_t)0, battChargeW);
-    int32_t heaterCurrentW = (int32_t)heaterTargetPct * 3000 / 100;
-    int32_t available      = netGridW + heaterCurrentW + battW - 100L;
-    int16_t rawPct         = (int16_t)constrain(available * 100L / 3000L, 0L, 100L);
-
-    // Start when ~150W net surplus available; stop immediately when none.
     if (!heaterRunning) {
-        if (rawPct < 5) return;
-        heaterRunning = true;
+        zeroCount = 0; rawPctAccum = 0; accumCount = 0;
+        if (rawPct == 0) return;
+        if (!highSoc) {
+            if (rawPct < 17) { surplusStartMs = 0; return; }  // ~500W threshold
+            if (surplusStartMs == 0) surplusStartMs = millis();
+            if (millis() - surplusStartMs < 5000UL) return;
+        }
+        heaterRunning  = true;
+        surplusStartMs = 0;
     }
-    if (rawPct == 0) { heaterRunning = false; heaterTargetPct = 0; return; }
 
-    heaterTargetPct = (uint8_t)rawPct;
+    if (rawPct == 0) {
+        if (++zeroCount >= 5) {
+            heaterRunning = false; heaterTargetPct = 0;
+            zeroCount = 0; rawPctAccum = 0; accumCount = 0;
+        }
+        return;
+    }
+    zeroCount = 0;
+
+    rawPctAccum += rawPct;
+    if (++accumCount < 8) return;
+    heaterTargetPct = (uint8_t)(rawPctAccum / 8);
+    rawPctAccum = 0; accumCount = 0;
 
     // Overheat power reduction (> 91°C heater output)
-    if (!sFault[H_SENSOR_HEATER_OUT]) {
-        float hOut = sTemp[H_SENSOR_HEATER_OUT];
-        if (hOut > 92.0f) {
-            heaterTargetPct = 0;
-        } else if (hOut > 91.0f) {
-            uint8_t reduce = (uint8_t)((hOut - 91.0f) * 100.0f);
-            heaterTargetPct = heaterTargetPct * (100 - reduce) / 100;
+    if (!(sFault[H_SENSOR_HEATER_OUT] && sFault[H_SENSOR_HEATER_OUT_2])) {
+        float hOut = getHeaterOutC();
+        if (!isnan(hOut)) {
+            if (hOut >= 92.0f) {
+                heaterTargetPct = 0;
+            } else if (hOut > 91.0f) {
+                uint8_t reduce = (uint8_t)((hOut - 91.0f) * 100.0f);
+                heaterTargetPct = heaterTargetPct * (100 - reduce) / 100;
+            }
         }
     }
+
+    // Hot pipe cap: 100% at 60°C, linear ramp to 0 at 90°C
+    if (!sFault[H_SENSOR_HOT_PIPE]) {
+        float hp = sTemp[H_SENSOR_HOT_PIPE];
+        if (hp >= 90.0f) {
+            heaterTargetPct = 0;
+        } else if (hp > 60.0f) {
+            uint8_t cap = (uint8_t)((90.0f - hp) * (100.0f / 30.0f));  // ~3.33% per °C over 30°C span
+            if (heaterTargetPct > cap) heaterTargetPct = cap;
+        }
+    }
+    if (heaterRunning) botTankValve.request(true);
 }
 
 // ============================================================
@@ -369,14 +453,46 @@ float   hSim[H_NUM_SENSORS];
 
 bool    simLogBurnerActive = false, simLogBurnerVal = false;
 bool    simPVExportActive  = false; int16_t simPVExportVal = 0;
+bool    simHPumpSpdActive  = false; uint8_t simHPumpSpdVal = 0;
+bool    simWPumpStop       = false;
 
-enum CalPumpPhase : uint8_t { CALP_IDLE, CALP_STABILIZE, CALP_PRE_RAMP, CALP_RAMPING, CALP_DONE };
+enum CalPumpPhase : uint8_t { CALP_IDLE, CALP_RUNNING, CALP_DONE };
 CalPumpPhase  calPumpPhase   = CALP_IDLE;
-uint8_t       calSolarStepC  = 85;    // current test point °C (85–40 in 5°C steps, descending)
-uint8_t       calHeaterPct   = 0;     // heater override %
+uint8_t       calHeaterPct   = 15;    // current step heater power %
+float         calPumpBase    = 4.0f;  // pump floor for current step % (float for sub-1% precision)
+uint8_t       calStepNum     = 0;     // 0 = first step (5min), 1+ = subsequent (3min)
 bool          calHtrOverride = false;
-unsigned long calPhaseMs     = 0;     // phase start / stability timer
-unsigned long calStepMs      = 0;     // ramp step timer
+bool          calCooling     = false; // true while waiting for htr_out to drop below 91°C
+bool          calSensorFault = false; // true while htr_out sensor is faulted during a step
+unsigned long calPhaseMs     = 0;     // step start time
+volatile uint32_t calPumpOnMs  = 200;  // precomputed on-time for ISR
+volatile uint32_t calPumpOffMs = 6200; // precomputed off-time for ISR
+
+// ── Pump formula test (pump_test command) ────────────────────
+// 28 values (5–100), interleaved low/mid/high so consecutive steps jump ~33%.
+static const uint8_t PUMP_TEST_POWERS[] PROGMEM = {
+    35, 69, 39, 73,  8, 42, 76, 11, 45, 80,
+    15, 49, 83, 18, 52, 86, 21, 56, 90, 25,
+    59, 93, 28, 62, 97, 32, 66, 100
+};
+static const uint8_t PUMP_TEST_COUNT = sizeof(PUMP_TEST_POWERS);
+// Sequential low→mid range; covers all previously oscillating levels + boundary
+static const uint8_t STRESS_TEST_POWERS[] PROGMEM = {
+     5, 11, 15, 18, 20, 21, 25, 30, 35
+};
+static const uint8_t STRESS_TEST_COUNT = sizeof(STRESS_TEST_POWERS);
+enum PumpTestState : uint8_t { PT_IDLE, PT_HEATING, PT_COOLDOWN };
+PumpTestState pumpTestState    = PT_IDLE;
+uint8_t       pumpTestPower    = 5;
+uint8_t       pumpTestStepIdx  = 0;
+uint32_t      pumpTestLastPrint = 0;
+uint32_t      pumpTestWinStart  = 0;
+float         pumpTestWinMin    = 0.0f;
+float         pumpTestWinMax    = 0.0f;
+uint32_t      pumpTestLastSec   = 0;
+float         pumpTestMaxPump   = 0.0f;
+bool          pumpTestStress    = false;
+uint32_t      pumpTestCoolStart = 0;
 #endif // DEBUG_SERIAL
 
 // ============================================================
@@ -450,7 +566,8 @@ unsigned long lastConvStartMs = 0;
 bool          convStarted     = false;
 static const uint32_t sensorFaultMaskH[H_NUM_SENSORS] = {
     FAULT_H_SENSOR_TANK_BOT, FAULT_H_SENSOR_TANK_MID, FAULT_H_SENSOR_TANK_TOP,
-    FAULT_H_SENSOR_HOT_PIPE, FAULT_H_SENSOR_COLD_PIPE, FAULT_H_SENSOR_HEATER_OUT
+    FAULT_H_SENSOR_HOT_PIPE, FAULT_H_SENSOR_COLD_PIPE,
+    0, 0   // HEATER_OUT / HEATER_OUT_2 — managed by checkHeaterFaults() with 5s grace
 };
 
 inline void pollBtns();  // forward declaration — defined after Button struct
@@ -469,6 +586,11 @@ void readSensors() {
 
     for (uint8_t i = 0; i < H_NUM_SENSORS; i++) {
         float t = sensors.getTempC((uint8_t*)DS18B20_ADDRS[i]);
+        if (!tempValid(t)) {
+            // Retry once — transient EMI CRC errors are single-cycle; scratchpad still holds valid data
+            delayMicroseconds(500);
+            t = sensors.getTempC((uint8_t*)DS18B20_ADDRS[i]);
+        }
         pollBtns();
         if (tempValid(t)) {
             sTemp[i] = t; sFailCount[i] = 0;
@@ -488,63 +610,109 @@ void readSensors() {
 }
 
 // ============================================================
+//  HEATER OUTPUT TEMPERATURE  (dual-sensor arbitration)
+//  Both good → max of the two.  One faulted → remaining.  Both → NAN.
+// ============================================================
+
+static inline float getHeaterOutC() {
+    bool f1 = sFault[H_SENSOR_HEATER_OUT];
+    bool f2 = sFault[H_SENSOR_HEATER_OUT_2];
+    if (f1 && f2)  return NAN;
+    if (f1)        return sTemp[H_SENSOR_HEATER_OUT_2];
+    if (f2)        return sTemp[H_SENSOR_HEATER_OUT];
+    return max(sTemp[H_SENSOR_HEATER_OUT], sTemp[H_SENSOR_HEATER_OUT_2]);
+}
+
+// ============================================================
 //  HEATER FAULT CHECKS  (called from main loop)
 // ============================================================
 
 void checkHeaterFaults() {
-#ifdef DEBUG_SERIAL
-    if (simHeaterActive) return;
-#endif
+    static unsigned long htrOut1FaultMs = 0;
+    static unsigned long htrOut2FaultMs = 0;
+
+    bool f1 = sFault[H_SENSOR_HEATER_OUT];
+    bool f2 = sFault[H_SENSOR_HEATER_OUT_2];
+
+    // Track fault onset; clear H fault flag immediately on recovery
+    if (f1) { if (!htrOut1FaultMs) htrOut1FaultMs = millis(); }
+    else    { htrOut1FaultMs = 0; clearFaultH(FAULT_H_SENSOR_HEATER_OUT); }
+    if (f2) { if (!htrOut2FaultMs) htrOut2FaultMs = millis(); }
+    else    { htrOut2FaultMs = 0; clearFaultH(FAULT_H_SENSOR_HEATER_OUT_2); }
+
+    // Hard lockout clears when effective temp < 88°C and at least one sensor is live
+    if (heaterHardLockout && hasFaultH(FAULT_H_HEATER_OVERHEAT_SHUT) && !(f1 && f2)) {
+        float effT = getHeaterOutC();
+        if (!isnan(effT) && effT < 88.0f) {
+            heaterHardLockout = false;
+            clearFaultH(FAULT_H_HEATER_OVERHEAT_SHUT);
+        }
+    }
+
+    if (hasWPkt && millis() - lastWPktMs > 60000UL) {
+        heaterTargetPct = 0; heaterRunning = false;
+    }
+
     if (!heaterRunning || heaterTargetPct == 0) {
-        heaterElemFailMs   = 0;
-        heaterOutAtElemCheck = NAN;
-        heaterOvheatWarnMs = 0;
+        heaterPowerCapPct  = 100;
         heaterOvheatWarn   = false;
+        heaterOvheatWarnMs = 0;
+        clearFaultH(FAULT_H_HEATER_OVERHEAT_WARN);
         return;
     }
 
-    // Element fail: power applied > 30s with no temp rise
-    if (!sFault[H_SENSOR_HEATER_OUT]) {
-        float hOut = sTemp[H_SENSOR_HEATER_OUT];
-        if (heaterElemFailMs == 0) {
-            heaterElemFailMs     = millis();
-            heaterOutAtElemCheck = hOut;
-        } else if (millis() - heaterElemFailMs >= HEATER_ELEM_FAIL_MS) {
-            if (!isnan(heaterOutAtElemCheck) && hOut < heaterOutAtElemCheck + 1.0f) {
-                setFaultH(FAULT_H_HEATER_ELEMENT_FAIL);
-                heaterHardLockout = true;
-                heaterTargetPct   = 0;
-                PORTA &= ~(1 << PA5); // D27 off
-            }
-            heaterElemFailMs = millis(); // reset check interval
-            heaterOutAtElemCheck = hOut;
-        }
+    // Both sensors faulted: shut down heater immediately
+    if (f1 && f2) {
+        heaterPowerCapPct = 0;
+        setFaultH(FAULT_H_SENSOR_HEATER_OUT);
+        setFaultH(FAULT_H_SENSOR_HEATER_OUT_2);
+        return;
+    }
 
-        // Overheat warning: > 91°C for > 20s while hot pipe < 80°C
-        bool hotPipeOk = !sFault[H_SENSOR_HOT_PIPE] && sTemp[H_SENSOR_HOT_PIPE] < 80.0f;
-        if (hOut > 91.0f && hotPipeOk) {
-            if (!heaterOvheatWarn) {
-                heaterOvheatWarn   = true;
-                heaterOvheatWarnMs = millis();
-                setFaultH(FAULT_H_HEATER_OVERHEAT_WARN);
-            }
-            if (millis() - heaterOvheatWarnMs >= HEATER_OVERHEAT_SHUT_MS) {
-                setFaultH(FAULT_H_HEATER_OVERHEAT_SHUT);
-                heaterHardLockout = true;
-                heaterTargetPct   = 0;
-                PORTA &= ~(1 << PA5);
-            }
-        } else if (hOut <= 91.0f) {
-            heaterOvheatWarn = false;
-            clearFaultH(FAULT_H_HEATER_OVERHEAT_WARN);
-            heaterOvheatWarnMs = 0;
+    // Single fault: raise H fault flag after 5s grace; continue on remaining sensor
+    if (f1 && millis() - htrOut1FaultMs >= 5000UL) setFaultH(FAULT_H_SENSOR_HEATER_OUT);
+    if (f2 && millis() - htrOut2FaultMs >= 5000UL) setFaultH(FAULT_H_SENSOR_HEATER_OUT_2);
+
+    if (sFault[H_SENSOR_HOT_PIPE]) {
+        heaterPowerCapPct = 0;
+        setFaultH(FAULT_H_SENSOR_HOT_PIPE);
+        return;
+    }
+
+    float hOut = getHeaterOutC();
+    static bool ovhtValvesRequested = false;
+
+    if (hOut >= 93.0f) {
+        if (!ovhtValvesRequested) {
+            twoPortValve.request(true);
+            botTankValve.request(true);
+            ovhtValvesRequested = true;
+        }
+        heaterPowerCapPct = 0;
+        heaterTargetPct   = 0;
+        heaterHardLockout = true;
+        PORTA &= ~(1 << PA5);
+        setFaultH(FAULT_H_HEATER_OVERHEAT_SHUT);
+    } else if (hOut > 91.0f) {
+        if (!ovhtValvesRequested) {
+            twoPortValve.request(true);
+            botTankValve.request(true);
+            ovhtValvesRequested = true;
+        }
+        float cap = (92.0f - hOut) * 100.0f;
+        heaterPowerCapPct = (cap <= 0.0f) ? 0 : (uint8_t)cap;
+        if (!heaterOvheatWarn) {
+            heaterOvheatWarn   = true;
+            heaterOvheatWarnMs = millis();
+            setFaultH(FAULT_H_HEATER_OVERHEAT_WARN);
         }
     } else {
-        // Heater output sensor fault → lock out heater
-        setFaultH(FAULT_H_SENSOR_HEATER_OUT);
-        heaterHardLockout = true;
-        heaterTargetPct   = 0;
-        PORTA &= ~(1 << PA5);
+        ovhtValvesRequested = false;
+        heaterPowerCapPct  = 100;
+        heaterOvheatWarn   = false;
+        heaterOvheatWarnMs = 0;
+        clearFaultH(FAULT_H_HEATER_OVERHEAT_WARN);
+        clearFaultH(FAULT_H_SENSOR_HOT_PIPE);
     }
 }
 
@@ -578,7 +746,7 @@ uint8_t rtcSecond() { return rtcValid ? rtcNow.second() : 0; }
 
 SystemMode      systemMode          = MODE_WINTER;
 bool            nightCoolingEnabled = true;
-SolarTargetMode solarTargetMode     = SOLAR_TANK_PLUS5;
+SolarTargetMode solarTargetMode     = SOLAR_TANK_PLUS8;
 uint8_t         displayBrightness   = 100;
 
 // Not stored in EEPROM — reset on power cycle
@@ -618,7 +786,6 @@ void markSettingsDirty() { eepromDirty = true; eepromDirtyMs = millis(); }
 //  WINTER HEATING LOGIC  (H side)
 // ============================================================
 
-bool morningHeatActive = false;
 bool morningHeatFired  = false;  // prevents re-trigger same calendar day
 uint8_t lastHeatDay    = 255;
 
@@ -661,7 +828,22 @@ void checkMorningTrigger() {
     }
 }
 
+void checkHotTankProtection() {
+    if (sFault[H_SENSOR_TANK_BOT]) return;
+    float tBot = sTemp[H_SENSOR_TANK_BOT];
+    if (!hotTankProtection && tBot > 83.0f) {
+        hotTankProtection = true;
+        logBurnerCold.request(true);
+        botTankValve.request(false);
+        twoPortValve.request(true);
+    } else if (hotTankProtection && tBot < 82.0f) {
+        hotTankProtection = false;
+    }
+}
+
 void updateHeatSourceSelection() {
+    if (hotTankProtection) return;
+
     static bool prevMorningActive = false;
 
     if (prevMorningActive && !morningHeatActive) {
@@ -740,21 +922,27 @@ bool    summerTwoPortTop   = true; // true = heater cold side / top-of-tank
 void updateSummerStartup() {
     bool solarRunning = hasWPkt && lastWPkt.solarPumpActive;
 
-    if ((systemMode != MODE_SUMMER && !pvExportOverride) || !solarRunning) {
+    if (!solarRunning || morningHeatActive) {
         if (summerStartupPhase != 0) {
             summerStartupPhase = 0;
             logBurnerCold.request(false);
-            botTankValve.request(false);
-            twoPortValve.request(true);   // heater cold side / top-of-tank on any abort
+            if (!morningHeatActive) botTankValve.request(false);
+            twoPortValve.request(true);
         }
         return;
     }
 
     switch (summerStartupPhase) {
         case 0:
-            summerStartupPhase = 1;
-            logBurnerCold.request(true);
-            twoPortValve.request(true);   // heater cold side / top-of-tank
+            // Go straight to phase 3: collector hot >= 50°C means it's already above tank bottom,
+            // so the phase 1/2 gate conditions are met. Phase 3 manages valve direction dynamically.
+            // This also handles H rebooting while W is already mid-session — botTankValve opens
+            // immediately instead of waiting for sensor faults to clear.
+            summerStartupPhase = 3;
+            summerTwoPortTop   = true;
+            logBurnerCold.request(false);
+            botTankValve.request(true);
+            twoPortValve.request(true);   // heater cold side / top-of-tank; phase 3 adjusts
             break;
 
         case 1:
@@ -857,17 +1045,32 @@ bool    sdAvailable   = false;
 bool    sdEjected     = false;
 unsigned long lastLogMs = 0;
 
+static const uint8_t LOG_EXPECTED_COMMAS = 21; // 22 columns = 21 commas
+
 void initSD() {
     if (SD.begin(PIN_SD_CS)) {
         sdAvailable = true;
 #ifdef DEBUG_SERIAL
         Serial.println(F("SD: ok"));
 #endif
-        if (!SD.exists("log.csv")) {
+        bool needHeader = true;
+        if (SD.exists("log.csv")) {
+            File f = SD.open("log.csv", FILE_READ);
+            if (f) {
+                uint8_t commas = 0;
+                int c;
+                while ((c = f.read()) != -1 && c != '\n' && c != '\r')
+                    if (c == ',') commas++;
+                f.close();
+                if (commas == LOG_EXPECTED_COMMAS) needHeader = false;
+            }
+            if (needHeader) SD.remove("log.csv");
+        }
+        if (needHeader) {
             File f = SD.open("log.csv", FILE_WRITE);
             if (f) {
-                f.println(F("ts_ms,solar_hot,solar_cold,ufh_sup,ufh_tmv,w_air,out_air,"
-                            "tank_top,tank_mid,tank_bot,hot_pipe,cold_pipe,htr_out,"
+                f.println(F("datetime,solar_hot,solar_cold,ufh_sup,ufh_tmv,w_air,out_air,"
+                            "tank_bot,tank_mid,tank_top,hot_pipe,cold_pipe,htr_out,htr_out_2,"
                             "pump_pct,htr_pct,export_w,import_w,"
                             "bus_v,fan1rpm,fan2rpm,fan_pct"));
                 f.close();
@@ -889,9 +1092,20 @@ void initSD() {
 void logDataRow() {
     if (!sdAvailable || sdEjected) return;
     File f = SD.open("log.csv", FILE_WRITE);
-    if (!f) return;
+    if (!f) {
+        sdAvailable = false;
+        sdEjected   = true;
+        return;
+    }
 
-    f.print(millis()); f.print(',');
+    char tsBuf[20];
+    if (rtcValid)
+        snprintf(tsBuf, sizeof(tsBuf), "%04u-%02u-%02u %02u:%02u:%02u",
+                 rtcNow.year(), rtcNow.month(), rtcNow.day(),
+                 rtcNow.hour(), rtcNow.minute(), rtcNow.second());
+    else
+        snprintf(tsBuf, sizeof(tsBuf), "INVALID");
+    f.print(tsBuf); f.print(',');
     // W temperatures
     auto pT = [&](int16_t v){ if(v==TEMP_FAULT) f.print("NaN"); else f.print(v/10.0f,1); f.print(','); };
     pT(lastWPkt.tempSolarHot); pT(lastWPkt.tempSolarCold);
@@ -1022,15 +1236,19 @@ struct Button {
 } btnSelect, btnUp, btnDown;
 inline void pollBtns() { btnSelect.poll(); btnUp.poll(); btnDown.poll(); }
 
+// Forward declarations
+void drawFullPage();
+static void updateHPump();
+
 // 1ms timer ISR — polls buttons independently of loop speed so any press >4ms is detected
 ISR(TIMER3_COMPA_vect) { pollBtns(); }
+
+// 50ms timer ISR — drives H pump timing independently of loop blocking time
+ISR(TIMER1_COMPA_vect) { updateHPump(); }
 
 // Track double-press SELECT for boost shortcut
 unsigned long lastSelectMs   = 0;
 bool          selectPending  = false;
-
-// Forward declaration for full redraw
-void drawFullPage();
 
 void setBacklight(uint8_t pct) {
     analogWrite(PIN_DISPLAY_BL, pct == 0 ? 0 : (uint8_t)map(pct, 0, 100, 0, 255));
@@ -1062,7 +1280,7 @@ void drawStatusBar() {
     tft.print(nightCoolingEnabled ? "NC:ON " : "NC:OFF");
 
     tft.setCursor(272, 2);
-    tft.print(solarTargetMode == SOLAR_TANK_PLUS5 ? "TK+5" : "MAX ");
+    tft.print(solarTargetMode == SOLAR_TANK_PLUS8 ? "TK+8" : "MAX ");
 
     tft.setCursor(328, 2);
     tft.print("P"); tft.print(currentPage); tft.print("/5");
@@ -1172,24 +1390,34 @@ void drawPage1(uint32_t wF) {
     printRow(4, 155, 4, "Workshop Air", lastWPkt.tempWorkshopAir, lastWPkt.tempWorkshopAir == TEMP_FAULT);
     printRow(4, 155, 5, "Outside Air",  lastWPkt.tempOutsideAir,  lastWPkt.tempOutsideAir  == TEMP_FAULT);
 
-    // Right column: H temperatures (rows 0-5)
-    static const char* hNames[H_NUM_SENSORS] = {
-        "Tank Bot","Tank Mid","Tank Top","Hot Pipe","Cold Pipe","Htr Out" };
-    for (uint8_t i = 0; i < H_NUM_SENSORS; i++) {
-        int16_t enc = sFault[i] ? TEMP_FAULT : (int16_t)(sTemp[i] * 10.0f);
-        printRow(244, 355, i, hNames[i], enc, sFault[i]);
-        if (i % 3 == 2) pollBtns();
+    // Right column: H temperatures (rows 0-6); rows 5-6 are the two heater sensors
+    static const uint8_t hSensorIdx[7] = {
+        H_SENSOR_TANK_BOT, H_SENSOR_TANK_MID, H_SENSOR_TANK_TOP,
+        H_SENSOR_HOT_PIPE, H_SENSOR_COLD_PIPE,
+        H_SENSOR_HEATER_OUT_2,  // row 5: "Heater"
+        H_SENSOR_HEATER_OUT     // row 6: "Htr Out"
+    };
+    static const char* hNames[7] = {
+        "Tank Bot","Tank Mid","Tank Top","Hot Pipe","Cold Pipe","Heater","Htr Out" };
+    for (uint8_t row = 0; row < 7; row++) {
+        uint8_t si = hSensorIdx[row];
+        bool fault = sFault[si];
+        int16_t enc = fault ? TEMP_FAULT : (int16_t)(sTemp[si] * 10.0f);
+        printRow(244, 355, row, hNames[row], enc, fault);
+        if (row % 3 == 2) pollBtns();
     }
 
-    // Power/valve/winch section — extra 12px gap after the temp block
-    const uint16_t yS = 30 + 6 * 18 + 12;  // = 162
+    // Power/valve/winch section — extra 12px gap after the 7-row temp block
+    const uint16_t yS = 30 + 7 * 18 + 12;
 
     // Power row
     uint16_t y = yS;
     tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(4, y); tft.print("Heater");
-    { char tmp[8], hbuf[10]; snprintf(tmp, sizeof(tmp), "%dW", heaterRunning ? (heaterTargetPct * 3000 / 100) : 0); snprintf(hbuf, sizeof(hbuf), "%-7s", tmp); tft.setTextColor(C_CYAN, C_BLACK); tft.setCursor(82, y); tft.print(hbuf); }
-    tft.setCursor(265, y); tft.setTextColor(C_WHITE, C_BLACK); tft.print("Sol");
-    { char tmp[8], sbuf[8]; snprintf(tmp, sizeof(tmp), "%d%%", lastWPkt.solarPumpDutyPct); snprintf(sbuf, sizeof(sbuf), "%-5s", tmp); tft.setTextColor(C_CYAN, C_BLACK); tft.setCursor(310, y); tft.print(sbuf); }
+    { char tmp[8], buf[8]; snprintf(tmp, sizeof(tmp), "%dW", heaterRunning ? (heaterTargetPct * 3000 / 100) : 0); snprintf(buf, sizeof(buf), "%-5s", tmp); tft.setTextColor(C_CYAN, C_BLACK); tft.setCursor(82, y); tft.print(buf); }
+    tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(172, y); tft.print("Sol H:");
+    { char tmp[6], buf[6]; snprintf(tmp, sizeof(tmp), "%d%%", (int)roundf(hPumpDuty)); snprintf(buf, sizeof(buf), "%-4s", tmp); tft.setTextColor(C_CYAN, C_BLACK); tft.setCursor(250, y); tft.print(buf); }
+    tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(304, y); tft.print("Sol W:");
+    { char tmp[6], buf[6]; snprintf(tmp, sizeof(tmp), "%d%%", lastWPkt.solarPumpDutyPct); snprintf(buf, sizeof(buf), "%-4s", tmp); tft.setTextColor(C_CYAN, C_BLACK); tft.setCursor(382, y); tft.print(buf); }
 
     // Valve states
     y = yS + 18;
@@ -1384,9 +1612,9 @@ void getPage4Value(uint8_t item, char* buf, uint8_t bufSz) {
         case 0: { const char* bm[] = {"Off","Boost-5am","8hr"}; strlcpy(buf, bm[boostMode], bufSz); break; }
         case 1: snprintf(buf, bufSz, "%.1fC", (double)boostTarget); break;
         case 2: strlcpy(buf, systemMode == MODE_WINTER ? "Winter" : "Summer", bufSz); break;
-        case 3: { const char* mm[] = {"Off","SOC-Lim","Override"}; strlcpy(buf, mm[manualHeaterMode], bufSz); break; }
+        case 3: { const char* mm[] = {"Off","SOC-Lim","Manual On"}; strlcpy(buf, mm[manualHeaterMode], bufSz); break; }
         case 4: strlcpy(buf, nightCoolingEnabled ? "On" : "Off", bufSz); break;
-        case 5: strlcpy(buf, solarTargetMode == SOLAR_TANK_PLUS5 ? "Tank+5" : "Max", bufSz); break;
+        case 5: strlcpy(buf, solarTargetMode == SOLAR_TANK_PLUS8 ? "Tank+8" : "Max", bufSz); break;
         case 6: snprintf(buf, bufSz, "%d%%", lastWPkt.fanDutyPct); break;
         case 7: snprintf(buf, bufSz, "%luh", lastWPkt.fanFullTimerSecs / 3600); break;
         case 8: snprintf(buf, bufSz, "%lud", lastWPkt.fanBaseTimerSecs / 86400); break;
@@ -1408,9 +1636,9 @@ void page4Adjust(uint8_t item, int8_t dir) {
             systemMode = (systemMode == MODE_WINTER) ? MODE_SUMMER : MODE_WINTER;
             markSettingsDirty();
             break;
-        case 3: manualHeaterMode = (ManualHeaterMode)((manualHeaterMode + 2 + dir) % 2); break;
+        case 3: manualHeaterMode = (ManualHeaterMode)((manualHeaterMode + 3 + dir) % 3); break;
         case 4: nightCoolingEnabled = !nightCoolingEnabled; markSettingsDirty(); break;
-        case 5: solarTargetMode = (solarTargetMode == SOLAR_TANK_PLUS5) ? SOLAR_MAX : SOLAR_TANK_PLUS5; markSettingsDirty(); break;
+        case 5: solarTargetMode = (solarTargetMode == SOLAR_TANK_PLUS8) ? SOLAR_MAX : SOLAR_TANK_PLUS8; markSettingsDirty(); break;
         case 6: { // fan base speed — transmitted to W in H→W packet
             uint8_t fs = EEPROM.read(EE_FAN_BASE_SPEED);
             fs = constrain((int)fs + dir * 10, 0, 100);
@@ -1459,6 +1687,13 @@ void page4Action(uint8_t item) {
         faultHistScrollOffset = 0;
         faultLogPrevW = hasWPkt ? lastWPkt.wFaultFlags : 0;
         faultLogPrevH = hFaultFlags;
+        // Clear heater lockout so heater can restart if temperature has recovered
+        heaterHardLockout  = false;
+        heaterPowerCapPct  = 100;
+        heaterOvheatWarn   = false;
+        heaterOvheatWarnMs = 0;
+        clearFaultH(FAULT_H_HEATER_OVERHEAT_WARN);
+        clearFaultH(FAULT_H_HEATER_OVERHEAT_SHUT);
     }
     actionFlashEndMs = millis() + 300;
 }
@@ -1607,9 +1842,9 @@ void drawPage5() {
 
 void drawFullPage() {
     tft.fillRect(0, 0, 480, 20, C_NAVY);
-    // Split large fill into strips so pollBtns() can run between them
-    for (uint8_t s = 0; s < 8; s++) { tft.fillRect(0, 20 + s * 35, 480, 35, C_BLACK); pollBtns(); }
+    for (uint8_t s = 0; s < 8; s++) { tft.fillRect(0, 20 + s * 35, 480, 35, C_BLACK); pollBtns(); updateHPump(); }
     drawStatusBar();
+    updateHPump();
     switch (currentPage) {
         case 1: drawPage1(lastWPkt.wFaultFlags); break;
         case 2: drawPage2(); break;
@@ -1617,6 +1852,7 @@ void drawFullPage() {
         case 4: drawPage4(); break;
         case 5: drawPage5(); break;
     }
+    updateHPump();
     drawFaultBar(lastWPkt.wFaultFlags, hFaultFlags);
     needFullRedraw = false;
 }
@@ -1708,10 +1944,17 @@ void updateDisplayBanners() {
         tft.print(F("MANUAL OVERRIDE ACTIVE"));
     }
     // Manual heater banner
-    if (manualHeaterMode == MHM_FORCE_ON) {
+    if (manualHeaterMode == MHM_SOC_LIM) {
         tft.fillRect(0, 40, 480, 20, C_RED);
         tft.setTextColor(C_WHITE); tft.setTextSize(2); tft.setCursor(2, 42);
-        tft.print(F("HEATER FORCE ON — FULL 3kW"));
+        uint8_t soc = lastWPkt.battSocPct;
+        char socBuf[28];
+        snprintf(socBuf, sizeof(socBuf), "SOC-LIM: %u%% — %s", soc, soc > 50 ? "HEATING" : "DONE");
+        tft.print(socBuf);
+    } else if (manualHeaterMode == MHM_FORCE_ON) {
+        tft.fillRect(0, 40, 480, 20, C_RED);
+        tft.setTextColor(C_WHITE); tft.setTextSize(2); tft.setCursor(2, 42);
+        tft.print(F("HEATER MANUAL ON — FULL 3kW"));
     }
 }
 
@@ -1728,59 +1971,118 @@ PktReceiver pktRx;
 //  H-SIDE SOLAR PUMP DIRECT DRIVE
 // ============================================================
 
-static uint8_t hHeaterMinPumpPct(uint8_t heaterPct, float heaterOutC) {
-    uint8_t base = max(2, heaterPct / 5);
-    if (!isnan(heaterOutC) && heaterOutC > 70.0f)
-        base = max(base, (uint8_t)((heaterOutC - 70.0f) / 5.0f + 2));
-    return min(base, (uint8_t)25);
+static float calcPred(uint8_t heaterPct, float hotPipeC) {
+    float excess = (float)heaterPct - 20.0f;
+    float pt  = (excess > 0.0f) ? excess * excess * 0.0025f : 0.0f;
+    float tr  = (excess >= 0.0f) ? (0.09f + excess * 0.022f) : (0.09f * heaterPct / 20.0f);
+    float raw = 4.0f + pt + tr * (hotPipeC - 30.0f);
+    float minDuty = 4.0f + heaterPct * 0.05f;
+    return raw < minDuty ? minDuty : raw;
 }
 
-static uint8_t calcHPumpDuty() {
-    if (!heaterRunning || heaterTargetPct == 0) return 0;
-    float heaterOutC = sFault[H_SENSOR_HEATER_OUT] ? NAN : sTemp[H_SENSOR_HEATER_OUT];
-    uint8_t minPct = hHeaterMinPumpPct(heaterTargetPct, heaterOutC);
-    if (!isnan(heaterOutC)) {
-        float tankTopC     = sFault[H_SENSOR_TANK_TOP] ? 60.0f : sTemp[H_SENSOR_TANK_TOP];
-        float heaterTarget = (solarTargetMode == SOLAR_MAX) ? 89.0f : min(tankTopC + 5.0f, 89.0f);
-        if (heaterOutC >= heaterTarget + 2.0f) return 100;
-        if (heaterOutC >= heaterTarget - 2.0f) {
-            float t = (heaterOutC - (heaterTarget - 2.0f)) / 4.0f;
-            return (uint8_t)max((int)minPct, (int)(minPct + t * (100.0f - minPct)));
+static float calcHPumpDuty() {
+    if (heaterHardLockout)                                               return 100.0f;
+    if (!heaterRunning || heaterTargetPct == 0)                          return 0.0f;
+    if ((sFault[H_SENSOR_HEATER_OUT] && sFault[H_SENSOR_HEATER_OUT_2])
+        || sFault[H_SENSOR_HOT_PIPE])                                    return 0.0f;
+
+    float heaterOutC = getHeaterOutC();
+    float hotPipeC   = sTemp[H_SENSOR_HOT_PIPE];
+
+#ifdef DEBUG_SERIAL
+    if (calHtrOverride) {
+        float effectivePct = calPumpBase;
+        if (heaterOutC >= 88.0f) {
+            float t = min((heaterOutC - 88.0f) / 3.0f, 1.0f);
+            effectivePct = calPumpBase + 5.0f + t * (95.0f - calPumpBase);
+        } else if (heaterOutC >= 80.0f) {
+            float t = (heaterOutC - 80.0f) / 8.0f;
+            effectivePct = calPumpBase + t * 5.0f;
+        }
+        effectivePct = max(effectivePct, 0.1f);
+        calPumpOnMs  = 200UL;
+        calPumpOffMs = (uint32_t)(200.0f * (100.0f - effectivePct) / effectivePct);
+        return effectivePct;
+    }
+#endif
+
+    float pred = calcPred(heaterTargetPct, hotPipeC);
+    float duty;
+
+    if (solarTargetMode == SOLAR_TANK_PLUS8 && !sFault[H_SENSOR_TANK_TOP]
+                                             && sTemp[H_SENSOR_TANK_TOP] <= 75.0f) {
+        // Normal mode: target tracks tank top + 8°C, capped at 87°C.
+        // Above target: 2%/°C slope to 90°C, then ramp to 100% at 91°C.
+        float target    = min(sTemp[H_SENSOR_TANK_TOP] + 8.0f, 87.0f);
+        float dutyAt90  = min(pred + (90.0f - target) * 0.2f, 100.0f);
+        if (heaterOutC >= 91.0f) {
+            duty = 100.0f;
+        } else if (heaterOutC >= 90.0f) {
+            float t = heaterOutC - 90.0f;
+            duty = dutyAt90 + t * (100.0f - dutyAt90);
+        } else if (heaterOutC >= target) {
+            duty = pred + (heaterOutC - target) * 0.2f;
+        } else if (heaterOutC >= target - 7.0f) {
+            float t = (heaterOutC - (target - 7.0f)) / 7.0f;
+            duty = pred * 0.9f + t * (pred * 0.1f);
+        } else {
+            duty = pred * 0.9f;
+        }
+    } else {
+        // MAX mode (or tank top fault): fixed 85°C target with pred→upper ramp.
+        float upperMult = 1.3f - constrain((pred - 5.0f) / 25.0f, 0.0f, 1.0f) * 0.2f;
+        float upper = pred * upperMult;
+        if (heaterOutC >= 91.0f) {
+            duty = 100.0f;
+        } else if (heaterOutC >= 90.0f) {
+            float t = heaterOutC - 90.0f;
+            duty = upper + t * (100.0f - upper);
+        } else if (heaterOutC >= 85.0f) {
+            float t = (heaterOutC - 85.0f) / 5.0f;
+            duty = pred + t * (upper - pred);
+        } else if (heaterOutC >= 78.0f) {
+            float t = (heaterOutC - 78.0f) / 7.0f;
+            duty = pred * 0.9f + t * (pred * 0.1f);
+        } else {
+            duty = pred * 0.9f;
         }
     }
-    return minPct;
+
+    if (duty < 4.0f)   duty = 4.0f;
+    if (duty > 100.0f) duty = 100.0f;
+    return duty;
 }
 
-static void setHPumpDuty(uint8_t duty) {
+static void setHPumpDuty(float duty) {
     hPumpDuty = duty;
-    if (duty == 0) { digitalWrite(PIN_SOLAR_PUMP, LOW); hPumpOutputState = false; }
+    if (duty <= 0.0f) { digitalWrite(PIN_SOLAR_PUMP, LOW); hPumpOutputState = false; }
 }
 
 static void updateHPump() {
-    if (hPumpDuty == 0) {
+    if (hPumpDuty <= 0.0f) {
         if (hPumpOutputState) { digitalWrite(PIN_SOLAR_PUMP, LOW); hPumpOutputState = false; }
         return;
     }
-    if (hPumpDuty == 100) {
+    if (hPumpDuty >= 100.0f) {
         if (!hPumpOutputState) { digitalWrite(PIN_SOLAR_PUMP, HIGH); hPumpOutputState = true; hPumpOnMs = millis(); }
         return;
     }
     uint32_t onMs, offMs;
-    if (hPumpDuty <= 4) {
-        onMs  = 200UL;
-        offMs = 200UL * (100 - hPumpDuty) / hPumpDuty;
-    } else if (hPumpDuty <= 8) {
-        onMs  = 200UL + (uint32_t)(hPumpDuty - 4) * 50UL;
-        offMs = 4800UL - (uint32_t)(hPumpDuty - 4) * 50UL;
-    } else if (hPumpDuty <= 20) {
+#ifdef DEBUG_SERIAL
+    if (calHtrOverride) {
+        onMs  = calPumpOnMs;
+        offMs = calPumpOffMs;
+    } else
+#endif
+    if (hPumpDuty <= 20.0f) {
         onMs  = 400UL;
-        offMs = 400UL * (100 - hPumpDuty) / hPumpDuty;
-    } else if (hPumpDuty <= 50) {
-        onMs  = 400UL + (uint32_t)(hPumpDuty - 20) * 400UL / 30UL;
-        offMs = onMs * (100 - hPumpDuty) / hPumpDuty;
+        offMs = (uint32_t)(400.0f * (100.0f - hPumpDuty) / hPumpDuty);
+    } else if (hPumpDuty <= 50.0f) {
+        onMs  = (uint32_t)(400.0f + (hPumpDuty - 20.0f) * 400.0f / 30.0f);
+        offMs = (uint32_t)((float)onMs * (100.0f - hPumpDuty) / hPumpDuty);
     } else {
         onMs  = 800UL;
-        offMs = 800UL * (100 - hPumpDuty) / hPumpDuty;
+        offMs = (uint32_t)(800.0f * (100.0f - hPumpDuty) / hPumpDuty);
     }
     unsigned long now = millis();
     if (hPumpOutputState) {
@@ -1800,9 +2102,9 @@ void sendHToWPacket(bool timeSyncReq) {
     pkt.tempTankTop    = sFault[H_SENSOR_TANK_TOP]  ? TEMP_FAULT : (int16_t)(sTemp[H_SENSOR_TANK_TOP]  * 10);
     pkt.tempHotPipe    = sFault[H_SENSOR_HOT_PIPE]  ? TEMP_FAULT : (int16_t)(sTemp[H_SENSOR_HOT_PIPE]  * 10);
     pkt.tempColdPipe   = sFault[H_SENSOR_COLD_PIPE] ? TEMP_FAULT : (int16_t)(sTemp[H_SENSOR_COLD_PIPE] * 10);
-    pkt.tempHeaterOut  = sFault[H_SENSOR_HEATER_OUT]? TEMP_FAULT : (int16_t)(sTemp[H_SENSOR_HEATER_OUT]* 10);
+    { float effT = getHeaterOutC(); pkt.tempHeaterOut = isnan(effT) ? TEMP_FAULT : (int16_t)(effT * 10.0f); }
 
-    pkt.heaterPowerPct    = heaterRunning ? heaterTargetPct : 0;
+    pkt.heaterPowerPct    = heaterRunning ? max(heaterTargetPct, (uint8_t)1) : 0;
     pkt.heaterRestricted  = heaterOvheatWarn ? 1 : 0;
     pkt.twoPortHeaterSide = summerTwoPortTop ? 1 : 0;
 
@@ -1838,11 +2140,16 @@ void sendHToWPacket(bool timeSyncReq) {
     }
 
 #ifdef DEBUG_SERIAL
-    pkt.calPumpActive   = (calPumpPhase != CALP_IDLE && calPumpPhase != CALP_DONE) ? 1 : 0;
-    pkt.calSolarTargetC = (calPumpPhase == CALP_STABILIZE) ? (int16_t)(calSolarStepC * 10) : 900;
+    if (simWPumpStop) {
+        pkt.calPumpActive   = 1;
+        pkt.calSolarTargetC = 0;
+    } else {
+        pkt.calPumpActive   = (calPumpPhase == CALP_RUNNING) ? 1 : 0;
+        pkt.calSolarTargetC = 0;
+    }
 #endif
 
-    pkt.hPumpDutyPct = hPumpDuty;
+    pkt.hPumpDutyPct = (uint8_t)roundf(hPumpDuty);
 
     uint8_t frame[PKT_MAX_FRAME];
     uint16_t len = pktEncode(frame, sizeof(frame), PKT_DIR_HW, txSeqNum++,
@@ -1875,9 +2182,46 @@ static void pollRS485() {
         missedPackets = 0;
         if (rs485Fault) { rs485Fault = false; clearFaultH(FAULT_H_RS485_COMMS); }
 
+#ifdef DEBUG_SERIAL
+        {
+            DateTime now = rtc.now();
+            char tbuf[10];
+            snprintf(tbuf, sizeof(tbuf), "%02u:%02u:%02u",
+                     now.hour(), now.minute(), now.second());
+            Serial.print(F("["));
+            Serial.print(tbuf);
+            Serial.print(F("] W pkt | growatt="));
+            if (lastWPkt.growattValid) {
+                Serial.print(F("OK"));
+                Serial.print(F(" pv1="));   Serial.print(lastWPkt.pv1W);
+                Serial.print(F("W pv2="));  Serial.print(lastWPkt.pv2W);
+                Serial.print(F("W out="));  Serial.print(lastWPkt.pvOutputW);
+                Serial.print(F("W load=")); Serial.print(lastWPkt.loadW);
+                Serial.print(F("W exp="));  Serial.print(lastWPkt.pvExportW);
+                Serial.print(F("W imp="));  Serial.print(lastWPkt.gridImportW);
+                Serial.print(F("W batt="));
+                Serial.print(lastWPkt.battVoltage_dV / 10);
+                Serial.print(F("."));
+                Serial.print(abs(lastWPkt.battVoltage_dV % 10));
+                Serial.print(F("V soc="));  Serial.print(lastWPkt.battSocPct);
+                Serial.print(F("% chg="));  Serial.print(lastWPkt.battChargeW);
+                Serial.print(F("W gen="));
+                Serial.print(lastWPkt.dailyGenDeciKwh / 10);
+                Serial.print(F("."));
+                Serial.print(lastWPkt.dailyGenDeciKwh % 10);
+                Serial.print(F("kWh"));
+            } else {
+                Serial.print(F("NO DATA"));
+            }
+            Serial.print(F(" | htr="));   Serial.print(heaterRunning ? heaterTargetPct : 0);
+            Serial.print(F("% pump="));   Serial.print(lastWPkt.solarPumpDutyPct);
+            Serial.println(F("%"));
+        }
+#endif
+
         bool wSolarFault = (lastWPkt.wFaultFlags & (FAULT_W_SENSOR_SOLAR_HOT | FAULT_W_SENSOR_SOLAR_COLD)) != 0;
 #ifdef DEBUG_SERIAL
-        if (calPumpPhase == CALP_IDLE || calPumpPhase == CALP_DONE)
+        if ((calPumpPhase == CALP_IDLE || calPumpPhase == CALP_DONE) && pumpTestState == PT_IDLE)
 #endif
         updateHeaterDuty(lastWPkt.pvExportW, lastWPkt.gridImportW, manualHeaterMode, wSolarFault);
 
@@ -1905,7 +2249,8 @@ static void dbgTemps() {
     hDbgPrintTemp(H_SENSOR_TANK_TOP,   F("tank_top"));
     hDbgPrintTemp(H_SENSOR_HOT_PIPE,   F("hot_pipe"));
     hDbgPrintTemp(H_SENSOR_COLD_PIPE,  F("cold_pipe"));
-    hDbgPrintTemp(H_SENSOR_HEATER_OUT, F("htr_out"));
+    hDbgPrintTemp(H_SENSOR_HEATER_OUT,   F("htr_out"));
+    hDbgPrintTemp(H_SENSOR_HEATER_OUT_2, F("htr_out_2"));
     if (hasWPkt) {
         auto pW = [](const __FlashStringHelper* n, int16_t v) {
             Serial.print(F("  ")); Serial.print(n); Serial.print(F("(W): "));
@@ -1918,10 +2263,20 @@ static void dbgTemps() {
     }
 }
 
+static void dbgValveState(HBridgeValve& v, bool openIsHtr = false) {
+    if (v.phase == HBP_IDLE) {
+        Serial.println(v.isOpen ? (openIsHtr ? F("OPEN(htr)") : F("OPEN")) : (openIsHtr ? F("CLOSED(mid)") : F("CLOSED")));
+    } else {
+        Serial.print(v.pendingOpen ? (openIsHtr ? F("->OPEN(htr)") : F("->OPEN")) : (openIsHtr ? F("->CLOSED(mid)") : F("->CLOSED")));
+        Serial.print(v.phase == HBP_DEAD ? F(" [dead]") : F(" [pulsing]"));
+        Serial.println();
+    }
+}
+
 static void dbgValves() {
-    Serial.print(F("  log_cold: ")); Serial.println(logBurnerCold.isOpen ? F("OPEN")     : F("CLOSED"));
-    Serial.print(F("  bot_tank: ")); Serial.println(botTankValve.isOpen  ? F("OPEN")     : F("CLOSED"));
-    Serial.print(F("  two_port: ")); Serial.println(twoPortValve.isOpen  ? F("OPEN(htr)") : F("CLOSED(mid)"));
+    Serial.print(F("  log_cold: ")); dbgValveState(logBurnerCold);
+    Serial.print(F("  bot_tank: ")); dbgValveState(botTankValve);
+    Serial.print(F("  two_port: ")); dbgValveState(twoPortValve, true);
     if (hasWPkt) {
         Serial.print(F("  W ufh_cold:  ")); Serial.println((lastWPkt.valveStates & VSTATE_UFH_COLD_OPEN)   ? F("OPEN") : F("CLOSED"));
         Serial.print(F("  W solar_cold:")); Serial.println((lastWPkt.valveStates & VSTATE_SOLAR_COLD_OPEN) ? F("OPEN") : F("CLOSED"));
@@ -1944,6 +2299,7 @@ static void dbgFaults() {
     HF(FAULT_H_SENSOR_HOT_PIPE,      "SENSOR_HOT_PIPE")
     HF(FAULT_H_SENSOR_COLD_PIPE,     "SENSOR_COLD_PIPE")
     HF(FAULT_H_SENSOR_HEATER_OUT,    "SENSOR_HEATER_OUT")
+    HF(FAULT_H_SENSOR_HEATER_OUT_2,  "SENSOR_HEATER_OUT_2")
     #undef HF
     if (hasWPkt && lastWPkt.wFaultFlags) {
         Serial.print(F("  W faults: 0x")); Serial.println(lastWPkt.wFaultFlags, HEX);
@@ -2012,7 +2368,8 @@ static void dbgSet(char* key, char* val) {
     else if (!strcmp_P(key, PSTR("tank_top")))  si = H_SENSOR_TANK_TOP;
     else if (!strcmp_P(key, PSTR("hot_pipe")))  si = H_SENSOR_HOT_PIPE;
     else if (!strcmp_P(key, PSTR("cold_pipe"))) si = H_SENSOR_COLD_PIPE;
-    else if (!strcmp_P(key, PSTR("htr_out")))   si = H_SENSOR_HEATER_OUT;
+    else if (!strcmp_P(key, PSTR("htr_out")))    si = H_SENSOR_HEATER_OUT;
+    else if (!strcmp_P(key, PSTR("htr_out_2"))) si = H_SENSOR_HEATER_OUT_2;
 
     if (si < H_NUM_SENSORS) {
         if (fval >= 999.0f) { hSimulate[si] = false; Serial.println(F("cleared")); }
@@ -2025,6 +2382,27 @@ static void dbgSet(char* key, char* val) {
     if (!strcmp_P(key, PSTR("pv_export_clear")))   { simPVExportActive  = false; Serial.println(F("cleared")); return; }
     if (!strcmp_P(key, PSTR("heater_pct")))        { simHeaterActive    = true;  simHeaterVal    = (uint8_t)constrain((int)fval, 0, 100); Serial.println(F("ok")); return; }
     if (!strcmp_P(key, PSTR("heater_pct_clear")))  { simHeaterActive    = false; Serial.println(F("cleared")); return; }
+    if (!strcmp_P(key, PSTR("pump_spd")))          { simHPumpSpdActive  = true;  simHPumpSpdVal  = (uint8_t)constrain((int)fval, 0, 100); Serial.println(F("ok")); return; }
+    if (!strcmp_P(key, PSTR("pump_spd_clear")))    { simHPumpSpdActive  = false; Serial.println(F("cleared")); return; }
+    if (!strcmp_P(key, PSTR("rtc"))) {
+        // val format: YYYY-MM-DDTHH:MM:SS
+        char* p = val;
+        uint16_t yr = (uint16_t)atoi(p);
+        p = strchr(p, '-'); if (!p) { Serial.println(F("fmt: YYYY-MM-DDTHH:MM:SS")); return; }
+        uint8_t mo = (uint8_t)atoi(++p);
+        p = strchr(p, '-'); if (!p) { Serial.println(F("fmt: YYYY-MM-DDTHH:MM:SS")); return; }
+        uint8_t dy = (uint8_t)atoi(++p);
+        p = strchr(p, 'T'); if (!p) { Serial.println(F("fmt: YYYY-MM-DDTHH:MM:SS")); return; }
+        uint8_t hr = (uint8_t)atoi(++p);
+        p = strchr(p, ':'); if (!p) { Serial.println(F("fmt: YYYY-MM-DDTHH:MM:SS")); return; }
+        uint8_t mn = (uint8_t)atoi(++p);
+        p = strchr(p, ':'); if (!p) { Serial.println(F("fmt: YYYY-MM-DDTHH:MM:SS")); return; }
+        uint8_t sc = (uint8_t)atoi(++p);
+        rtc.adjust(DateTime(yr, mo, dy, hr, mn, sc));
+        rtcNow = rtc.now();
+        Serial.println(F("ok"));
+        return;
+    }
     Serial.print(F("unknown key: ")); Serial.println(key);
 }
 
@@ -2053,118 +2431,76 @@ static void dbgScan() {
     else { Serial.print(F("  total: ")); Serial.println(count); }
 }
 
-static void calPrintDataPoint(uint8_t solarStep, uint8_t heaterPct,
-                               bool hotFault, float hotPipe,
-                               bool htrFault, float htrOut,
-                               uint8_t pumpDuty) {
-    Serial.print(F("CAL,"));
-    Serial.print(solarStep); Serial.print(',');
-    Serial.print(heaterPct); Serial.print(',');
-    if (hotFault) Serial.print(F("NaN")); else Serial.print(hotPipe, 1);
-    Serial.print(',');
-    if (htrFault) Serial.print(F("NaN")); else Serial.print(htrOut, 1);
-    Serial.print(',');
-    Serial.println(pumpDuty);
-}
-
 static void updateCalPump() {
-    if (calPumpPhase == CALP_IDLE || calPumpPhase == CALP_DONE) return;
+    if (calPumpPhase != CALP_RUNNING) return;
 
     unsigned long now     = millis();
+    bool htrFault = sFault[H_SENSOR_HEATER_OUT] && sFault[H_SENSOR_HEATER_OUT_2];
     bool hotFault = sFault[H_SENSOR_HOT_PIPE];
-    bool htrFault = sFault[H_SENSOR_HEATER_OUT];
+    float htrOut  = htrFault ? NAN : getHeaterOutC();
     float hotPipe = hotFault ? NAN : sTemp[H_SENSOR_HOT_PIPE];
-    float htrOut  = htrFault ? NAN : sTemp[H_SENSOR_HEATER_OUT];
-    uint8_t pumpDuty = hasWPkt ? lastWPkt.solarPumpDutyPct : 0;
 
-    switch (calPumpPhase) {
-        case CALP_STABILIZE:
+    if (htrFault) {
+        if (!calSensorFault) {
+            calSensorFault  = true;
+            calPhaseMs      = now;
+            heaterRunning   = false;
+            heaterTargetPct = 0;
+            Serial.println(F("CAL: htr_out sensor fault — heater off, restarting step when recovered"));
+        }
+        calHtrOverride = true;
+        return;
+    }
+    if (calSensorFault) {
+        calSensorFault = false;
+        calPhaseMs     = now;
+        Serial.println(F("CAL: htr_out recovered — restarting step"));
+    }
+
+    calHtrOverride  = true;
+    heaterRunning   = true;
+    heaterTargetPct = calHeaterPct;
+
+    if (htrOut >= 91.0f) {
+        if (!calCooling) {
+            calCooling = true;
+            Serial.println(F("CAL: htr_out 91C — cooling at 100% pump"));
+        }
+        return;
+    }
+    if (calCooling) {
+        calCooling = false;
+        calPhaseMs = now;
+        Serial.println(F("CAL: cooled below 91C — restarting step"));
+    }
+
+    unsigned long stepDuration = (calStepNum == 0) ? 300000UL : 180000UL;
+
+    if (now - calPhaseMs >= stepDuration) {
+        // Record end-of-step data
+        Serial.print(F("CAL,"));
+        Serial.print(calHeaterPct); Serial.print(',');
+        if (htrFault) Serial.print(F("NaN")); else Serial.print(htrOut, 1);
+        Serial.print(',');
+        if (hotFault) Serial.print(F("NaN")); else Serial.print(hotPipe, 1);
+        Serial.print(',');
+        Serial.println(hPumpDuty, 1);
+
+        if (calHeaterPct >= 100) {
+            Serial.println(F("CAL: complete"));
+            calPumpPhase    = CALP_DONE;
             calHtrOverride  = false;
             heaterRunning   = false;
             heaterTargetPct = 0;
-            PORTA &= ~(1 << PA5);
-            if (!hotFault && fabsf(hotPipe - (float)calSolarStepC) < 2.0f) {
-                if (calPhaseMs == 0) calPhaseMs = now;
-                if (now - calPhaseMs >= 10000UL) {
-                    Serial.print(F("CAL: hot_pipe stable at ")); Serial.print(hotPipe, 1);
-                    Serial.print(F("C — target ")); Serial.print(calSolarStepC);
-                    Serial.println(F("C, raising solar target to 90C, heater to 5%"));
-                    calPhaseMs     = now;
-                    calHeaterPct   = 5;
-                    calHtrOverride = true;
-                    calPumpPhase   = CALP_PRE_RAMP;
-                }
-            } else {
-                calPhaseMs = 0;
-            }
-            break;
-
-        case CALP_PRE_RAMP:
-            calHtrOverride  = true;
-            calHeaterPct    = 5;
-            heaterRunning   = true;
-            heaterTargetPct = 5;
-            if (!htrFault && htrOut >= 87.0f) {
-                Serial.println(F("CAL: htr_out >= 87C, starting 30s ramp"));
-                Serial.println(F("CAL_HDR: solar_step_C,heater_pct,hot_pipe_C,htr_out_C,pump_pct"));
-                calStepMs    = now;
-                calHeaterPct = 5;
-                calPumpPhase = CALP_RAMPING;
-                calPrintDataPoint(calSolarStepC, calHeaterPct, hotFault, hotPipe, htrFault, htrOut, pumpDuty);
-            } else if (now - calPhaseMs >= 300000UL) {
-                Serial.println(F("CAL: TIMEOUT — htr_out did not reach 87C in 5min, aborting"));
-                calPumpPhase   = CALP_DONE;
-                calHtrOverride = false;
-            }
-            break;
-
-        case CALP_RAMPING: {
-            calHtrOverride  = true;
-            heaterRunning   = true;
-            heaterTargetPct = calHeaterPct;
-            // Pump at ceiling — log current state as max for this solar step and advance
-            if (pumpDuty >= 100) {
-                Serial.print(F("CAL: pump 100% at ")); Serial.print(calHeaterPct);
-                Serial.println(F("% heater — ceiling, advancing"));
-                calPrintDataPoint(calSolarStepC, calHeaterPct, hotFault, hotPipe, htrFault, htrOut, 100);
-                if (calSolarStepC > 40) {
-                    calSolarStepC -= 5;
-                    calHeaterPct   = 0;
-                    calHtrOverride = false;
-                    calPhaseMs     = 0;
-                    calPumpPhase   = CALP_STABILIZE;
-                    Serial.print(F("CAL: step done — stabilising at ")); Serial.print(calSolarStepC); Serial.println(F("C"));
-                } else {
-                    Serial.println(F("CAL: all steps complete"));
-                    calPumpPhase   = CALP_DONE;
-                    calHtrOverride = false;
-                }
-                break;
-            }
-            // 30s sweep: 19 intervals between 5%..100% → 1578ms each
-            if (now - calStepMs >= 1578UL) {
-                calStepMs     = now;
-                calHeaterPct  = min((uint8_t)(calHeaterPct + 5), (uint8_t)100);
-                heaterTargetPct = calHeaterPct;
-                calPrintDataPoint(calSolarStepC, calHeaterPct, hotFault, hotPipe, htrFault, htrOut, pumpDuty);
-                if (calHeaterPct >= 100) {
-                    if (calSolarStepC > 40) {
-                        calSolarStepC -= 5;
-                        calHeaterPct   = 0;
-                        calHtrOverride = false;
-                        calPhaseMs     = 0;
-                        calPumpPhase   = CALP_STABILIZE;
-                        Serial.print(F("CAL: step done — stabilising at ")); Serial.print(calSolarStepC); Serial.println(F("C"));
-                    } else {
-                        Serial.println(F("CAL: all steps complete"));
-                        calPumpPhase   = CALP_DONE;
-                        calHtrOverride = false;
-                    }
-                }
-            }
-            break;
+        } else {
+            calPumpBase    = min(hPumpDuty, 95.0f);
+            calHeaterPct   = min((uint8_t)(calHeaterPct + 5), (uint8_t)100);
+            calStepNum++;
+            calPhaseMs     = now;
+            Serial.print(F("CAL: step ")); Serial.print(calStepNum);
+            Serial.print(F(" — heater ")); Serial.print(calHeaterPct);
+            Serial.print(F("%, pump base ")); Serial.print(calPumpBase, 2); Serial.println('%');
         }
-        default: break;
     }
 }
 
@@ -2173,17 +2509,20 @@ static void dbgCalPump() {
         Serial.println(F("cal_pump: HEATER_ENABLED is false — set true in firmware before calibrating"));
         return;
     }
-    if (calPumpPhase != CALP_IDLE && calPumpPhase != CALP_DONE) {
+    if (calPumpPhase == CALP_RUNNING) {
         Serial.println(F("cal_pump: already running — use cal_abort to stop"));
         return;
     }
-    calPumpPhase   = CALP_STABILIZE;
-    calSolarStepC  = 85;
-    calHeaterPct   = 0;
-    calHtrOverride = false;
-    calPhaseMs     = 0;
-    Serial.println(F("CAL: started — ensure summer mode active and solar pump running"));
-    Serial.println(F("CAL: waiting for hot_pipe to stabilise at 85C"));
+    calPumpPhase    = CALP_RUNNING;
+    calHeaterPct    = 15;
+    calPumpBase     = 4.0f;
+    calStepNum      = 0;
+    calHtrOverride  = true;
+    calCooling      = false;
+    calSensorFault  = false;
+    calPhaseMs      = millis();
+    Serial.println(F("CAL: started — 15% heater, pump base 4.0%"));
+    Serial.println(F("CAL_HDR: heater_pct,htr_out_C,hot_pipe_C,pump_pct"));
 }
 
 static void dbgCalAbort() {
@@ -2193,6 +2532,165 @@ static void dbgCalAbort() {
     heaterTargetPct = 0;
     PORTA &= ~(1 << PA5);
     Serial.println(F("CAL: aborted — heater off, normal control restored"));
+}
+
+// ── Pump formula test: runs normal calcHPumpDuty, steps 5–100% ──
+
+static void dbgPumpTestAbort();  // forward declaration — defined below
+
+static void pumpTestStartStep() {
+    uint32_t now = millis();
+    pumpTestPower = pumpTestStress
+        ? pgm_read_byte(&STRESS_TEST_POWERS[pumpTestStepIdx])
+        : pgm_read_byte(&PUMP_TEST_POWERS[pumpTestStepIdx]);
+    logBurnerCold.request(false);
+    botTankValve.request(true);
+    twoPortValve.request(true);
+    heaterRunning       = true;
+    heaterTargetPct     = pumpTestPower;
+    pumpTestHeaterActive = true;
+    pumpTestState       = PT_HEATING;
+    pumpTestLastPrint = now;
+    pumpTestLastSec  = now;
+    pumpTestWinStart = now;
+    pumpTestMaxPump  = 0.0f;
+    { float _t = getHeaterOutC(); float hOut = isnan(_t) ? 0.0f : _t;
+      pumpTestWinMin = pumpTestWinMax = hOut; }
+    if (pumpTestStress) {
+        Serial.print(F("STRESS_TEST: step ")); Serial.print(pumpTestPower); Serial.println('%');
+    }
+}
+
+static void pumpTestStartCooldown() {
+    heaterRunning        = false;
+    heaterTargetPct      = 0;
+    pumpTestHeaterActive = false;
+    pumpTestState        = PT_COOLDOWN;
+    pumpTestCoolStart = millis();
+    Serial.println(F("STRESS_TEST: cooling down..."));
+}
+
+static void updatePumpTest() {
+    if (pumpTestState == PT_IDLE) return;
+    uint32_t now = millis();
+
+    if (pumpTestState == PT_COOLDOWN) {
+        heaterRunning   = false;
+        heaterTargetPct = 0;
+        float _ht = getHeaterOutC(); float hOut = isnan(_ht) ? 99.0f : _ht;
+        bool cooled  = (hOut < 60.0f);
+        bool timeout = (now - pumpTestCoolStart >= 120000);
+        if (cooled || timeout) {
+            Serial.print(F("STRESS_TEST: cooldown done htr_out="));
+            Serial.println(hOut, 1);
+            if (pumpTestStepIdx >= STRESS_TEST_COUNT) {
+                Serial.println(F("STRESS_TEST: complete"));
+                dbgPumpTestAbort();
+                return;
+            }
+            pumpTestStartStep();
+        }
+        return;
+    }
+
+    if (pumpTestState == PT_HEATING) {
+        heaterRunning   = true;
+        heaterTargetPct = pumpTestPower;
+
+        if (hPumpDuty > pumpTestMaxPump) pumpTestMaxPump = hPumpDuty;
+
+        if (now - pumpTestLastPrint >= 2000) {
+            pumpTestLastPrint = now;
+            float hotPipe = sFault[H_SENSOR_HOT_PIPE]   ? NAN : sTemp[H_SENSOR_HOT_PIPE];
+            float htrOut  = getHeaterOutC();
+            Serial.print(pumpTestPower);        Serial.print(',');
+            if (isnan(hotPipe)) Serial.print(F("NaN")); else Serial.print(hotPipe, 1);
+            Serial.print(',');
+            if (isnan(htrOut))  Serial.print(F("NaN")); else Serial.print(htrOut, 1);
+            Serial.print(',');
+            Serial.println(hPumpDuty, 1);
+        }
+
+        if (now - pumpTestLastSec >= 1000) {
+            pumpTestLastSec = now;
+            float _ho = getHeaterOutC();
+            if (isnan(_ho)) {
+                pumpTestWinStart = now;
+            } else {
+                float hOut = _ho;
+                if (hOut < pumpTestWinMin) pumpTestWinMin = hOut;
+                if (hOut > pumpTestWinMax) pumpTestWinMax = hOut;
+                if (pumpTestWinMax - pumpTestWinMin >= 0.4f) {
+                    pumpTestWinMin = pumpTestWinMax = hOut;
+                    pumpTestWinStart = now;
+                }
+            }
+        }
+
+        if (now - pumpTestWinStart >= 30000) {
+            float hotPipe = sFault[H_SENSOR_HOT_PIPE] ? NAN : sTemp[H_SENSOR_HOT_PIPE];
+            float htrOut  = getHeaterOutC();
+            if (pumpTestStress) {
+                Serial.print(F("SSTABLE,"));
+                Serial.print(pumpTestPower); Serial.print(',');
+                if (isnan(hotPipe)) Serial.print(F("NaN")); else Serial.print(hotPipe, 1);
+                Serial.print(',');
+                if (isnan(htrOut))  Serial.print(F("NaN")); else Serial.print(htrOut, 1);
+                Serial.print(',');
+                Serial.print(hPumpDuty, 1);
+                Serial.print(',');
+                Serial.println(pumpTestMaxPump, 1);
+                pumpTestStepIdx++;
+                if (pumpTestStepIdx >= STRESS_TEST_COUNT) {
+                    Serial.println(F("STRESS_TEST: complete"));
+                    dbgPumpTestAbort();
+                } else {
+                    pumpTestStartStep();
+                }
+            } else {
+                Serial.print(F("STABLE,"));
+                Serial.print(pumpTestPower); Serial.print(',');
+                if (isnan(hotPipe)) Serial.print(F("NaN")); else Serial.print(hotPipe, 1);
+                Serial.print(',');
+                if (isnan(htrOut))  Serial.print(F("NaN")); else Serial.print(htrOut, 1);
+                Serial.print(',');
+                Serial.println(hPumpDuty, 1);
+                pumpTestStepIdx = (pumpTestStepIdx + 1) % PUMP_TEST_COUNT;
+                Serial.print(F("PUMP_TEST: step ")); Serial.print(pgm_read_byte(&PUMP_TEST_POWERS[pumpTestStepIdx])); Serial.println('%');
+                pumpTestStartStep();
+            }
+        }
+    }
+}
+
+static void dbgPumpTest() {
+    if (!HEATER_ENABLED) { Serial.println(F("pump_test: HEATER_ENABLED is false")); return; }
+    if (pumpTestState != PT_IDLE) { Serial.println(F("pump_test: already running — use pump_test_abort")); return; }
+    pumpTestStress  = false;
+    pumpTestStepIdx = 0;
+    pumpTestStartStep();
+    Serial.println(F("PUMP_TEST: started — spread heater powers, loops continuously"));
+    Serial.println(F("FMT: pwr%,hot_pipe,htr_out,pump%"));
+}
+
+static void dbgPumpTestAbort() {
+    pumpTestState        = PT_IDLE;
+    pumpTestStress       = false;
+    pumpTestHeaterActive = false;
+    heaterRunning        = false;
+    heaterTargetPct      = 0;
+    PORTA &= ~(1 << PA5);
+    Serial.println(F("PUMP_TEST: aborted"));
+}
+
+static void dbgStressTest() {
+    if (!HEATER_ENABLED) { Serial.println(F("stress_test: HEATER_ENABLED is false")); return; }
+    if (pumpTestState != PT_IDLE) { Serial.println(F("stress_test: already running — use pump_test_abort")); return; }
+    pumpTestStress  = true;
+    pumpTestStepIdx = 0;
+    pumpTestStartStep();
+    Serial.println(F("STRESS_TEST: started — 9 lowPow levels, 30s/0.4C stable window"));
+    Serial.println(F("FMT: pwr%,hot_pipe,htr_out,pump%  |  SSTABLE adds max_pump%"));
 }
 
 static void handleDebugCommand(char* buf) {
@@ -2210,10 +2708,13 @@ static void handleDebugCommand(char* buf) {
     if      (!strcmp_P(cmd, PSTR("help"))) {
         Serial.println(F("temps  valves  faults  mode  status  heater  bus  rtc  page <1-5>  scan"));
         Serial.println(F("set <sensor> <val>  (val=999 clears sim)"));
-        Serial.println(F("  sensors: tank_bot tank_mid tank_top hot_pipe cold_pipe htr_out"));
+        Serial.println(F("  sensors: tank_bot tank_mid tank_top hot_pipe cold_pipe htr_out htr_out_2"));
+        Serial.println(F("set rtc YYYY-MM-DDTHH:MM:SS"));
         Serial.println(F("set log_burner|pv_export|batt_soc|heater_pct <val>"));
         Serial.println(F("set log_burner_clear|pv_export_clear|batt_soc_clear|heater_pct_clear 0"));
         Serial.println(F("cal_pump  (start pump cal sequence)  cal_abort"));
+        Serial.println(F("pump_test  stress_test  pump_test_abort"));
+        Serial.println(F("w_pump_stop  w_pump_run"));
     }
     else if (!strcmp_P(cmd, PSTR("temps")))    dbgTemps();
     else if (!strcmp_P(cmd, PSTR("valves")))   dbgValves();
@@ -2230,8 +2731,13 @@ static void handleDebugCommand(char* buf) {
     }
     else if (!strcmp_P(cmd, PSTR("scan")))     dbgScan();
     else if (!strcmp_P(cmd, PSTR("set")))      dbgSet(arg1, arg2);
-    else if (!strcmp_P(cmd, PSTR("cal_pump"))) dbgCalPump();
-    else if (!strcmp_P(cmd, PSTR("cal_abort"))) dbgCalAbort();
+    else if (!strcmp_P(cmd, PSTR("cal_pump")))        dbgCalPump();
+    else if (!strcmp_P(cmd, PSTR("cal_abort")))       dbgCalAbort();
+    else if (!strcmp_P(cmd, PSTR("pump_test")))       dbgPumpTest();
+    else if (!strcmp_P(cmd, PSTR("stress_test")))     dbgStressTest();
+    else if (!strcmp_P(cmd, PSTR("pump_test_abort"))) dbgPumpTestAbort();
+    else if (!strcmp_P(cmd, PSTR("w_pump_stop"))) { simWPumpStop = true;  Serial.println(F("W pump stop sent")); }
+    else if (!strcmp_P(cmd, PSTR("w_pump_run")))  { simWPumpStop = false; Serial.println(F("W pump run restored")); }
     else if (cmd[0] != 0) { Serial.print(F("unknown: ")); Serial.println(cmd); }
 }
 
@@ -2257,11 +2763,15 @@ static void processSerialInput() {
 // ============================================================
 
 void powerUpSafeState() {
-    // Close all 3 tank valves with 7s pulses (sequential per spec)
+    // Close all 3 tank valves with 7s pulses (sequential per spec).
+    // Assume worst case: valve may be physically open, so force isOpen=true
+    // before requesting close so request() doesn't return early.
+    logBurnerCold.isOpen = true;
     logBurnerCold.request(false);
     unsigned long t = millis();
     while (millis() - t < 7200) { logBurnerCold.update(); wdt_reset(); }
 
+    botTankValve.isOpen = true;
     botTankValve.request(false);
     t = millis();
     while (millis() - t < 7200) { botTankValve.update(); wdt_reset(); }
@@ -2296,6 +2806,10 @@ void setup() {
     digitalWrite(PIN_PSU_12V,        RELAY_OFF); pinMode(PIN_PSU_12V,        OUTPUT);
     digitalWrite(PIN_RS485_DE_LINK,  LOW);        pinMode(PIN_RS485_DE_LINK,  OUTPUT);
     digitalWrite(PIN_SOLAR_PUMP,     LOW);        pinMode(PIN_SOLAR_PUMP,     OUTPUT);
+    // D53 is the Mega hardware SS pin — must be driven HIGH as output before SPI init
+    // or the SPI peripheral drops into slave mode, causing SD.begin() to fail.
+    // TFT library configures this pin during tft.init(), which runs after SD init.
+    digitalWrite(PIN_DISPLAY_CS,     HIGH);       pinMode(PIN_DISPLAY_CS,     OUTPUT);
     pinMode(PIN_DISPLAY_BL,     OUTPUT); setBacklight(displayBrightness);
 
     // Input pins
@@ -2316,6 +2830,12 @@ void setup() {
     TCCR3B = (1 << WGM32) | (1 << CS31);  // CTC mode, prescaler /8 → 2MHz clock
     OCR3A  = 1999;                          // 2MHz / 2000 = 1kHz
     TIMSK3 = (1 << OCIE3A);
+
+    // Timer1 CTC at 50ms — drives TIMER1_COMPA ISR for H pump timing
+    TCCR1A = 0;
+    TCCR1B = (1 << WGM12) | (1 << CS12);  // CTC mode, prescaler /256 → 62.5kHz clock
+    OCR1A  = 3124;                          // 62500 / 3125 = 20Hz = 50ms
+    TIMSK1 = (1 << OCIE1A);
 
     // RS485 UART
     Serial1.begin(9600);
@@ -2382,6 +2902,7 @@ void setup() {
 
 void loop() {
     wdt_reset();
+    updateHPump();
 #ifdef DEBUG_SERIAL
     processSerialInput();
 #endif
@@ -2426,11 +2947,18 @@ void loop() {
     checkHeaterFaults();
 
     // H-side solar pump direct drive
+#ifdef DEBUG_SERIAL
+    updatePumpTest();
+    if (pumpTestState == PT_COOLDOWN) setHPumpDuty(10.0f);
+    else if (simHPumpSpdActive) setHPumpDuty(simHPumpSpdVal);
+    else
+#endif
     setHPumpDuty(calcHPumpDuty());
     updateHPump();
 
     // 5am trigger and heating session
     checkMorningTrigger();
+    checkHotTankProtection();
     updateHeatSourceSelection();
     updatePVExportOverride();
     updateSummerStartup();
@@ -2474,9 +3002,14 @@ void loop() {
         if (currentPage == 4) needPageRedraw = true;
     }
 
-    // Flush display immediately after button events so the user sees a response
-    // before the RS485 exchange (which blocks for up to 200ms with no W controller)
+    // Inter-controller RS485: reply before any display draw — TFT redraws can take
+    // 100-300ms and W's receive window is only 150ms, so comms must come first.
+    pollRS485();
+    updateHPump();
+
+    // Flush display after button events (draw happens after RS485 reply)
     if (displayOn && (needFullRedraw || needPageRedraw)) {
+        updateHPump();
         if (needFullRedraw) {
             drawFullPage();
         } else {
@@ -2487,10 +3020,8 @@ void loop() {
             needPageRedraw = false;
             lastDisplayRefreshMs = now;
         }
+        updateHPump();
     }
-
-    // Inter-controller RS485: receive continuously, reply immediately on each W packet
-    pollRS485();
 
     // Miss counting and WDT reset on the 250ms heartbeat
     if (now - lastInterCtrlMs >= INTER_CTRL_POLL_MS) {
@@ -2505,10 +3036,12 @@ void loop() {
     updateCalPump();
 #endif
 
-    // SD logging (every 250ms = on each new W packet)
-    if (hasWPkt && now - lastLogMs >= 250) {
+    // SD logging (every 2s)
+    if (hasWPkt && now - lastLogMs >= 2000) {
         lastLogMs = now;
+        updateHPump();
         logDataRow();
+        updateHPump();
     }
 
     // Display refresh
@@ -2535,6 +3068,7 @@ void loop() {
     }
 
     if (displayOn) {
+        updateHPump();
         if (needFullRedraw) {
             drawFullPage();
         } else if (needPageRedraw) {
@@ -2547,7 +3081,9 @@ void loop() {
         } else if (now - lastDisplayRefreshMs >= 500) {
             lastDisplayRefreshMs = now;
             drawStatusBar();
+            updateHPump();
             drawFaultBar(hasWPkt ? lastWPkt.wFaultFlags : 0, hFaultFlags);
+            updateHPump();
             // Partial refresh of current page data (quick update of values only)
             switch (currentPage) {
                 case 1: drawPage1(hasWPkt ? lastWPkt.wFaultFlags : 0); break;
@@ -2556,9 +3092,11 @@ void loop() {
                 case 4: drawPage4(); break;
                 case 5: drawPage5(); break;
             }
+            updateHPump();
             if (manualOverrideActive || manualHeaterMode != MHM_OFF) {
                 updateDisplayBanners();
             }
         }
+        updateHPump();
     }
 }

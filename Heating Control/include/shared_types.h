@@ -23,13 +23,14 @@ enum BoostMode : uint8_t {
 };
 
 enum SolarTargetMode : uint8_t {
-    SOLAR_TANK_PLUS5 = 0,
+    SOLAR_TANK_PLUS8 = 0,
     SOLAR_MAX        = 1
 };
 
 enum ManualHeaterMode : uint8_t {
     MHM_OFF      = 0,
-    MHM_FORCE_ON = 1
+    MHM_SOC_LIM  = 1,   // run at 100% until battery SOC drops to 50%
+    MHM_FORCE_ON = 2
 };
 
 enum WinchState : uint8_t {
@@ -74,6 +75,7 @@ enum WinchState : uint8_t {
 #define FAULT_H_SENSOR_HOT_PIPE      (1UL << 9)
 #define FAULT_H_SENSOR_COLD_PIPE     (1UL << 10)
 #define FAULT_H_SENSOR_HEATER_OUT    (1UL << 11)
+#define FAULT_H_SENSOR_HEATER_OUT_2  (1UL << 12)
 
 // ── W-side valve state bitmask (valveStates field) ──────────
 #define VSTATE_UFH_COLD_OPEN    (1 << 0)
