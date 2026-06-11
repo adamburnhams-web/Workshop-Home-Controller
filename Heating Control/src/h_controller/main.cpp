@@ -2828,8 +2828,8 @@ static void socTestNextStep() {
 
 static void updateSocTest() {
     if (socTestState == SCT_IDLE) {
-        if (HEATER_ENABLED && !calHtrOverride && pumpTestState == PT_IDLE
-            && (!hasWPkt || lastWPkt.battSocPct >= 50)) {
+        if (HEATER_ENABLED && hasWPkt && !calHtrOverride
+            && pumpTestState == PT_IDLE && lastWPkt.battSocPct >= 50) {
             socTestShuffle();
             socTestStepIdx = 0;
             socTestActive  = true;
@@ -2839,7 +2839,7 @@ static void updateSocTest() {
         return;
     }
     uint32_t now = millis();
-    uint8_t  soc = hasWPkt ? lastWPkt.battSocPct : 100;
+    uint8_t  soc = lastWPkt.battSocPct;
 
     if (socTestState == SCT_PAUSED) {
         heaterRunning  = false;
