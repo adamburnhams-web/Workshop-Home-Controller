@@ -2039,12 +2039,16 @@ PktReceiver pktRx;
 // ============================================================
 
 static float calcPred(uint8_t heaterPct, float hotPipeC) {
-    float excess = (float)heaterPct - 20.0f;
-    float pt  = (excess > 0.0f) ? excess * excess * 0.0025f : 0.0f;
-    float tr  = (excess >= 0.0f) ? (0.09f + excess * 0.022f) : (0.09f * heaterPct / 20.0f);
-    float raw = 4.0f + pt + tr * (hotPipeC - 30.0f);
-    float minDuty = 4.0f + heaterPct * 0.05f;
-    return raw < minDuty ? minDuty : raw;
+    float hp     = fmaxf(hotPipeC, 20.0f);
+    float denom  = fmaxf(85.0f - hp, 5.0f);
+    float lp     = logf((float)heaterPct);
+    float ld     = logf(denom);
+    float p_warm = expf(-6.319f + 3.605f*lp + 1.534f*ld - 0.734f*lp*ld);
+    float p_cold = 12.6f * (float)heaterPct / denom;
+    float cold   = fmaxf(0.0f, 1.0f - (hp - 20.0f) / 20.0f);
+    float pred   = p_warm + fmaxf(0.0f, p_cold - p_warm) * cold;
+    pred        += 0.004f * fmaxf(hotPipeC - 48.0f, 0.0f) * (float)heaterPct;
+    return fmaxf(pred, 4.0f);
 }
 
 static float calcHPumpDuty() {
@@ -2074,15 +2078,22 @@ static float calcHPumpDuty() {
     }
 #endif
 
-    float pred = calcPred(heaterLevelPct(), hotPipeC);
+    bool  normalMode = solarTargetMode == SOLAR_TANK_PLUS8 && !sFault[H_SENSOR_TANK_TOP]
+                                                            && sTemp[H_SENSOR_TANK_TOP] <= 75.0f;
+    float effTarget  = normalMode ? fminf(sTemp[H_SENSOR_TANK_TOP] + 8.0f, 87.0f) : 85.0f;
+    float pred = calcPred(heaterLevelPct(), hotPipeC + fmaxf(0.0f, 85.0f - effTarget));
     float duty;
 
-    if (solarTargetMode == SOLAR_TANK_PLUS8 && !sFault[H_SENSOR_TANK_TOP]
-                                             && sTemp[H_SENSOR_TANK_TOP] <= 75.0f) {
+    // Upper pump ceiling at 90°C — scales with hot pipe because that's where the
+    // pred formula under-predicts most. 1.3x at cold pipe, up to ~1.54x at 60°C.
+    float upperMult = 1.3f + 0.008f * fmaxf(0.0f, hotPipeC - 30.0f);
+    float upper     = fminf(pred * upperMult, 100.0f);
+
+    if (normalMode) {
         // Normal mode: target tracks tank top + 8°C, capped at 87°C.
-        // Above target: 2%/°C slope to 90°C, then ramp to 100% at 91°C.
-        float target    = min(sTemp[H_SENSOR_TANK_TOP] + 8.0f, 87.0f);
-        float dutyAt90  = min(pred + (90.0f - target) * 0.2f, 100.0f);
+        // Above target: ramp pred→upper over target→90°C, then spike to 100% at 91°C.
+        float target    = effTarget;
+        float dutyAt90  = upper;
         if (heaterOutC >= 91.0f) {
             duty = 100.0f;
         } else if (heaterOutC >= 90.0f) {
@@ -2098,8 +2109,6 @@ static float calcHPumpDuty() {
         }
     } else {
         // MAX mode (or tank top fault): fixed 85°C target with pred→upper ramp.
-        float upperMult = 1.3f - constrain((pred - 5.0f) / 25.0f, 0.0f, 1.0f) * 0.2f;
-        float upper = pred * upperMult;
         if (heaterOutC >= 91.0f) {
             duty = 100.0f;
         } else if (heaterOutC >= 90.0f) {
