@@ -231,11 +231,39 @@ static inline bool tempValid(float t) {
 //  HEATER SSR  —  zero-crossing ISR + cycle-burst control
 // ============================================================
 
+// 20-level fixed-burst heater table. Each level fires on_hc half-cycles (10ms each) then
+// off_hc half-cycles off, repeating. pct10 = actual duty × 10 (e.g. 143 = 14.3%).
+// Levels named by exact duty, not nominal request.
+struct HeaterLevel { uint8_t on_hc; uint8_t off_hc; uint16_t pct10; };
+static const HeaterLevel kHeaterLevels[20] PROGMEM = {
+    {  1, 19,   50 },  //  5.0%
+    {  1,  9,  100 },  // 10.0%
+    {  1,  7,  143 },  // 14.3%
+    {  1,  4,  200 },  // 20.0%
+    {  1,  3,  250 },  // 25.0%
+    {  3,  7,  300 },  // 30.0%
+    {  1,  2,  333 },  // 33.3%
+    {  2,  3,  400 },  // 40.0%
+    {  3,  4,  429 },  // 42.9%
+    {  1,  1,  500 },  // 50.0%
+    {  4,  3,  571 },  // 57.1%
+    {  3,  2,  600 },  // 60.0%
+    {  2,  1,  667 },  // 66.7%
+    {  7,  3,  700 },  // 70.0%
+    {  3,  1,  750 },  // 75.0%
+    {  4,  1,  800 },  // 80.0%
+    {  6,  1,  857 },  // 85.7%
+    {  9,  1,  900 },  // 90.0%
+    { 19,  1,  950 },  // 95.0%
+    {  1,  0, 1000 },  // 100.0%
+};
+
 volatile unsigned long lastZCMicros  = 0;
-volatile uint8_t       heaterSpreadAcc    = 0;    // Bresenham accumulator for spread firing
-volatile uint8_t       heaterPowerCapPct  = 100;  // ISR-level power ceiling (reduced 91–92°C)
-volatile uint8_t       heaterTargetPct = 0;   // 0–100, written by outer loop
-volatile uint32_t      zcFireCount   = 0;
+volatile uint8_t  heaterLevelIdx  = 0;    // 0=off, 1–20=active level index
+volatile uint8_t  heaterLevelCap  = 20;   // ISR-level cap (0–20; 20=no cap)
+volatile uint8_t  heaterPhaseHc   = 0;    // half-cycle count within current phase
+volatile bool     heaterPhaseOn   = true; // true=ON phase, false=OFF phase
+volatile uint32_t zcFireCount     = 0;
 #ifdef DEBUG_SERIAL
 volatile bool simHeaterActive    = false;
 bool          pumpTestHeaterActive = false;  // true while pump_test/stress_test owns the heater
@@ -258,23 +286,58 @@ bool          hPumpOutputState = false;
 unsigned long hPumpOnMs        = 0;
 unsigned long hPumpOffMs       = 0;
 
-// Zero-crossing ISR — runs every 10ms on 50Hz grid (every half-cycle)
-// Bresenham spread firing: pulses distributed evenly rather than burst,
-// so instantaneous load is stable and export meters don't see large swings.
-// Direct port write (PA5 = D27) to avoid digitalWrite() overhead in ISR
+// Zero-crossing ISR — runs every 10ms on 50Hz grid (every half-cycle).
+// Fixed-burst firing: fires on_hc consecutive half-cycles then off_hc off, repeating.
+// Direct port write (PA5 = D27) to avoid digitalWrite() overhead in ISR.
 void zeroCrossISR() {
     lastZCMicros = micros();
     zcFireCount++;
 
-    heaterSpreadAcc += min(heaterTargetPct, heaterPowerCapPct);
-    bool fire = (heaterSpreadAcc >= 100);
-    if (fire) heaterSpreadAcc -= 100;
+    bool on = false;
+    uint8_t lvl = min(heaterLevelIdx, heaterLevelCap);
 
-    bool on = (HEATER_ENABLED || simHeaterActive) && heaterRunning
-              && (lastWPkt.valveStates & VSTATE_SOLAR_COLD_OPEN)
-              && !heaterHardLockout && fire;
+    if (lvl > 0 && (HEATER_ENABLED || simHeaterActive) && heaterRunning
+        && (lastWPkt.valveStates & VSTATE_SOLAR_COLD_OPEN) && !heaterHardLockout) {
+        uint8_t on_hc  = pgm_read_byte(&kHeaterLevels[lvl - 1].on_hc);
+        uint8_t off_hc = pgm_read_byte(&kHeaterLevels[lvl - 1].off_hc);
+        if (heaterPhaseOn) {
+            on = true;
+            if (++heaterPhaseHc >= on_hc) {
+                heaterPhaseHc = 0;
+                if (off_hc > 0) heaterPhaseOn = false;
+            }
+        } else {
+            if (++heaterPhaseHc >= off_hc) {
+                heaterPhaseHc = 0;
+                heaterPhaseOn = true;
+            }
+        }
+    }
+
     if (on) PORTA |= (1 << PA5);    // D27 = PA5
     else    PORTA &= ~(1 << PA5);
+}
+
+// Returns highest level index whose duty does not exceed pct (0–100). Returns 0 if pct==0.
+static uint8_t pctToLevel(uint8_t pct) {
+    uint8_t best = 0;
+    for (uint8_t i = 0; i < 20; i++) {
+        if (pgm_read_word(&kHeaterLevels[i].pct10) <= (uint16_t)pct * 10) best = i + 1;
+        else break;
+    }
+    return best;
+}
+
+// Duty of current active level as integer percent (rounded), or 0 if off.
+static uint8_t heaterLevelPct() {
+    if (heaterLevelIdx == 0) return 0;
+    return (uint8_t)((pgm_read_word(&kHeaterLevels[heaterLevelIdx - 1].pct10) + 5) / 10);
+}
+
+// Duty × 10 of current level (e.g. 143 = 14.3%), or 0 if off.
+static uint16_t heaterLevelPct10() {
+    if (heaterLevelIdx == 0) return 0;
+    return pgm_read_word(&kHeaterLevels[heaterLevelIdx - 1].pct10);
 }
 
 uint8_t rtcHour();   // defined after RTC section
@@ -291,42 +354,42 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
 {
 #ifdef DEBUG_SERIAL
     if (simHeaterActive) {
-        heaterRunning   = simHeaterVal > 0;
-        heaterTargetPct = simHeaterVal;
+        heaterRunning  = simHeaterVal > 0;
+        heaterLevelIdx = pctToLevel(simHeaterVal);
         return;
     }
     if (pumpTestHeaterActive) return;  // pump_test/stress_test own heaterRunning
 #endif
     if (!gridPresent || !HEATER_ENABLED) {
-        heaterTargetPct = 0; heaterRunning = false; return;
+        heaterLevelIdx = 0; heaterRunning = false; return;
     }
     // W solar sensor fault: W is in emergency UFH dump mode; suppress heater
     // to avoid adding heat to a circuit being used to dissipate excess solar heat.
     if (wSolarFault) {
-        heaterTargetPct = 0; heaterRunning = false; return;
+        heaterLevelIdx = 0; heaterRunning = false; return;
     }
     if (heaterHardLockout) {
-        heaterTargetPct = 0; heaterRunning = false; return;
+        heaterLevelIdx = 0; heaterRunning = false; return;
     }
     if (hotTankProtection) {
-        heaterTargetPct = 0; heaterRunning = false; return;
+        heaterLevelIdx = 0; heaterRunning = false; return;
     }
     if (morningHeatActive) {
-        heaterTargetPct = 0; heaterRunning = false; return;
+        heaterLevelIdx = 0; heaterRunning = false; return;
     }
     if (manualMode == MHM_FORCE_ON) {
         logBurnerCold.request(false);
         botTankValve.request(true);
         twoPortValve.request(true);
-        heaterRunning = true; heaterTargetPct = 100; return;
+        heaterRunning = true; heaterLevelIdx = 20; return;
     }
     if ((twoPortValve.busy() && !twoPortValve.pendingOpen) ||
         (botTankValve.busy() && !botTankValve.pendingOpen)) {
-        heaterTargetPct = 0; heaterRunning = false; return;
+        heaterLevelIdx = 0; heaterRunning = false; return;
     }
 
     bool     growattOk     = lastWPkt.growattValid;
-    int32_t  heaterCurrentW = (int32_t)heaterTargetPct * 3000 / 100;
+    int32_t  heaterCurrentW = (int32_t)heaterLevelPct10() * 3;
     int16_t  rawPct;
 
     static bool          lastHighSoc    = false;
@@ -350,11 +413,11 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
         rawPct = (int16_t)constrain(available * 100L / 3000L, 0L, 100L);
     } else if (manualMode == MHM_SOC_LIM) {
         // SOC mode but below threshold — heater off
-        heaterRunning = false; heaterTargetPct = 0; return;
+        heaterRunning = false; heaterLevelIdx = 0; return;
     } else {
         // Normal auto mode: requires PV generating.
         if (!growattOk || (lastWPkt.pv1W + lastWPkt.pv2W) < 200) {
-            heaterRunning = false; heaterTargetPct = 0; return;
+            heaterRunning = false; heaterLevelIdx = 0; return;
         }
         int16_t battChgW   = lastWPkt.battChargeW;
         int32_t netGridW   = (int32_t)pvExportW - gridImportW;
@@ -374,7 +437,7 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
     }
 
     if (highSoc != lastHighSoc) {
-        heaterRunning = false; heaterTargetPct = 0;
+        heaterRunning = false; heaterLevelIdx = 0;
         surplusStartMs = 0; zeroCount = 0; rawPctAccum = 0; accumCount = 0;
         lastHighSoc = highSoc;
     }
@@ -393,7 +456,7 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
 
     if (rawPct == 0) {
         if (++zeroCount >= 5) {
-            heaterRunning = false; heaterTargetPct = 0;
+            heaterRunning = false; heaterLevelIdx = 0;
             zeroCount = 0; rawPctAccum = 0; accumCount = 0;
         }
         return;
@@ -402,32 +465,21 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
 
     rawPctAccum += rawPct;
     if (++accumCount < 8) return;
-    heaterTargetPct = (uint8_t)(rawPctAccum / 8);
+    uint8_t avgPct = (uint8_t)(rawPctAccum / 8);
     rawPctAccum = 0; accumCount = 0;
-
-    // Overheat power reduction (> 91°C heater output)
-    if (!(sFault[H_SENSOR_HEATER_OUT] && sFault[H_SENSOR_HEATER_OUT_2])) {
-        float hOut = getHeaterOutC();
-        if (!isnan(hOut)) {
-            if (hOut >= 92.0f) {
-                heaterTargetPct = 0;
-            } else if (hOut > 91.0f) {
-                uint8_t reduce = (uint8_t)((hOut - 91.0f) * 100.0f);
-                heaterTargetPct = heaterTargetPct * (100 - reduce) / 100;
-            }
-        }
-    }
 
     // Hot pipe cap: 100% at 60°C, linear ramp to 0 at 90°C
     if (!sFault[H_SENSOR_HOT_PIPE]) {
         float hp = sTemp[H_SENSOR_HOT_PIPE];
         if (hp >= 90.0f) {
-            heaterTargetPct = 0;
+            avgPct = 0;
         } else if (hp > 60.0f) {
-            uint8_t cap = (uint8_t)((90.0f - hp) * (100.0f / 30.0f));  // ~3.33% per °C over 30°C span
-            if (heaterTargetPct > cap) heaterTargetPct = cap;
+            uint8_t cap = (uint8_t)((90.0f - hp) * (100.0f / 30.0f));
+            if (avgPct > cap) avgPct = cap;
         }
     }
+
+    heaterLevelIdx = pctToLevel(avgPct);
     if (heaterRunning) botTankValve.request(true);
 }
 
@@ -650,11 +702,11 @@ void checkHeaterFaults() {
     }
 
     if (hasWPkt && millis() - lastWPktMs > 60000UL) {
-        heaterTargetPct = 0; heaterRunning = false;
+        heaterLevelIdx = 0; heaterRunning = false;
     }
 
-    if (!heaterRunning || heaterTargetPct == 0) {
-        heaterPowerCapPct  = 100;
+    if (!heaterRunning || heaterLevelIdx == 0) {
+        heaterLevelCap     = 20;
         heaterOvheatWarn   = false;
         heaterOvheatWarnMs = 0;
         clearFaultH(FAULT_H_HEATER_OVERHEAT_WARN);
@@ -663,7 +715,7 @@ void checkHeaterFaults() {
 
     // Both sensors faulted: shut down heater immediately
     if (f1 && f2) {
-        heaterPowerCapPct = 0;
+        heaterLevelCap = 0;
         setFaultH(FAULT_H_SENSOR_HEATER_OUT);
         setFaultH(FAULT_H_SENSOR_HEATER_OUT_2);
         return;
@@ -674,7 +726,7 @@ void checkHeaterFaults() {
     if (f2 && millis() - htrOut2FaultMs >= 5000UL) setFaultH(FAULT_H_SENSOR_HEATER_OUT_2);
 
     if (sFault[H_SENSOR_HOT_PIPE]) {
-        heaterPowerCapPct = 0;
+        heaterLevelCap = 0;
         setFaultH(FAULT_H_SENSOR_HOT_PIPE);
         return;
     }
@@ -688,8 +740,8 @@ void checkHeaterFaults() {
             botTankValve.request(true);
             ovhtValvesRequested = true;
         }
-        heaterPowerCapPct = 0;
-        heaterTargetPct   = 0;
+        heaterLevelCap = 0;
+        heaterLevelIdx = 0;
         heaterHardLockout = true;
         PORTA &= ~(1 << PA5);
         setFaultH(FAULT_H_HEATER_OVERHEAT_SHUT);
@@ -700,7 +752,7 @@ void checkHeaterFaults() {
             ovhtValvesRequested = true;
         }
         float cap = (92.0f - hOut) * 100.0f;
-        heaterPowerCapPct = (cap <= 0.0f) ? 0 : (uint8_t)cap;
+        heaterLevelCap = (cap <= 0.0f) ? 0 : pctToLevel((uint8_t)cap);
         if (!heaterOvheatWarn) {
             heaterOvheatWarn   = true;
             heaterOvheatWarnMs = millis();
@@ -708,7 +760,7 @@ void checkHeaterFaults() {
         }
     } else {
         ovhtValvesRequested = false;
-        heaterPowerCapPct  = 100;
+        heaterLevelCap     = 20;
         heaterOvheatWarn   = false;
         heaterOvheatWarnMs = 0;
         clearFaultH(FAULT_H_HEATER_OVERHEAT_WARN);
@@ -947,7 +999,7 @@ void updateSummerStartup() {
 
         case 1:
             // Heater firing: skip straight to phase 3 — log burner cold must close, bot-of-tank open
-            if (heaterRunning && heaterTargetPct > 0) {
+            if (heaterRunning && heaterLevelIdx > 0) {
                 summerStartupPhase = 3;
                 logBurnerCold.request(false);
                 botTankValve.request(true);
@@ -967,7 +1019,7 @@ void updateSummerStartup() {
 
         case 2:
             // Heater firing: skip straight to phase 3 — log burner cold already closed, bot-of-tank already open
-            if (heaterRunning && heaterTargetPct > 0) {
+            if (heaterRunning && heaterLevelIdx > 0) {
                 summerStartupPhase = 3;
                 twoPortValve.request(true);   // heater cold side / top-of-tank
                 break;
@@ -987,7 +1039,7 @@ void updateSummerStartup() {
             // of temps if pump is below 3%), AND hot pipe is below tank top.
             static bool          heaterLatch  = false;
             static unsigned long heaterStopMs = 0;
-            bool heaterActive = heaterRunning && heaterTargetPct > 0;
+            bool heaterActive = heaterRunning && heaterLevelIdx > 0;
             bool pumpRunning  = hasWPkt && lastWPkt.solarPumpDutyPct >= 3;
 
             if (heaterActive) {
@@ -1117,7 +1169,7 @@ void logDataRow() {
     }
     // State
     f.print(lastWPkt.solarPumpDutyPct); f.print(',');
-    f.print(heaterRunning ? heaterTargetPct : 0); f.print(',');
+    f.print(heaterRunning ? heaterLevelPct() : 0); f.print(',');
     f.print(lastWPkt.pvExportW); f.print(',');
     f.print(lastWPkt.gridImportW); f.print(',');
     f.print(busVoltageV, 2); f.print(',');
@@ -1413,7 +1465,7 @@ void drawPage1(uint32_t wF) {
     // Power row
     uint16_t y = yS;
     tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(4, y); tft.print("Heater");
-    { char tmp[8], buf[8]; snprintf(tmp, sizeof(tmp), "%dW", heaterRunning ? (heaterTargetPct * 3000 / 100) : 0); snprintf(buf, sizeof(buf), "%-5s", tmp); tft.setTextColor(C_CYAN, C_BLACK); tft.setCursor(82, y); tft.print(buf); }
+    { char tmp[8], buf[8]; snprintf(tmp, sizeof(tmp), "%dW", heaterRunning ? (int)(heaterLevelPct10() * 3) : 0); snprintf(buf, sizeof(buf), "%-5s", tmp); tft.setTextColor(C_CYAN, C_BLACK); tft.setCursor(82, y); tft.print(buf); }
     tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(172, y); tft.print("Sol H:");
     { char tmp[6], buf[6]; snprintf(tmp, sizeof(tmp), "%d%%", (int)roundf(hPumpDuty)); snprintf(buf, sizeof(buf), "%-4s", tmp); tft.setTextColor(C_CYAN, C_BLACK); tft.setCursor(250, y); tft.print(buf); }
     tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(304, y); tft.print("Sol W:");
@@ -1494,9 +1546,9 @@ void drawPage2() {
 
     // Heater W / duty
     {
-        int16_t hW = heaterRunning ? (int16_t)(heaterTargetPct * 3000 / 100) : 0;
+        int16_t hW = heaterRunning ? (int16_t)(heaterLevelPct10() * 3) : 0;
         snprintf(lv, sizeof(lv), "%-6dW", hW);
-        snprintf(rv, sizeof(rv), "%u%%  ", heaterRunning ? heaterTargetPct : 0);
+        snprintf(rv, sizeof(rv), "%u%%  ", heaterRunning ? heaterLevelPct() : 0);
         tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(4, y); tft.print("Heater:");
         tft.setTextColor(heaterRunning ? C_GREEN : C_WHITE, C_BLACK);
         tft.setCursor(100, y); tft.print(lv);
@@ -1689,7 +1741,7 @@ void page4Action(uint8_t item) {
         faultLogPrevH = hFaultFlags;
         // Clear heater lockout so heater can restart if temperature has recovered
         heaterHardLockout  = false;
-        heaterPowerCapPct  = 100;
+        heaterLevelCap     = 20;
         heaterOvheatWarn   = false;
         heaterOvheatWarnMs = 0;
         clearFaultH(FAULT_H_HEATER_OVERHEAT_WARN);
@@ -1982,7 +2034,7 @@ static float calcPred(uint8_t heaterPct, float hotPipeC) {
 
 static float calcHPumpDuty() {
     if (heaterHardLockout)                                               return 100.0f;
-    if (!heaterRunning || heaterTargetPct == 0)                          return 0.0f;
+    if (!heaterRunning || heaterLevelIdx == 0)                           return 0.0f;
     if ((sFault[H_SENSOR_HEATER_OUT] && sFault[H_SENSOR_HEATER_OUT_2])
         || sFault[H_SENSOR_HOT_PIPE])                                    return 0.0f;
 
@@ -2006,7 +2058,7 @@ static float calcHPumpDuty() {
     }
 #endif
 
-    float pred = calcPred(heaterTargetPct, hotPipeC);
+    float pred = calcPred(heaterLevelPct(), hotPipeC);
     float duty;
 
     if (solarTargetMode == SOLAR_TANK_PLUS8 && !sFault[H_SENSOR_TANK_TOP]
@@ -2104,7 +2156,7 @@ void sendHToWPacket(bool timeSyncReq) {
     pkt.tempColdPipe   = sFault[H_SENSOR_COLD_PIPE] ? TEMP_FAULT : (int16_t)(sTemp[H_SENSOR_COLD_PIPE] * 10);
     { float effT = getHeaterOutC(); pkt.tempHeaterOut = isnan(effT) ? TEMP_FAULT : (int16_t)(effT * 10.0f); }
 
-    pkt.heaterPowerPct    = heaterRunning ? max(heaterTargetPct, (uint8_t)1) : 0;
+    pkt.heaterPowerPct    = (heaterRunning && heaterLevelIdx > 0) ? max(heaterLevelPct(), (uint8_t)1) : 0;
     pkt.heaterRestricted  = heaterOvheatWarn ? 1 : 0;
     pkt.twoPortHeaterSide = summerTwoPortTop ? 1 : 0;
 
@@ -2213,7 +2265,7 @@ static void pollRS485() {
             } else {
                 Serial.print(F("NO DATA"));
             }
-            Serial.print(F(" | htr="));   Serial.print(heaterRunning ? heaterTargetPct : 0);
+            Serial.print(F(" | htr="));   Serial.print(heaterRunning ? heaterLevelPct() : 0);
             Serial.print(F("% pump="));   Serial.print(lastWPkt.solarPumpDutyPct);
             Serial.println(F("%"));
         }
@@ -2319,7 +2371,7 @@ static void dbgMode() {
     Serial.print(F("  log_burner:   ")); Serial.println(logBurnerHot       ? F("HOT")    : F("cold"));
     if (simLogBurnerActive) Serial.println(F("  (log_burner SIM active)"));
     Serial.print(F("  heater:       ")); Serial.print(heaterRunning ? F("ON ") : F("off "));
-    Serial.print(heaterTargetPct); Serial.println(F("%"));
+    Serial.print(heaterLevelPct()); Serial.println(F("%"));
     Serial.print(F("  htr_lockout:  ")); Serial.println(heaterHardLockout  ? F("YES")    : F("no"));
     Serial.print(F("  rs485:        ")); Serial.println(rs485Fault         ? F("FAULT")  : F("ok"));
     Serial.print(F("  rtc_valid:    ")); Serial.println(rtcValid            ? F("yes")    : F("no"));
@@ -2328,8 +2380,8 @@ static void dbgMode() {
 
 static void dbgHeater() {
     Serial.print(F("  running:   ")); Serial.println(heaterRunning     ? F("yes")  : F("no"));
-    Serial.print(F("  duty:      ")); Serial.print(heaterTargetPct);   Serial.println(F("%"));
-    Serial.print(F("  power_est: ")); Serial.print(heaterTargetPct * 3000 / 100); Serial.println(F("W"));
+    Serial.print(F("  duty:      ")); Serial.print(heaterLevelPct());   Serial.println(F("%"));
+    Serial.print(F("  power_est: ")); Serial.print(heaterLevelPct10() * 3); Serial.println(F("W"));
     Serial.print(F("  lockout:   ")); Serial.println(heaterHardLockout ? F("YES")  : F("no"));
     Serial.print(F("  ovht_warn: ")); Serial.println(heaterOvheatWarn  ? F("YES")  : F("no"));
     Serial.print(F("  grid:      ")); Serial.println(gridPresent       ? F("ok")   : F("OUTAGE"));
@@ -2445,7 +2497,7 @@ static void updateCalPump() {
             calSensorFault  = true;
             calPhaseMs      = now;
             heaterRunning   = false;
-            heaterTargetPct = 0;
+            heaterLevelIdx  = 0;
             Serial.println(F("CAL: htr_out sensor fault — heater off, restarting step when recovered"));
         }
         calHtrOverride = true;
@@ -2459,7 +2511,7 @@ static void updateCalPump() {
 
     calHtrOverride  = true;
     heaterRunning   = true;
-    heaterTargetPct = calHeaterPct;
+    heaterLevelIdx  = pctToLevel(calHeaterPct);
 
     if (htrOut >= 91.0f) {
         if (!calCooling) {
@@ -2491,7 +2543,7 @@ static void updateCalPump() {
             calPumpPhase    = CALP_DONE;
             calHtrOverride  = false;
             heaterRunning   = false;
-            heaterTargetPct = 0;
+            heaterLevelIdx  = 0;
         } else {
             calPumpBase    = min(hPumpDuty, 95.0f);
             calHeaterPct   = min((uint8_t)(calHeaterPct + 5), (uint8_t)100);
@@ -2529,7 +2581,7 @@ static void dbgCalAbort() {
     calPumpPhase   = CALP_IDLE;
     calHtrOverride = false;
     heaterRunning  = false;
-    heaterTargetPct = 0;
+    heaterLevelIdx = 0;
     PORTA &= ~(1 << PA5);
     Serial.println(F("CAL: aborted — heater off, normal control restored"));
 }
@@ -2546,8 +2598,8 @@ static void pumpTestStartStep() {
     logBurnerCold.request(false);
     botTankValve.request(true);
     twoPortValve.request(true);
-    heaterRunning       = true;
-    heaterTargetPct     = pumpTestPower;
+    heaterRunning        = true;
+    heaterLevelIdx       = pctToLevel(pumpTestPower);
     pumpTestHeaterActive = true;
     pumpTestState       = PT_HEATING;
     pumpTestLastPrint = now;
@@ -2563,7 +2615,7 @@ static void pumpTestStartStep() {
 
 static void pumpTestStartCooldown() {
     heaterRunning        = false;
-    heaterTargetPct      = 0;
+    heaterLevelIdx       = 0;
     pumpTestHeaterActive = false;
     pumpTestState        = PT_COOLDOWN;
     pumpTestCoolStart = millis();
@@ -2575,8 +2627,8 @@ static void updatePumpTest() {
     uint32_t now = millis();
 
     if (pumpTestState == PT_COOLDOWN) {
-        heaterRunning   = false;
-        heaterTargetPct = 0;
+        heaterRunning  = false;
+        heaterLevelIdx = 0;
         float _ht = getHeaterOutC(); float hOut = isnan(_ht) ? 99.0f : _ht;
         bool cooled  = (hOut < 60.0f);
         bool timeout = (now - pumpTestCoolStart >= 120000);
@@ -2594,8 +2646,8 @@ static void updatePumpTest() {
     }
 
     if (pumpTestState == PT_HEATING) {
-        heaterRunning   = true;
-        heaterTargetPct = pumpTestPower;
+        heaterRunning  = true;
+        heaterLevelIdx = pctToLevel(pumpTestPower);
 
         if (hPumpDuty > pumpTestMaxPump) pumpTestMaxPump = hPumpDuty;
 
@@ -2603,7 +2655,7 @@ static void updatePumpTest() {
             pumpTestLastPrint = now;
             float hotPipe = sFault[H_SENSOR_HOT_PIPE]   ? NAN : sTemp[H_SENSOR_HOT_PIPE];
             float htrOut  = getHeaterOutC();
-            Serial.print(pumpTestPower);        Serial.print(',');
+            Serial.print(heaterLevelPct());     Serial.print(',');
             if (isnan(hotPipe)) Serial.print(F("NaN")); else Serial.print(hotPipe, 1);
             Serial.print(',');
             if (isnan(htrOut))  Serial.print(F("NaN")); else Serial.print(htrOut, 1);
@@ -2678,7 +2730,7 @@ static void dbgPumpTestAbort() {
     pumpTestStress       = false;
     pumpTestHeaterActive = false;
     heaterRunning        = false;
-    heaterTargetPct      = 0;
+    heaterLevelIdx       = 0;
     PORTA &= ~(1 << PA5);
     Serial.println(F("PUMP_TEST: aborted"));
 }
@@ -2930,7 +2982,7 @@ void loop() {
             gridPresent = gridOk;
             if (!gridOk) {
                 setFaultH(FAULT_H_GRID_OUTAGE);
-                heaterTargetPct = 0;
+                heaterLevelIdx = 0;
                 PORTA &= ~(1 << PA5);
             } else {
                 clearFaultH(FAULT_H_GRID_OUTAGE);
