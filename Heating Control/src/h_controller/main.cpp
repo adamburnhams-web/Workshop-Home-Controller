@@ -559,7 +559,9 @@ uint8_t      socTestStepIdx    = 0;
 uint32_t     socTestStepStart  = 0;
 uint32_t     socTestLastLog    = 0;
 bool         socTestPriming    = false;    // true during 10s pump prime at step start
-uint32_t     socTestPrimeEndMs = 0;
+uint32_t     socTestPrimeEndMs    = 0;
+bool         socTestLogPending    = false;
+const __FlashStringHelper* socTestPendingEvent = nullptr;
 #endif // DEBUG_SERIAL
 
 // ============================================================
@@ -2808,6 +2810,19 @@ static void socTestLogRow(const __FlashStringHelper* event) {
     f.close();
 }
 
+static void socTestScheduleLog(const __FlashStringHelper* event) {
+    if (!socTestLogPending || event != nullptr) socTestPendingEvent = event;
+    socTestLogPending = true;
+}
+
+static void socTestFlushLog() {
+    if (!socTestLogPending) return;
+    if (hasWPkt && (millis() - lastWPktMs) < 30) return;
+    socTestLogRow(socTestPendingEvent);
+    socTestLogPending   = false;
+    socTestPendingEvent = nullptr;
+}
+
 static void socTestStartStep() {
     uint32_t now = millis();
     logBurnerCold.request(false);
@@ -2821,11 +2836,11 @@ static void socTestStartStep() {
     socTestLastLog     = now - 2000UL;
     Serial.print(F("SCT: step ")); Serial.print(socTestStepIdx + 1);
     Serial.print(F("/20 — ")); Serial.print(heaterLevelPct()); Serial.println(F("%"));
-    socTestLogRow(F("STEP_START"));
+    socTestScheduleLog(F("STEP_START"));
 }
 
 static void socTestNextStep() {
-    socTestLogRow(F("STEP_END"));
+    socTestScheduleLog(F("STEP_END"));
     socTestStepIdx++;
     if (socTestStepIdx >= 20) {
         socTestStepIdx = 0;
@@ -2878,7 +2893,7 @@ static void updateSocTest() {
         heaterLevelIdx = 0;
         socTestPriming = false;
         socTestState   = SCT_PAUSED;
-        socTestLogRow(F("PAUSE"));
+        socTestScheduleLog(F("PAUSE"));
         Serial.print(F("SCT: paused — SOC ")); Serial.print(soc); Serial.println('%');
         return;
     }
@@ -2891,7 +2906,7 @@ static void updateSocTest() {
     float h2 = sFault[H_SENSOR_HEATER_OUT_2] ? NAN : sTemp[H_SENSOR_HEATER_OUT_2];
     if ((!isnan(h1) && h1 >= 93.0f) || (!isnan(h2) && h2 >= 93.0f)) {
         Serial.println(F("SCT: 93C — cooling before next step"));
-        socTestLogRow(F("OVERHEAT"));
+        socTestScheduleLog(F("OVERHEAT"));
         socTestState   = SCT_COOLING;
         heaterRunning  = false;
         heaterLevelIdx = 0;
@@ -2900,7 +2915,7 @@ static void updateSocTest() {
 
     if (now - socTestLastLog >= 2000) {
         socTestLastLog = now;
-        socTestLogRow(nullptr);
+        socTestScheduleLog(nullptr);
     }
 
     if (now - socTestStepStart >= 900000UL) {
@@ -3255,6 +3270,7 @@ void loop() {
     // Inter-controller RS485: reply before any display draw — TFT redraws can take
     // 100-300ms and W's receive window is only 150ms, so comms must come first.
     pollRS485();
+    socTestFlushLog();
     updateHPump();
 
     // Flush display after button events (draw happens after RS485 reply)
