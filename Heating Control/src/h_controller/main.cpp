@@ -2827,7 +2827,17 @@ static void socTestNextStep() {
 }
 
 static void updateSocTest() {
-    if (socTestState == SCT_IDLE) return;
+    if (socTestState == SCT_IDLE) {
+        if (HEATER_ENABLED && hasWPkt && !calHtrOverride
+            && pumpTestState == PT_IDLE && lastWPkt.battSocPct >= 50) {
+            socTestShuffle();
+            socTestStepIdx = 0;
+            socTestActive  = true;
+            socTestState   = SCT_HEATING;
+            socTestStartStep();
+        }
+        return;
+    }
     uint32_t now = millis();
     uint8_t  soc = lastWPkt.battSocPct;
 
