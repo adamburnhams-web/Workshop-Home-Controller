@@ -31,8 +31,8 @@
 #define PIN_WINCH_REED_LOCK  7   // pull-up; HIGH=manual lock engaged (switch open when locked)
 #define PIN_WINCH_SAFETY     8   // pull-up; LOW=over-open safety limit
 #define PIN_VAC_SENSOR       9   // pull-up; LOW=full vacuum, HIGH=low vacuum
-#define PIN_UNLOCK_BTN      46   // 15VDC via 10k/4.7k divider
-#define PIN_LOCK_SW         11   // 15VDC via 10k/4.7k divider; HIGH=lock workshop
+#define PIN_UNLOCK_BTN      10   // 15VDC via 10k/4.7k divider
+#define PIN_LIGHT_BTN       11   // 15VDC via 10k/4.7k divider
 #define PIN_MANUAL_RELOCK   12   // dry contact, pull-up; LOW=suppression ON
 #define PIN_ONE_WIRE        13   // DS18B20 1-Wire bus (6 sensors)
 
@@ -48,9 +48,9 @@
 // Odd board  (D23–D37): D25 D27 D29 D31 D33 D35 D37  (D23 spare)
 #define PIN_UFH_COLD_DIR    22   // even ch1: SPDT direction relay, NO=open, NC=close
 // D23: spare (odd ch1)
-#define PIN_ALARM_SOUNDER   24   // even ch2: alarm sounder at W
+#define PIN_SOLAR_COLD_DIR  24   // even ch2: SPDT direction relay
 #define PIN_EXT_LIGHTS      25   // odd  ch2: external LED lights
-#define PIN_SOLAR_COLD_DIR  26   // even ch3: SPDT direction relay
+#define PIN_ALARM_SOUNDER   26   // even ch3: alarm sounder at W
 #define PIN_WALL_FAN        27   // odd  ch3: wall axial fan (BES speed controller)
 #define PIN_FAN_FLAP        28   // even ch4: fan flap actuator (open before fan ON)
 #define PIN_WINCH_POWER     29   // odd  ch4: winch power (with direction ch5 or ch6)
@@ -137,8 +137,7 @@ static const uint16_t VALVE_POWERUP_WAIT_MS = 30000;
 #define COMMS_FAULT_THRESHOLD 20
 #define FAN_RPM_FAULT_DELAY_MS 5000UL
 #define VAC_PUMP_MAX_MS    1800000UL // 30 minutes
-#define VAC_PUMP_PREWARM_MS  2000UL  // pump-on lead time before valve opens
-#define VAC_EXTRA_RUN_MS   600000UL  // 10 extra minutes after full vacuum
+#define VAC_EXTRA_RUN_MS   300000UL  // 5 extra minutes after full vacuum
 #define VALVE_PULSE_MS      7000UL   // H-bridge valve travel time
 #define LOCK_PULSE_MS       1000UL   // door lock pulse
 #define HBRIDGE_DEAD_MS      200UL   // dead-time between relay changes
@@ -412,7 +411,7 @@ struct WindowWinch {
 //  VACUUM SYSTEM
 // ============================================================
 
-enum VacState : uint8_t { VAC_IDLE, VAC_PUMP_START, VAC_OPENING, VAC_PUMPING, VAC_FULL, VAC_DONE, VAC_FAULT };
+enum VacState : uint8_t { VAC_IDLE, VAC_OPENING, VAC_PUMPING, VAC_FULL, VAC_DONE, VAC_FAULT };
 
 VacState     vacState           = VAC_IDLE;
 unsigned long vacStateEnteredMs = 0;
@@ -966,8 +965,29 @@ void updateFanRPM() {
     bool fan1ShouldSpin = (fanCurrentDuty >= FAN_MIN_DUTY_PCT);
     bool fan2ShouldSpin = (fanCurrentDuty >= FAN_MIN_DUTY_PCT);
 
-    fan1FaultStartMs = 0; fan1FaultActive = false;
-    fan2FaultStartMs = 0; fan2FaultActive = false;
+    if (fan1ShouldSpin && fan1RPM == 0) {
+        if (!fan1FaultActive) {
+            if (fan1FaultStartMs == 0) fan1FaultStartMs = millis();
+            if (millis() - fan1FaultStartMs > FAN_RPM_FAULT_DELAY_MS) {
+                fan1FaultActive = true; setFault(FAULT_W_FAN1);
+            }
+        }
+    } else {
+        fan1FaultStartMs = 0;
+        if (fan1FaultActive) { fan1FaultActive = false; clearFault(FAULT_W_FAN1); }
+    }
+
+    if (fan2ShouldSpin && fan2RPM == 0) {
+        if (!fan2FaultActive) {
+            if (fan2FaultStartMs == 0) fan2FaultStartMs = millis();
+            if (millis() - fan2FaultStartMs > FAN_RPM_FAULT_DELAY_MS) {
+                fan2FaultActive = true; setFault(FAULT_W_FAN2);
+            }
+        }
+    } else {
+        fan2FaultStartMs = 0;
+        if (fan2FaultActive) { fan2FaultActive = false; clearFault(FAULT_W_FAN2); }
+    }
 }
 
 // Fan control: W computes speed autonomously from lock state + settings from H
@@ -1015,14 +1035,6 @@ void updateVacuum() {
     switch (vacState) {
         case VAC_IDLE:
             if (heatingOrSolarActive && !vacFullThisSession) {
-                digitalWrite(PIN_VAC_PUMP, RELAY_ON);
-                vacStateEnteredMs = now;
-                vacState = VAC_PUMP_START;
-            }
-            break;
-
-        case VAC_PUMP_START:
-            if (now - vacStateEnteredMs >= VAC_PUMP_PREWARM_MS) {
                 vacIsoValve.request(true); // open
                 vacStateEnteredMs = now;
                 vacState = VAC_OPENING;
@@ -1032,6 +1044,7 @@ void updateVacuum() {
         case VAC_OPENING:
             vacIsoValve.update();
             if (!vacIsoValve.busy()) {
+                digitalWrite(PIN_VAC_PUMP, RELAY_ON);
                 vacStateEnteredMs = now;
                 vacState = VAC_PUMPING;
             }
@@ -1050,7 +1063,7 @@ void updateVacuum() {
             break;
 
         case VAC_FULL:
-            // Run pump for 10 extra minutes after full vacuum, then close valve
+            // Run pump for 5 extra minutes after full vacuum, then close valve
             if (now - vacStateEnteredMs >= VAC_EXTRA_RUN_MS) {
                 vacIsoValve.request(false); // close isolation valve
                 vacDoneStartMs    = now;
@@ -1505,29 +1518,48 @@ void updateSecurity() {
     bool winchSecured = (digitalRead(PIN_WINCH_REED_CLOSE) == HIGH)
                      && (digitalRead(PIN_WINCH_REED_LOCK)  == HIGH);
 #endif
+    // D10 is shared with midpoint LED wire: mask button when LED relay is energised (RELAY_ON=LOW)
     bool unlockBtn    = (digitalRead(PIN_UNLOCK_BTN)    == HIGH)
                      && (digitalRead(PIN_MIDPOINT_LED) == RELAY_OFF);
-    bool lockSw = (digitalRead(PIN_LOCK_SW) == HIGH);
+    bool lightBtn     = (digitalRead(PIN_LIGHT_BTN)     == HIGH);
     unsigned long now = millis();
 
-    // Unlock button: pulse door lock open
+    // Unlock button: pulse door lock 1s, hold mid-point LED high
     static bool prevUnlockBtn = false;
     if (unlockBtn && !prevUnlockBtn && workshopLocked) {
-        doorLock.request(true);
+        doorLock.request(true); // open = unlock
         workshopLocked = false;
     }
     prevUnlockBtn = unlockBtn;
 
-    // Lock switch: lock immediately on rising edge
-    static bool prevLockSw = false;
-    if (lockSw && !prevLockSw && !workshopLocked) {
-        doorLock.request(false);
-        workshopLocked = true;
-        relockTimerActive = false;
+    // External light toggle
+    static bool prevLightBtn = false;
+    if (!fireAlarmActive && lightBtn && !prevLightBtn) {
+        extLightsOn = !extLightsOn;
+        digitalWrite(PIN_EXT_LIGHTS, extLightsOn ? RELAY_ON : RELAY_OFF);
     }
-    prevLockSw = lockSw;
+    prevLightBtn = lightBtn;
 
-    relockTimerActive = false; // relock only via D11 lock switch
+    // W-side light button (same effect)
+    // (connected to D11 — handled above as lightBtn)
+
+    // Auto-relock timer: starts when ALL four conditions clear
+    bool relockAllowed = !doorOpen && !pirActive && !manualSupp && winchSecured;
+    if (!workshopLocked) {
+        if (relockAllowed) {
+            if (!relockTimerActive) {
+                relockTimerActive = true;
+                relockTimerStartMs = now;
+            } else if (now - relockTimerStartMs >= RELOCK_TIMEOUT_MS) {
+                // Relock
+                doorLock.request(false);
+                workshopLocked = true;
+                relockTimerActive = false;
+            }
+        } else {
+            relockTimerActive = false; // reset if any condition active
+        }
+    }
 
     // Intruder alert: PIR while locked
     static bool prevPIR = false;
@@ -1812,9 +1844,7 @@ void updateMidpointLED() {
         digitalWrite(PIN_MIDPOINT_LED, flashOn ? RELAY_ON : RELAY_OFF);
         return;
     }
-    const uint32_t wComms = FAULT_W_RS485_COMMS | FAULT_W_GROWATT_COMMS;
-    bool anyFault = ((wFaultFlags & ~wComms) != 0)
-                 || (hasHPacket && ((lastH.hFaultFlags & ~(uint32_t)FAULT_H_RS485_COMMS) != 0));
+    bool anyFault       = (wFaultFlags != 0) || (hasHPacket && lastH.hFaultFlags != 0);
     bool manualHeaterOn = hasHPacket && lastH.manualHeaterMode != MHM_OFF;
 
     uint8_t priority = anyFault ? 1 : (manualHeaterOn ? 2 : (!workshopLocked ? 3 : 4));
@@ -2186,6 +2216,8 @@ static void dbgFaults() {
     WF(FAULT_W_VAC_PUMP_OVERTIME,    "VAC_PUMP_OVERTIME")
     WF(FAULT_W_GROWATT_COMMS,         "SDM230_COMMS")
     WF(FAULT_W_RS485_COMMS,          "RS485_COMMS")
+    WF(FAULT_W_FAN1,                 "FAN1")
+    WF(FAULT_W_FAN2,                 "FAN2")
     WF(FAULT_W_WINCH_OVER_OPEN,      "WINCH_OVER_OPEN")
     WF(FAULT_W_SENSOR_SOLAR_HOT,     "SENSOR_SOLAR_HOT")
     WF(FAULT_W_SENSOR_SOLAR_COLD,    "SENSOR_SOLAR_COLD")
@@ -2256,9 +2288,6 @@ static void dbgFans() {
 
 static void dbgSecurity() {
     Serial.print(F("  locked:     ")); Serial.println(workshopLocked ? F("yes") : F("no"));
-    Serial.print(F("  unlock_btn: ")); Serial.println(digitalRead(PIN_UNLOCK_BTN) == HIGH ? F("HIGH") : F("LOW"));
-    Serial.print(F("  lock_sw:    ")); Serial.println(digitalRead(PIN_LOCK_SW) == HIGH ? F("ON") : F("off"));
-    Serial.print(F("  led_pin:    ")); Serial.println(digitalRead(PIN_MIDPOINT_LED) == RELAY_OFF ? F("OFF(ok)") : F("ON(masked)"));
     Serial.print(F("  door:       ")); Serial.println((digitalRead(PIN_DOOR_REED)       == LOW)  ? F("OPEN")   : F("closed"));
     Serial.print(F("  pir:        ")); Serial.println((digitalRead(PIN_PIR)              == HIGH) ? F("ACTIVE") : F("clear"));
     Serial.print(F("  winch_cls:  ")); Serial.println((digitalRead(PIN_WINCH_REED_CLOSE) == HIGH)  ? F("CLOSED") : F("open"));
@@ -2590,7 +2619,7 @@ void setup() {
     pinMode(PIN_WINCH_SAFETY,    INPUT_PULLUP);
     pinMode(PIN_VAC_SENSOR,      INPUT_PULLUP);
     pinMode(PIN_UNLOCK_BTN,      INPUT);  // voltage divider, no pull-up
-    pinMode(PIN_LOCK_SW,         INPUT);  // voltage divider, no pull-up
+    pinMode(PIN_LIGHT_BTN,       INPUT);  // voltage divider, no pull-up
     pinMode(PIN_MANUAL_RELOCK,   INPUT_PULLUP);
     pinMode(PIN_FAN_BTN,         INPUT_PULLUP);
     pinMode(PIN_WIN_OPEN_BTN,    INPUT_PULLUP);

@@ -287,6 +287,133 @@ Spec suggested ~200 entries. Code uses 80 (`~40 bytes × 80 = 3.2KB`) to stay wi
 
 ---
 
+## H Controller — 12V PSU relay debounce
+
+New on/off delays before switching the 12V backup PSU relay:
+- **ON**: 3s continuously below 12V → relay energises (`BUS_PSU_ON_DELAY_MS = 3000`)
+- **OFF**: 5s continuously above 12.5V (hysteresis threshold) → relay de-energises (`BUS_PSU_OFF_DELAY_MS = 5000`)
+
+Previously the relay switched immediately on threshold crossing. Delays prevent relay chatter on a fluctuating bus.
+
+---
+
+## H Controller — heater level table corrections
+
+Two entries in `kHeaterLevels[20]` changed to reduce the denominator (shorter burst period, lower line-frequency stress):
+
+| Index | Old | New |
+|---|---|---|
+| level 4 | `{3,7}` → 30.0% | `{2,5}` → 28.6% |
+| level 13 | `{7,3}` → 70.0% | `{5,2}` → 71.4% |
+
+---
+
+## H Controller — SOC test time-of-day aware thresholds
+
+SOC test start/pause SOC thresholds now depend on time of day:
+
+| Time | Start gate | Pause gate |
+|---|---|---|
+| Before 13:00 | 40% | 30% |
+| 13:00 and after | 65% | 55% |
+
+Previously hardcoded at 50% (start) / 40% (pause). Afternoon sessions need a higher SOC guard because the battery does not recover overnight between steps.
+
+New helper functions: `socTestStartSoc()`, `socTestPauseSoc()`.
+
+---
+
+## H Controller — SOC test flush timing reworked
+
+- SD flush window extended from 30ms → 100ms after last W packet. The 30ms guard never fired because `pollRS485` (debug serial + `Serial1.flush`) takes ~67ms alone.
+- `socTestFlushLog()` moved to **before** `pollRS485()` in the main loop (was after). This places the SD write in the 100–270ms quiet zone after the previous reply; `pollRS485` then runs immediately and catches the next W packet without delay.
+- `randomSeed(analogRead(A1))` added in `setup()` so the SCT shuffle order differs each boot.
+- `socTestLastLog = millis()` now set when entering SCT_HEATING from IDLE (not just on step transitions).
+
+---
+
+## W Controller — pin reassignments (second batch)
+
+| Signal | Old pin | New pin | Notes |
+|---|---|---|---|
+| `PIN_UNLOCK_BTN` | D10 | D46 | D10 shared with midpoint LED wire; moved to avoid masking condition |
+| `PIN_LIGHT_BTN` | D11 | — | Removed; functionality replaced by `PIN_LOCK_SW` |
+| `PIN_LOCK_SW` | — | D11 | New: lock switch (replaces light button) |
+| `PIN_ALARM_SOUNDER` | D26 | D24 | Swapped with solar cold direction relay |
+| `PIN_SOLAR_COLD_DIR` | D24 | D26 | Swapped with alarm sounder |
+
+Updated relay board layout (even board, D22–D36):
+
+| Pin | Load |
+|---|---|
+| D22 | UFH cold valve direction relay |
+| D24 | Alarm sounder |
+| D26 | Solar cold valve direction relay |
+| D28 | Fan flap actuator |
+| D30 | Door lock H-bridge relay A |
+| D32 | Door lock H-bridge relay B |
+| D34 | Vacuum isolation valve CLOSE |
+| D36 | Vacuum isolation valve OPEN |
+
+---
+
+## W Controller — security: light button replaced with lock switch
+
+`PIN_LIGHT_BTN` (D11) repurposed to `PIN_LOCK_SW` (D11):
+- **Removed**: external light toggle via D11 button
+- **New**: rising edge on `PIN_LOCK_SW` → immediately locks workshop (`doorLock.request(false)`, `workshopLocked = true`)
+- Auto-relock timer permanently disabled (`relockTimerActive = false` unconditionally; relock only via `PIN_LOCK_SW`)
+- `security` debug command now shows `unlock_btn`, `lock_sw`, and `led_pin` state
+
+---
+
+## W Controller — fan RPM fault detection disabled
+
+`updateFanRPM()` no longer raises stall faults. `fan1FaultStartMs`, `fan2FaultStartMs`, `fan1FaultActive`, `fan2FaultActive` are reset unconditionally each RPM period. `FAULT_W_FAN1` and `FAULT_W_FAN2` are never raised and removed from `dbgFaults()` output.
+
+Rationale: tachometer wiring not yet commissioned; false faults would mask real issues.
+
+---
+
+## W Controller — vacuum system: pump prewarm before valve open
+
+New `VAC_PUMP_START` state inserted between `VAC_IDLE` and `VAC_OPENING`:
+1. `VAC_IDLE` → `VAC_PUMP_START`: pump turns on immediately
+2. After `VAC_PUMP_PREWARM_MS` (2s): isolation valve opens → `VAC_OPENING`
+
+Previously the isolation valve opened first and the pump started only after the valve fully opened. Prewarm builds pressure before the valve exposes the vacuum circuit.
+
+`VAC_EXTRA_RUN_MS` increased from 300s (5 min) to 600s (10 min).
+
+---
+
+## W Controller — mid-point LED: comms faults excluded
+
+RS485 comms faults (`FAULT_W_RS485_COMMS`, `FAULT_W_GROWATT_COMMS`, `FAULT_H_RS485_COMMS`) masked out of the `anyFault` check in `updateMidpointLED()`. Only hardware faults trigger the fault-flash pattern.
+
+---
+
+## New diagnostic / test utility programs
+
+Not deployed to production controllers; compiled via separate PlatformIO environments.
+
+| Program | Environment | Purpose |
+|---|---|---|
+| `src/growatt_monitor/` | *(manual)* | Standalone Mega 2560: polls Growatt Modbus (Serial2/D16-D17, DE D47) and prints all data to USB serial once per 4-phase cycle |
+| `src/h_test_comms/` | *(manual)* | Standalone H-side RS485 listener: prints every valid W→H packet with uptime, sequence, temps, Growatt, pump duty, fault flags; reports missed sequences |
+| `src/w_sim/` | *(manual)* | W controller simulator: sends a fixed neutral `WToHPacket` to H every 250ms over RS485; prints H→W replies to USB serial |
+| `src/w_test/` | `controller_w_test` | Alternate W controller test build (`build_src_filter = +<w_test/*>`, COM5) |
+
+---
+
+## Build system changes
+
+- W controller upload/monitor port: COM3 → COM5
+- New PlatformIO environment `controller_w_test`: same libraries as `controller_w`, `build_src_filter = +<w_test/*>`, COM5
+- Root-level `platformio.ini` added at repo root (subset; `controller_w` + `controller_h` environments)
+
+---
+
 ## W Controller — solar pump control rework (second pass)
 
 ### `calcPumpDuty()` — heater floor removed, new curve (temporary)

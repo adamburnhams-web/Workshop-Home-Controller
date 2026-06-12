@@ -117,6 +117,8 @@ static const bool HEATER_AUTO_ENABLED = false;  // TEMP: set true to enable PV/b
 #define BUS_LOW_THRESH_DV       140      // 14.0V (×0.1V units)
 #define BUS_PSU_THRESH_DV       120      // 12.0V
 #define BUS_PSU_HYSTERESIS_DV   125      // 12.5V
+#define BUS_PSU_ON_DELAY_MS    3000UL   // 3s below threshold before PSU on
+#define BUS_PSU_OFF_DELAY_MS   5000UL   // 5s above hysteresis before PSU off
 #define BUS_RESTORE_THRESH_DV   140      // 14.0V
 #define BUS_LOW_DELAY_MS        10000UL  // 10s before fault
 #define HEATER_OVERHEAT_WARN_MS 20000UL  // 20s above 91°C = warning
@@ -242,7 +244,7 @@ static const HeaterLevel kHeaterLevels[20] PROGMEM = {
     {  1,  7,  143 },  // 14.3%
     {  1,  4,  200 },  // 20.0%
     {  1,  3,  250 },  // 25.0%
-    {  3,  7,  300 },  // 30.0%
+    {  2,  5,  286 },  // 28.6%
     {  1,  2,  333 },  // 33.3%
     {  2,  3,  400 },  // 40.0%
     {  3,  4,  429 },  // 42.9%
@@ -250,7 +252,7 @@ static const HeaterLevel kHeaterLevels[20] PROGMEM = {
     {  4,  3,  571 },  // 57.1%
     {  3,  2,  600 },  // 60.0%
     {  2,  1,  667 },  // 66.7%
-    {  7,  3,  700 },  // 70.0%
+    {  5,  2,  714 },  // 71.4%
     {  3,  1,  750 },  // 75.0%
     {  4,  1,  800 },  // 80.0%
     {  6,  1,  857 },  // 85.7%
@@ -570,6 +572,8 @@ const __FlashStringHelper* socTestPendingEvent = nullptr;
 
 float busVoltageV = 15.0f;
 bool  psu12vActive = false;
+unsigned long psu12vOnStartMs  = 0;
+unsigned long psu12vOffStartMs = 0;
 unsigned long busLowStartMs = 0;
 bool  busLowActive = false;
 
@@ -583,13 +587,30 @@ void updateBusVoltage() {
     readBusVoltage();
     uint16_t vdv = (uint16_t)(busVoltageV * 10.0f); // in 0.1V units
 
-    // 12V PSU relay
-    if (!psu12vActive && vdv < BUS_PSU_THRESH_DV) {
-        psu12vActive = true;
-        digitalWrite(PIN_PSU_12V, RELAY_ON);
-    } else if (psu12vActive && vdv >= BUS_PSU_HYSTERESIS_DV) {
-        psu12vActive = false;
-        digitalWrite(PIN_PSU_12V, RELAY_OFF);
+    // 12V PSU relay — 3s below 12V to turn on, 5s above 12.5V to turn off
+    unsigned long now = millis();
+    if (!psu12vActive) {
+        if (vdv < BUS_PSU_THRESH_DV) {
+            if (psu12vOnStartMs == 0) psu12vOnStartMs = now;
+            if (now - psu12vOnStartMs >= BUS_PSU_ON_DELAY_MS) {
+                psu12vActive = true;
+                psu12vOffStartMs = 0;
+                digitalWrite(PIN_PSU_12V, RELAY_ON);
+            }
+        } else {
+            psu12vOnStartMs = 0;
+        }
+    } else {
+        if (vdv >= BUS_PSU_HYSTERESIS_DV) {
+            if (psu12vOffStartMs == 0) psu12vOffStartMs = now;
+            if (now - psu12vOffStartMs >= BUS_PSU_OFF_DELAY_MS) {
+                psu12vActive = false;
+                psu12vOnStartMs = 0;
+                digitalWrite(PIN_PSU_12V, RELAY_OFF);
+            }
+        } else {
+            psu12vOffStartMs = 0;
+        }
     }
 
     // Bus low fault (< 14V for > 10s)
@@ -2817,7 +2838,9 @@ static void socTestScheduleLog(const __FlashStringHelper* event) {
 
 static void socTestFlushLog() {
     if (!socTestLogPending) return;
-    if (hasWPkt && (millis() - lastWPktMs) < 30) return;
+    // pollRS485 takes ~67ms (debug serial + Serial1.flush), so 30ms never fired.
+    // 100ms defers the write past the reply window into the pre-next-packet quiet zone.
+    if (hasWPkt && (millis() - lastWPktMs) < 100) return;
     socTestLogRow(socTestPendingEvent);
     socTestLogPending   = false;
     socTestPendingEvent = nullptr;
@@ -2850,14 +2873,19 @@ static void socTestNextStep() {
     socTestStartStep();
 }
 
+// Before 13:00: start at 40%, pause at 30%.  After 13:00: start at 65%, pause at 55%.
+static uint8_t socTestStartSoc() { return rtcHour() < 13 ? 40 : 65; }
+static uint8_t socTestPauseSoc() { return rtcHour() < 13 ? 30 : 55; }
+
 static void updateSocTest() {
     if (socTestState == SCT_IDLE) {
         if (HEATER_ENABLED && hasWPkt && !calHtrOverride
-            && pumpTestState == PT_IDLE && lastWPkt.battSocPct >= 50) {
+            && pumpTestState == PT_IDLE && lastWPkt.battSocPct >= socTestStartSoc()) {
             socTestShuffle();
             socTestStepIdx = 0;
             socTestActive  = true;
             socTestState   = SCT_HEATING;
+            socTestLastLog = millis();
             socTestStartStep();
         }
         return;
@@ -2868,7 +2896,7 @@ static void updateSocTest() {
     if (socTestState == SCT_PAUSED) {
         heaterRunning  = false;
         heaterLevelIdx = 0;
-        if (soc >= 50) {
+        if (soc >= socTestStartSoc()) {
             socTestState = SCT_HEATING;
             socTestStartStep();
             Serial.print(F("SCT: resumed — SOC ")); Serial.print(soc); Serial.println('%');
@@ -2881,14 +2909,14 @@ static void updateSocTest() {
         heaterLevelIdx = 0;
         socTestPriming = false;
         if (!heaterHardLockout) {
-            if (soc >= 40) { socTestState = SCT_HEATING; socTestNextStep(); }
-            else           { socTestState = SCT_PAUSED; }
+            if (soc >= socTestPauseSoc()) { socTestState = SCT_HEATING; socTestNextStep(); }
+            else                          { socTestState = SCT_PAUSED; }
         }
         return;
     }
 
     // SCT_HEATING
-    if (soc < 40) {
+    if (soc < socTestPauseSoc()) {
         heaterRunning  = false;
         heaterLevelIdx = 0;
         socTestPriming = false;
@@ -2933,14 +2961,17 @@ static void dbgSocTest() {
     socTestStepIdx = 0;
     socTestActive  = true;
     uint8_t soc = lastWPkt.battSocPct;
-    if (soc >= 50) {
+    if (soc >= socTestStartSoc()) {
         socTestState = SCT_HEATING;
         socTestStartStep();
     } else {
         socTestState = SCT_PAUSED;
-        Serial.print(F("SCT: started, SOC ")); Serial.print(soc); Serial.println(F("% — waiting for 50%"));
+        Serial.print(F("SCT: started, SOC ")); Serial.print(soc);
+        Serial.print(F("% — waiting for ")); Serial.print(socTestStartSoc()); Serial.println('%');
     }
-    Serial.println(F("SCT: 20 levels x 15min, SOC gate 40/50%, sct.csv"));
+    Serial.print(F("SCT: 20 levels x 15min, SOC gate "));
+    Serial.print(socTestPauseSoc()); Serial.print('/'); Serial.print(socTestStartSoc());
+    Serial.println(F("%, sct.csv"));
     Serial.println(F("SCT_HDR: timestamp,pct,hot_pipe,htr1,htr2,pump_pct,pred,event"));
 }
 
@@ -3055,6 +3086,7 @@ void powerUpSafeState() {
 
 void setup() {
     wdt_disable();
+    randomSeed(analogRead(A1));  // floating pin noise — ensures soc_test shuffle differs each boot
 #ifdef DEBUG_SERIAL
     Serial.begin(115200);
 #endif
@@ -3267,10 +3299,13 @@ void loop() {
         if (currentPage == 4) needPageRedraw = true;
     }
 
+    // SD flush before RS485: write fires 100-270ms after last reply (quiet zone),
+    // then pollRS485 immediately follows so it catches the next packet without delay.
+    socTestFlushLog();
+
     // Inter-controller RS485: reply before any display draw — TFT redraws can take
     // 100-300ms and W's receive window is only 150ms, so comms must come first.
     pollRS485();
-    socTestFlushLog();
     updateHPump();
 
     // Flush display after button events (draw happens after RS485 reply)

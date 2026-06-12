@@ -6,6 +6,10 @@
 .pioenvs/
 .piolibdeps/
 
+# Serial monitor logs and Python cache
+Heating Control/logs/
+**/__pycache__/
+
 # IDE files
 .vscode/
 *.suo
