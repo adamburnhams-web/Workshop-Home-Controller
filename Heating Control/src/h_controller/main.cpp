@@ -1122,7 +1122,7 @@ void updateSummerStartup() {
 // logic by sending MODE_SUMMER in the H→W packet without changing the stored systemMode.
 void updatePVExportOverride() {
     if (systemMode != MODE_WINTER) { pvExportOverride = false; return; }
-    bool pvActive = lastWPkt.growattValid ? ((lastWPkt.pv1W + lastWPkt.pv2W) >= 200) : (rtcHour() < 21);
+    bool pvActive = lastWPkt.growattValid ? ((lastWPkt.pv1W + lastWPkt.pv2W) >= 350) : (rtcHour() < 21);
     if (!pvExportOverride && lastWPkt.pvExportW >= 500) pvExportOverride = true;
     if (pvExportOverride && !pvActive)                   pvExportOverride = false;
 }
@@ -1384,8 +1384,7 @@ void drawStatusBar() {
 // ── Fault bar (bottom 20px) ───────────────────────────────
 
 const char* faultNameW(uint32_t mask) {
-    if (mask & FAULT_W_SOLAR_OVERHEAT_COLD)  return "Sol Ovht Cld";
-    if (mask & FAULT_W_SOLAR_OVERHEAT_HOT)   return "Sol Ovht Hot";
+if (mask & FAULT_W_SOLAR_OVERHEAT_HOT)   return "Sol Ovht Hot";
     if (mask & FAULT_W_SOLAR_PUMP)            return "Sol Pump Flt";
     if (mask & FAULT_W_SOLAR_PUMP_OVERCURRENT) return "Sol Pump OC";
     if (mask & FAULT_W_UFH_OVERHEAT)          return "UFH Overheat";
@@ -2846,13 +2845,46 @@ static void socTestFlushLog() {
     socTestPendingEvent = nullptr;
 }
 
+// HP cap matching normal mode: 100% at <=60°C, linear to 0% at 90°C.
+static uint8_t socTestHpCap() {
+    if (sFault[H_SENSOR_HOT_PIPE]) return 100;
+    float hp = sTemp[H_SENSOR_HOT_PIPE];
+    if (hp >= 90.0f) return 0;
+    if (hp > 60.0f)  return (uint8_t)((90.0f - hp) * (100.0f / 30.0f));
+    return 100;
+}
+
 static void socTestStartStep() {
+    // Skip any levels whose pct exceeds the current hp cap.
+    // Mirrors the normal-mode hot-pipe cap so we don't collect data outside
+    // the operating envelope the controller will actually use.
+    for (uint8_t skipped = 0; skipped < 20; skipped++) {
+        heaterLevelIdx = socTestShuffled[socTestStepIdx];
+        uint8_t cap = socTestHpCap();
+        if (heaterLevelPct() <= cap) break;
+        Serial.print(F("SCT: skip ")); Serial.print(heaterLevelPct());
+        Serial.print(F("% hp-cap=")); Serial.print(cap); Serial.println('%');
+        socTestStepIdx++;
+        if (socTestStepIdx >= 20) {
+            socTestStepIdx = 0;
+            socTestShuffle();
+            Serial.println(F("SCT: reshuffled"));
+        }
+        if (skipped == 19) {
+            // All levels capped — hp too hot to run any test level safely.
+            heaterRunning  = false;
+            heaterLevelIdx = 0;
+            socTestState   = SCT_PAUSED;
+            Serial.println(F("SCT: all levels hp-capped — paused"));
+            return;
+        }
+    }
+
     uint32_t now = millis();
     logBurnerCold.request(false);
     botTankValve.request(true);
     twoPortValve.request(true);
     heaterRunning      = true;
-    heaterLevelIdx     = socTestShuffled[socTestStepIdx];
     socTestPriming     = true;
     socTestPrimeEndMs  = now + 10000UL;
     socTestStepStart   = now;
@@ -2873,9 +2905,13 @@ static void socTestNextStep() {
     socTestStartStep();
 }
 
-// Before 13:00: start at 40%, pause at 30%.  After 13:00: start at 65%, pause at 55%.
-static uint8_t socTestStartSoc() { return rtcHour() < 13 ? 40 : 65; }
-static uint8_t socTestPauseSoc() { return rtcHour() < 13 ? 30 : 55; }
+// 07:30–13:00: start at 30%, pause at 20%.  All other times: start at 80%, pause at 70%.
+static bool socTestMorningWindow() {
+    uint8_t h = rtcHour(), m = rtcMinute();
+    return (h > 7 || (h == 7 && m >= 30)) && h < 13;
+}
+static uint8_t socTestStartSoc() { return socTestMorningWindow() ? 30 : 80; }
+static uint8_t socTestPauseSoc() { return socTestMorningWindow() ? 20 : 70; }
 
 static void updateSocTest() {
     if (socTestState == SCT_IDLE) {
@@ -3225,12 +3261,19 @@ void loop() {
         if (gridOk != gridPresent) {
             gridPresent = gridOk;
             if (!gridOk) {
-                setFaultH(FAULT_H_GRID_OUTAGE);
+                lastGridLossMs = millis();  // start outage timer
                 heaterLevelIdx = 0;
                 PORTA &= ~(1 << PA5);
             } else {
                 clearFaultH(FAULT_H_GRID_OUTAGE);
+                gridOutageFault = false;
+                lastGridLossMs  = 0;
             }
+        }
+        // Fault set only after 5s sustained outage — ignores brief glitches
+        if (!gridPresent && !gridOutageFault && millis() - lastGridLossMs >= 5000UL) {
+            gridOutageFault = true;
+            setFaultH(FAULT_H_GRID_OUTAGE);
         }
     }
 

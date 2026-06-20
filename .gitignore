@@ -6,8 +6,9 @@
 .pioenvs/
 .piolibdeps/
 
-# Serial monitor logs and Python cache
+# Serial monitor logs and Python cache (but keep analysis scripts)
 Heating Control/logs/
+!Heating Control/logs/*.py
 **/__pycache__/
 
 # IDE files

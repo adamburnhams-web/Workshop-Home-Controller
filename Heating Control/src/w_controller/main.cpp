@@ -82,6 +82,9 @@
 // UART1 (Serial1 D18/D19): inter-controller RS485 link
 // UART2 (Serial2 D16/D17): Growatt Modbus RS485
 
+// Set false to re-enable once workshop air sensor is trusted
+static const bool FIRE_ALARM_ENABLED = false;
+
 // ============================================================
 //  COMMISSIONING CONSTANTS — must be verified on-site
 // ============================================================
@@ -127,7 +130,6 @@ static const uint16_t VALVE_POWERUP_WAIT_MS = 30000;
 #define FROST_STOP_C         80   // 8.0°C — frost protection stop
 #define UFH_PUMP_OFF_C      280   // 28.0°C — stop UFH pump when supply drops here
 #define UFH_OVERHEAT_C      450   // 45.0°C — hard lockout trigger
-#define SOLAR_OVERHEAT_COLD_DELTA 100 // 10.0°C above tank bottom
 #define RELOCK_TIMEOUT_MS  300000UL  // 5 minutes
 #define ALARM_DURATION_MS   60000UL  // 1-minute alarm auto-stop
 #define HANDLE_ALERT_NIGHT_MIN_MS 10000UL
@@ -218,8 +220,9 @@ bool     pumpCurrentSampled = false;
 unsigned long pumpAboveClockingMs = 0; // time pump stayed above clocking speed
 bool     pumpAboveClocking = false;
 
-// Pump speed override state (fast-rise 5s@100%, fast-drop 10s@0%, periodic 1s kick)
+// Pump speed override state (fast-rise 5s@100%, fast-drop 10s@0%, cold-hot 20s@100%, periodic 1s kick)
 uint8_t       pumpSpdOvMode     = 0;    // 0=none, 1=5s@100%, 2=10s@0%
+unsigned long coldFlushUntilMs  = 0;
 unsigned long pumpSpdOvStartMs  = 0;
 bool          hotRiseTracking   = false;
 unsigned long hotRiseCrossMs    = 0;
@@ -493,15 +496,13 @@ bool solarDumpUFHOn   = false; // UFH pump running for emergency solar dump; sen
 bool frostProtActive = false;
 bool frostProtUFHOpen = false;
 
-unsigned long solarOverspeedStartMs = 0;
-bool          solarOverspeedTracking = false;
-
 // ============================================================
 //  MID-POINT LED
 // ============================================================
 
 bool          ledBlinkHigh    = false;
 unsigned long ledBlinkMs      = 0;
+unsigned long unlockSuppressUntilMs = 0; // blocks unlock for 100ms after LED ON→OFF transition
 
 // ============================================================
 //  RS485 INTER-CONTROLLER
@@ -858,14 +859,20 @@ static void resetSolarPumpOverrides() {
     hotWasAboveHigh  = false;
     hotPrevAboveLow  = false;
     kick60Active     = false;
+    coldFlushUntilMs = 0;
 }
 
-// Returns final pump duty after applying three speed override rules.
+// Returns final pump duty after applying four speed override rules.
 // Rule 1: if pipe > 60°C and baseDuty < 4%, run 100% for 1s every 60s.
 // Rule 2: if hot rises from target-2.5 to target-2.0 in < 15s → 5s @ 100%.
 // Rule 3: if hot was > target+2.5 and drops to ≤ target+2.0 → 0% for 10s.
+// Rule 4: if cold >= 80°C → flush at 100% for 20s (overrides all other rules).
 static uint8_t applyPumpSpeedOverrides(uint8_t baseDuty, float hot, float cold, float targetC) {
     unsigned long now = millis();
+
+    // Rule 4: cold return too hot — flush hard. Overrides mode 2 pause intentionally.
+    if (cold >= 80.0f) coldFlushUntilMs = now + 20000UL;
+    if (now < coldFlushUntilMs) return 100;
 
     // Rule 3: track above-target excursion; trigger 10s zero on drop to target+2.0
     if (hot > targetC + 2.5f) hotWasAboveHigh = true;
@@ -1012,9 +1019,15 @@ void updateVacuum() {
     bool vacSensorFull = (digitalRead(PIN_VAC_SENSOR) == LOW);
     unsigned long now  = millis();
 
+    // Solar start edge: if vacuum already full when solar kicks in, force a top-up run
+    static bool prevSolarActive = false;
+    bool solarJustStarted = !prevSolarActive && solarPumpActive;
+    prevSolarActive = solarPumpActive;
+
     switch (vacState) {
         case VAC_IDLE:
-            if (heatingOrSolarActive && !vacFullThisSession) {
+            if ((heatingOrSolarActive && !vacFullThisSession)
+                || (solarJustStarted && vacSensorFull)) {
                 digitalWrite(PIN_VAC_PUMP, RELAY_ON);
                 vacStateEnteredMs = now;
                 vacState = VAC_PUMP_START;
@@ -1168,29 +1181,6 @@ void updateWinterSolar(float tankBottomC) {
         finalDuty = 0;
     setSolarPumpDuty(finalDuty);
 
-    // Overspeed fault: pump above minimum for > 10s AND cold > tankBottom + 10°C
-    // If tank bottom is stale: skip fault check
-    bool pumpAboveMin = (duty > 1);
-    if (pumpAboveMin && !tankBotStale && !sFault[SENSOR_SOLAR_COLD]) {
-        float tankBot = tankBottomC;
-        if (cold > tankBot + 10.0f) {
-            if (!solarOverspeedTracking) {
-                solarOverspeedTracking = true;
-                solarOverspeedStartMs  = millis();
-            } else if (millis() - solarOverspeedStartMs > 10000UL) {
-                setFault(FAULT_W_SOLAR_OVERHEAT_COLD);
-                // Dump through UFH
-                ufhColdValve.setOpen();
-                solarColdValve.setOpen();
-            }
-        } else {
-            solarOverspeedTracking = false;
-            clearFault(FAULT_W_SOLAR_OVERHEAT_COLD);
-        }
-    } else {
-        solarOverspeedTracking = false;
-        if (!pumpAboveMin) clearFault(FAULT_W_SOLAR_OVERHEAT_COLD);
-    }
 
     // Stop condition: hot no longer > cold + 2°C
     if ((hot - cold) <= 2.0f) {
@@ -1338,22 +1328,6 @@ void updateSummerSolar() {
         setSolarPumpDuty(finalDuty);
     }
 
-    // Overspeed overheat fault (same as winter)
-    bool pumpAboveMin = (duty > 1);
-    if (pumpAboveMin && !tankBotStale && !sFault[SENSOR_SOLAR_COLD]) {
-        float cold2 = sTemp[SENSOR_SOLAR_COLD];
-        if (cold2 > tankBotC + 10.0f) {
-            if (!solarOverspeedTracking) {
-                solarOverspeedTracking = true;
-                solarOverspeedStartMs  = millis();
-            } else if (millis() - solarOverspeedStartMs > 10000UL) {
-                setFault(FAULT_W_SOLAR_OVERHEAT_COLD);
-            }
-        } else {
-            solarOverspeedTracking = false;
-            clearFault(FAULT_W_SOLAR_OVERHEAT_COLD);
-        }
-    }
 
     // Hot side overheat: tank bottom < 70°C AND solar hot > 91°C AND pump at 100%
     if (!tankBotStale && tankBotC < 70.0f && hot > 91.0f && duty == 100) {
@@ -1506,7 +1480,8 @@ void updateSecurity() {
                      && (digitalRead(PIN_WINCH_REED_LOCK)  == HIGH);
 #endif
     bool unlockBtn    = (digitalRead(PIN_UNLOCK_BTN)    == HIGH)
-                     && (digitalRead(PIN_MIDPOINT_LED) == RELAY_OFF);
+                     && (digitalRead(PIN_MIDPOINT_LED) == RELAY_OFF)
+                     && (millis() >= unlockSuppressUntilMs);
     bool lockSw = (digitalRead(PIN_LOCK_SW) == HIGH);
     unsigned long now = millis();
 
@@ -1575,8 +1550,7 @@ void updateSecurity() {
     }
 
     // Fault-based buzzer: solar overheat, pump fault, or fire alarm
-    buzzerActive |= hasFault(FAULT_W_SOLAR_OVERHEAT_COLD)
-                 || hasFault(FAULT_W_SOLAR_OVERHEAT_HOT)
+    buzzerActive |= hasFault(FAULT_W_SOLAR_OVERHEAT_HOT)
                  || hasFault(FAULT_W_SOLAR_PUMP)
                  || fireAlarmActive;
 
@@ -1847,6 +1821,14 @@ void updateMidpointLED() {
         // Priority 4: off
         digitalWrite(PIN_MIDPOINT_LED, RELAY_OFF);
     }
+
+    // Detect ON→OFF transition; set suppress window so unlock ignores coupling spike
+    static uint8_t prevMidLed = RELAY_OFF;
+    uint8_t curMidLed = digitalRead(PIN_MIDPOINT_LED);
+    if (prevMidLed == RELAY_ON && curMidLed == RELAY_OFF) {
+        unlockSuppressUntilMs = now + 100UL;
+    }
+    prevMidLed = curMidLed;
 }
 
 // ============================================================
@@ -2178,8 +2160,7 @@ static void dbgValves() {
 static void dbgFaults() {
     bool any = false;
     #define WF(m,n) if(hasFault(m)){Serial.println(F("  " n));any=true;}
-    WF(FAULT_W_SOLAR_OVERHEAT_COLD,  "SOLAR_OVERHEAT_COLD")
-    WF(FAULT_W_SOLAR_OVERHEAT_HOT,   "SOLAR_OVERHEAT_HOT")
+WF(FAULT_W_SOLAR_OVERHEAT_HOT,   "SOLAR_OVERHEAT_HOT")
     WF(FAULT_W_SOLAR_PUMP,           "SOLAR_PUMP")
     WF(FAULT_W_UFH_OVERHEAT,         "UFH_OVERHEAT")
     WF(FAULT_W_FROST_NOT_RECOVERING, "FROST_NOT_RECOVERING")
@@ -2735,7 +2716,7 @@ void loop() {
     updateNightCooling();
 
     // Fire alarm
-    updateFireAlarm();
+    if (FIRE_ALARM_ENABLED) updateFireAlarm();
 
     // Mid-point LED
     updateMidpointLED();

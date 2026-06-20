@@ -28,11 +28,12 @@ platformio run -e controller_w --target upload
 ## Key files
 | File | Purpose |
 |---|---|
-| `Heating Control/src/h_controller/main.cpp` | H controller — ~2500 lines |
+| `Heating Control/src/h_controller/main.cpp` | H controller — ~2600 lines |
 | `Heating Control/src/w_controller/main.cpp` | W controller — ~2200 lines |
 | `Heating Control/include/shared_types.h` | Shared enums, packet structs, fault flags |
 | `Heating Control/include/rs485_packet.h` | RS485 framing, CRC-16/Modbus, encode/decode |
 | `Heating Control/platformio.ini` | Build environments |
+| `Heating Control/logs/make_hpump_cal.py` | Parses all sct*.csv files → hpump_cal.xlsx calibration spreadsheet |
 
 ## RS485 inter-controller link
 - **W → H**: `WToHPacket` (sensors, Growatt data, valve/security state, fan state)
@@ -55,6 +56,8 @@ Both controllers have `#define DEBUG_SERIAL` at the top. Remove to strip all deb
 `cal_abort` — abort calibration, restore normal control
 `pump_test` — sweep heater through 28 power levels and log pump/temp data
 `stress_test` — sweep heater through 9 low/mid power levels repeatedly
+`soc_test` — manually trigger 20-level SOC calibration sweep (auto-starts based on SOC/time)
+`soc_test_abort` — abort running SOC test
 
 Set sensors: `tank_bot` `tank_mid` `tank_top` `hot_pipe` `cold_pipe` `htr_out` `htr_out_2` `log_burner` `pv_export` `batt_soc`
 Use `val=999` to clear a sim override.
@@ -80,6 +83,17 @@ All addresses are filled in (commissioning complete for both controllers).
 - H controller (7 sensors): [src/h_controller/main.cpp ~line 77](Heating Control/src/h_controller/main.cpp) — `tank_bot`, `tank_mid`, `tank_top`, `hot_pipe`, `cold_pipe`, `htr_out` (sensor 12), `htr_out_2` (sensor 13)
 - W controller (6 sensors): [src/w_controller/main.cpp ~line 91](Heating Control/src/w_controller/main.cpp) — `solar_hot`, `solar_cold`, `ufh_supply`, `ufh_post_tmv`, `workshop_air`, `outside_air`
 
+## SCT (SOC Calibration Test) — H controller
+20-level heater sweep, each step 15 min, logging every 2s to `sct.csv` on SD card.
+- **SOC gates**: 07:30–13:00 start=30%/pause=20%; other times start=80%/pause=70%
+- **HP cap skip**: steps whose pct exceeds the normal-mode hot-pipe cap `(90-hp)*100/30` are skipped automatically (serial logs `SCT: skip X% hp-cap=Y%`)
+- **OVERHEAT**: cuts step at 93°C heater outlet, cools before next step
+- **Columns**: `timestamp, pct, hot_pipe, htr1, htr2, pump_pct, pred, event`
+- **Analysis**: run `python make_hpump_cal.py` in `logs/` → `hpump_cal.xlsx`
+  - Per-sheet (one per heater level): overall avg + avg midpoint est @ 85°C in cols A–C, then per-step pairs (obs | midpoint est) in cols D+
+  - Midpoint est = `(avg_pump + linear_pump85) / 2`
+  - Levels 30% and 70% (old firmware) excluded automatically
+
 ## Commissioning TODOs
 - [ ] Calibrate `SOLAR_PUMP_MIN_CURRENT_A` (INA219, W controller)
 - [ ] Calibrate `FAN_MIN_DUTY_PCT` (W controller)
@@ -89,6 +103,7 @@ All addresses are filled in (commissioning complete for both controllers).
 - [ ] Test Growatt Modbus on Serial2 (W controller, separate MAX485)
 - [ ] Run `cal_pump` on H controller to derive H-pump duty calibration curve
 - [ ] Replace temporary `calcPumpDuty()` curve in W controller with data-derived version
+- [ ] Re-enable fire alarm (`FIRE_ALARM_ENABLED = false` at top of w_controller/main.cpp)
 
 ## Code conventions
 - No `String` class anywhere — char arrays and `F()` macros only

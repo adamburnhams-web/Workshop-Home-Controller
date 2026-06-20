@@ -127,7 +127,6 @@ static const uint16_t VALVE_POWERUP_WAIT_MS = 30000;
 #define FROST_STOP_C         80   // 8.0°C — frost protection stop
 #define UFH_PUMP_OFF_C      280   // 28.0°C — stop UFH pump when supply drops here
 #define UFH_OVERHEAT_C      450   // 45.0°C — hard lockout trigger
-#define SOLAR_OVERHEAT_COLD_DELTA 100 // 10.0°C above tank bottom
 #define RELOCK_TIMEOUT_MS  300000UL  // 5 minutes
 #define ALARM_DURATION_MS   60000UL  // 1-minute alarm auto-stop
 #define HANDLE_ALERT_NIGHT_MIN_MS 10000UL
@@ -491,9 +490,6 @@ bool solarActiveEver  = false; // for vacuum system "heating active" check
 bool solarDumpUFHOn   = false; // UFH pump running for emergency solar dump; sent to H
 bool frostProtActive = false;
 bool frostProtUFHOpen = false;
-
-unsigned long solarOverspeedStartMs = 0;
-bool          solarOverspeedTracking = false;
 
 // ============================================================
 //  MID-POINT LED
@@ -1181,29 +1177,6 @@ void updateWinterSolar(float tankBottomC) {
         finalDuty = 0;
     setSolarPumpDuty(finalDuty);
 
-    // Overspeed fault: pump above minimum for > 10s AND cold > tankBottom + 10°C
-    // If tank bottom is stale: skip fault check
-    bool pumpAboveMin = (duty > 1);
-    if (pumpAboveMin && !tankBotStale && !sFault[SENSOR_SOLAR_COLD]) {
-        float tankBot = tankBottomC;
-        if (cold > tankBot + 10.0f) {
-            if (!solarOverspeedTracking) {
-                solarOverspeedTracking = true;
-                solarOverspeedStartMs  = millis();
-            } else if (millis() - solarOverspeedStartMs > 10000UL) {
-                setFault(FAULT_W_SOLAR_OVERHEAT_COLD);
-                // Dump through UFH
-                ufhColdValve.setOpen();
-                solarColdValve.setOpen();
-            }
-        } else {
-            solarOverspeedTracking = false;
-            clearFault(FAULT_W_SOLAR_OVERHEAT_COLD);
-        }
-    } else {
-        solarOverspeedTracking = false;
-        if (!pumpAboveMin) clearFault(FAULT_W_SOLAR_OVERHEAT_COLD);
-    }
 
     // Stop condition: hot no longer > cold + 2°C
     if ((hot - cold) <= 2.0f) {
@@ -1351,22 +1324,6 @@ void updateSummerSolar() {
         setSolarPumpDuty(finalDuty);
     }
 
-    // Overspeed overheat fault (same as winter)
-    bool pumpAboveMin = (duty > 1);
-    if (pumpAboveMin && !tankBotStale && !sFault[SENSOR_SOLAR_COLD]) {
-        float cold2 = sTemp[SENSOR_SOLAR_COLD];
-        if (cold2 > tankBotC + 10.0f) {
-            if (!solarOverspeedTracking) {
-                solarOverspeedTracking = true;
-                solarOverspeedStartMs  = millis();
-            } else if (millis() - solarOverspeedStartMs > 10000UL) {
-                setFault(FAULT_W_SOLAR_OVERHEAT_COLD);
-            }
-        } else {
-            solarOverspeedTracking = false;
-            clearFault(FAULT_W_SOLAR_OVERHEAT_COLD);
-        }
-    }
 
     // Hot side overheat: tank bottom < 70°C AND solar hot > 91°C AND pump at 100%
     if (!tankBotStale && tankBotC < 70.0f && hot > 91.0f && duty == 100) {
@@ -1607,8 +1564,7 @@ void updateSecurity() {
     }
 
     // Fault-based buzzer: solar overheat, pump fault, or fire alarm
-    buzzerActive |= hasFault(FAULT_W_SOLAR_OVERHEAT_COLD)
-                 || hasFault(FAULT_W_SOLAR_OVERHEAT_HOT)
+    buzzerActive |= hasFault(FAULT_W_SOLAR_OVERHEAT_HOT)
                  || hasFault(FAULT_W_SOLAR_PUMP)
                  || fireAlarmActive;
 
@@ -2208,8 +2164,7 @@ static void dbgValves() {
 static void dbgFaults() {
     bool any = false;
     #define WF(m,n) if(hasFault(m)){Serial.println(F("  " n));any=true;}
-    WF(FAULT_W_SOLAR_OVERHEAT_COLD,  "SOLAR_OVERHEAT_COLD")
-    WF(FAULT_W_SOLAR_OVERHEAT_HOT,   "SOLAR_OVERHEAT_HOT")
+WF(FAULT_W_SOLAR_OVERHEAT_HOT,   "SOLAR_OVERHEAT_HOT")
     WF(FAULT_W_SOLAR_PUMP,           "SOLAR_PUMP")
     WF(FAULT_W_UFH_OVERHEAT,         "UFH_OVERHEAT")
     WF(FAULT_W_FROST_NOT_RECOVERING, "FROST_NOT_RECOVERING")
