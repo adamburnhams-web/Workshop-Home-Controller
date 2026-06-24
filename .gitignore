@@ -9,6 +9,7 @@
 # Serial monitor logs and Python cache (but keep analysis scripts)
 Heating Control/logs/
 !Heating Control/logs/*.py
+!Heating Control/logs/new_pump/*.py
 **/__pycache__/
 
 # IDE files

@@ -20,8 +20,8 @@ Output: hpump_cal.xlsx
   20 sheets, one per heater level (named "5%", "10%", ... "100%")
   Row 1   : headers
   Per HP temp (15-85°C), two rows:
-    Row A : "htr out" | overall avg htr | 85 | 85 | step1_avg_htr | 85 | step2_avg_htr | 85 | ...
-    Row B : HP temp   | overall avg pump | lin_85 | pl_85 | step1_avg_pump | step1_lin_85 | ...
+    Row A : "htr out" | overall avg htr | 85 | step1_avg_htr | 85 | step2_avg_htr | 85 | ...
+    Row B : HP temp   | overall avg pump | avg midpoint est @ 85°C | step1_avg_pump | step1_midpoint | ...
   Steps are in the order they were collected (chronological across files).
 """
 
@@ -147,10 +147,7 @@ def parse_sct(path, cutoff_ts=None):
     flush_step(step_pct, step_stable)  # commit any open step at EOF
 
 
-import datetime as _dt
-SCT_CUTOFFS = {
-    'sct8.csv': _dt.datetime(2026, 6, 23, 14, 9, 5),  # exclude 12 post-OVERHEAT steps
-}
+SCT_CUTOFFS = {}  # add entries here to exclude post-event data: 'sctN.csv': datetime(...)
 
 for fn in sorted(os.listdir(LOG_DIR)):
     if fn.lower().startswith('sct') and fn.lower().endswith('.csv'):
@@ -177,14 +174,6 @@ def pump85_linear(avg_htr, avg_pump, hp_nom):
     if hp_nom >= 85 or avg_htr <= hp_nom:
         return None
     result = avg_pump * (avg_htr - hp_nom) / (85.0 - hp_nom)
-    return max(4.0, min(100.0, result))
-
-def pump85_pl(avg_htr, avg_pump, hp_nom, pct):
-    if hp_nom >= 85 or avg_htr <= hp_nom:
-        return None
-    alpha  = 1.534 - 0.734 * math.log(pct)
-    ratio  = (85.0 - hp_nom) / (avg_htr - hp_nom)
-    result = avg_pump * (ratio ** alpha)
     return max(4.0, min(100.0, result))
 
 

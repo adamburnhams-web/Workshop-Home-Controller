@@ -42,6 +42,7 @@ enum WinchState : uint8_t {
 // ── Fault flag bitmask (shared between both controllers) ────
 
 // W-side faults (in wFaultFlags)
+#define FAULT_W_SOLAR_OVERHEAT_COLD  (1UL << 0)
 #define FAULT_W_SOLAR_OVERHEAT_HOT   (1UL << 1)
 #define FAULT_W_SOLAR_PUMP           (1UL << 2)
 #define FAULT_W_SOLAR_PUMP_OVERCURRENT (1UL << 7)

@@ -620,3 +620,86 @@ Replaces `pumpClockPeriodMs` / `pumpMinOnMs` dynamic period scheme. Variables an
 | — | 100% | continuous | — | — |
 
 All zone boundaries transition smoothly (same on/off at crossover points). Zones 0, A, B, D give actual duty = input% exactly. Zone C uses on growing linearly 400→800ms with off derived from the ratio, giving near-exact tracking.
+
+---
+
+## H Controller (h_new) — source directory split
+
+`controller_h` and `controller_h_new` now build from separate source directories:
+
+| Environment | Source | Description |
+|---|---|---|
+| `controller_h` | `src/h_controller/` | Stable production firmware (main branch) |
+| `controller_h_new` | `src/h_controller_new/` | New H controller firmware (h_new branch) |
+
+All changes below apply only to `controller_h_new` unless stated otherwise.
+
+---
+
+## H Controller (h_new) — `calcPred` rewrite: per-level lookup table
+
+Replaced the global log/exp blended formula with a 20-entry lookup table keyed by exact heater level percentage. Formula per level: `pump = k / (85 − hp)^alpha`, clamped to [4, 100].
+
+k and alpha fitted from SCT calibration data via log-linear regression per level, then smoothed as degree-2 polynomials in `log(pct)` to eliminate crossovers. Forced levels (5%, 10%, 14%) use proportionally scaled k from the 20% fit: `k = k_at_20 × (pct / 20.0)`, `alpha = alpha_at_20`.
+
+Lookup uses an exact match scan (levels are always one of the 20 discrete values — no interpolation needed). Falls through to the last entry (100%) if no match.
+
+| Level % | k | alpha |
+|---|---|---|
+| 5 | 32.3 | 0.811 |
+| 10 | 64.6 | 0.811 |
+| 14 | 90.4 | 0.811 |
+| 20 | 129.2 | 0.811 |
+| 25 | 417.8 | 1.079 |
+| 29 | 838.7 | 1.232 |
+| 33 | 1456.7 | 1.349 |
+| 40 | 3015.8 | 1.494 |
+| 43 | 3850.9 | 1.539 |
+| 50 | 6090.9 | 1.619 |
+| 57 | 8575.3 | 1.671 |
+| 60 | 9665.5 | 1.687 |
+| 67 | 12168.6 | 1.713 |
+| 71 | 13531.5 | 1.722 |
+| 75 | 14819.5 | 1.728 |
+| 80 | 16301.9 | 1.732 |
+| 86 | 17868.6 | 1.731 |
+| 90 | 18775.9 | 1.728 |
+| 95 | 19752.6 | 1.722 |
+| 100 | 20556.2 | 1.714 |
+
+---
+
+## H Controller (h_new) — H pump: hot pipe ≥ 80°C forces 100%
+
+In `calcHPumpDuty()`, after reading `hotPipeC`: if `hotPipeC >= 80.0f` return 100% immediately. Applies when heater is on — the heater check gates the function earlier. Rationale: at high inlet temperatures even low power levels risk pushing the outlet over 85°C without full pump.
+
+---
+
+## H Controller (h_new) — overheat thresholds reworked
+
+Previous behaviour (from main branch):
+- 91–92°C: absolute heater cap 100%→0%
+- ≥ 93°C: hard lockout
+
+New behaviour:
+- **91–93.5°C**: proportional heater cap — scales the *current demand level* linearly from 100% to 0% over this range: `cap = heaterLevelPct() × (1 − (hOut − 91) / 2.5)`. Regardless of what the heater is set to, reduction starts at 91°C and reaches 0% at 93.5°C.
+- **≥ 94°C**: hard lockout (was 93°C)
+
+Using proportional rather than absolute cap means the reduction starts immediately at 91°C for any demand level, not only when the absolute cap drops below the current level.
+
+Hard lockout auto-clears when outlet < 88°C with at least one sensor live (unchanged).
+
+---
+
+## H Controller (h_new) — SCT CSV: W pump column added
+
+`sct.csv` now has 9 columns (was 8):
+
+`timestamp, pct, hot_pipe, htr1, htr2, h_pump_pct, w_pump_pct, pred, event`
+
+`w_pump_pct` = `lastWPkt.solarPumpDutyPct` at time of log row; 0 if no W packet received.
+
+`make_hpump_cal.py` (both `logs/` and `logs/new_pump/`) updated:
+- Detects format by column count: `len(row) >= 9` → new format
+- Reads event from index 8 (new) or index 7 (old)
+- Discards any data row where `w_pump_pct > 0` and resets the stability buffer — W solar pump running changes thermal conditions and invalidates H pump calibration data for that row
