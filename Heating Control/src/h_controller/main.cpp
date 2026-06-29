@@ -249,14 +249,23 @@ bool hotTankProtection = false;
 bool morningHeatActive = false;
 bool heaterOvheatWarn = false;
 unsigned long heaterOvheatWarnMs = 0;
+bool          importTripActive  = false;
+unsigned long importHighStartMs = 0;
+unsigned long importZeroStartMs = 0;
 bool gridPresent                 = true;
 unsigned long lastGridLossMs     = 0;
 bool gridOutageFault             = false;
+bool          pvExportOverride   = false; // true = PV export ≥500W for ≥60s in WINTER mode → allow heater + send MODE_SUMMER to W
+unsigned long pvExport500StartMs = 0;
 
 float         hPumpDuty        = 0.0f;
 bool          hPumpOutputState = false;
 unsigned long hPumpOnMs        = 0;
 unsigned long hPumpOffMs       = 0;
+
+enum FlushState : uint8_t { FLUSH_IDLE, FLUSH_ACTIVE, FLUSH_PAUSE };
+FlushState flushState = FLUSH_IDLE;
+uint32_t   flushTimer = 0;
 
 // Zero-crossing ISR — runs every 10ms on 50Hz grid (every half-cycle)
 // Bresenham spread firing: pulses distributed evenly rather than burst,
@@ -306,6 +315,9 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
         heaterTargetPct = 0; heaterRunning = false; return;
     }
     if (heaterHardLockout) {
+        heaterTargetPct = 0; heaterRunning = false; return;
+    }
+    if (importTripActive) {
         heaterTargetPct = 0; heaterRunning = false; return;
     }
     if (hotTankProtection) {
@@ -359,14 +371,9 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
         int16_t battChgW   = lastWPkt.battChargeW;
         int32_t netGridW   = (int32_t)pvExportW - gridImportW;
         int32_t battW      = (int32_t)min((int16_t)0, battChgW);
-        // When battery is well charged, include charging power in available headroom
-        // so the heater can absorb PV that would otherwise just top off a full battery.
-        // Reservation reduces as SOC rises to protect remaining charge capacity.
-        // Before noon the threshold is lower (50%) to front-load hot water earlier.
-        bool    socReserve    = (rtcHour() < 12) ? (soc > 50) : (soc > 80);
-        int32_t reservationW  = socReserve ? 1100L : 0L;
-        if      (soc > 97) reservationW = 200L;
-        else if (soc > 90) reservationW = 500L;
+        // Before noon: 1kW reservation always.
+        // After noon: no reservation until SOC > 80% (battery charges freely), then 1kW.
+        int32_t reservationW = (rtcHour() < 12 || soc > 80) ? 1000L : 0L;
         int32_t available = (reservationW > 0)
             ? (int32_t)pvExportW - gridImportW + (int32_t)battChgW + heaterCurrentW - reservationW
             : netGridW + heaterCurrentW + battW - 100L;
@@ -383,7 +390,9 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
         zeroCount = 0; rawPctAccum = 0; accumCount = 0;
         if (rawPct == 0) return;
         if (!highSoc) {
-            if (rawPct < 17) { surplusStartMs = 0; return; }  // ~500W threshold
+            // 500W threshold when solar is off; 150W (5%) when solar is already running
+            uint8_t startThreshPct = lastWPkt.solarPumpActive ? 5 : 17;
+            if (rawPct < startThreshPct) { surplusStartMs = 0; return; }
             if (surplusStartMs == 0) surplusStartMs = millis();
             if (millis() - surplusStartMs < 5000UL) return;
         }
@@ -439,6 +448,44 @@ uint32_t hFaultFlags = 0;
 void setFaultH(uint32_t m)   { hFaultFlags |= m; }
 void clearFaultH(uint32_t m) { hFaultFlags &= ~m; }
 bool hasFaultH(uint32_t m)   { return (hFaultFlags & m) != 0; }
+
+// ============================================================
+//  HEATER IMPORT TRIP  (inverter CB tripped while panels producing)
+// ============================================================
+
+void checkHeaterImportTrip(int16_t gridImportW, bool growattValid) {
+    if (!growattValid) return;
+    unsigned long now     = millis();
+    int16_t       heaterW = (int16_t)((int32_t)heaterTargetPct * 3000L / 100L);
+    bool          importHigh = heaterRunning && heaterW > 0 && gridImportW >= heaterW;
+
+    if (!importTripActive) {
+        if (importHigh) {
+            if (!importHighStartMs) importHighStartMs = now;
+            if (now - importHighStartMs >= 20000UL) {
+                importTripActive  = true;
+                importHighStartMs = 0;
+                heaterRunning     = false;
+                heaterTargetPct   = 0;
+                setFaultH(FAULT_H_HEATER_IMPORT_TRIP);
+            }
+        } else {
+            importHighStartMs = 0;
+        }
+        importZeroStartMs = 0;
+    } else {
+        if (gridImportW <= 0) {
+            if (!importZeroStartMs) importZeroStartMs = now;
+            if (now - importZeroStartMs >= 20000UL) {
+                importTripActive  = false;
+                importZeroStartMs = 0;
+                clearFaultH(FAULT_H_HEATER_IMPORT_TRIP);
+            }
+        } else {
+            importZeroStartMs = 0;
+        }
+    }
+}
 
 #ifdef DEBUG_SERIAL
 // ============================================================
@@ -754,8 +801,6 @@ BoostMode        boostMode          = BOOST_OFF;
 float            boostTarget        = 15.5f;
 ManualHeaterMode manualHeaterMode   = MHM_OFF;
 uint32_t         boost8hrEndMs      = 0;  // millis() when 8hr boost ends
-bool             pvExportOverride   = false; // true = PV export ≥500W in WINTER mode → send MODE_SUMMER to W
-
 unsigned long eepromDirtyMs = 0;
 bool          eepromDirty   = false;
 
@@ -1031,10 +1076,17 @@ void updateSummerStartup() {
 // PV export override: in winter mode, when PV export >= 500W, tell W to run summer solar
 // logic by sending MODE_SUMMER in the H→W packet without changing the stored systemMode.
 void updatePVExportOverride() {
-    if (systemMode != MODE_WINTER) { pvExportOverride = false; return; }
+    if (systemMode != MODE_WINTER) { pvExportOverride = false; pvExport500StartMs = 0; return; }
     bool pvActive = lastWPkt.growattValid ? ((lastWPkt.pv1W + lastWPkt.pv2W) >= 200) : (rtcHour() < 21);
-    if (!pvExportOverride && lastWPkt.pvExportW >= 500) pvExportOverride = true;
-    if (pvExportOverride && !pvActive)                   pvExportOverride = false;
+    if (!pvExportOverride) {
+        if (lastWPkt.pvExportW >= 500) {
+            if (!pvExport500StartMs) pvExport500StartMs = millis();
+            if (millis() - pvExport500StartMs >= 60000UL) pvExportOverride = true;
+        } else {
+            pvExport500StartMs = 0;
+        }
+    }
+    if (pvExportOverride && !pvActive) { pvExportOverride = false; pvExport500StartMs = 0; }
 }
 
 // ============================================================
@@ -1043,6 +1095,7 @@ void updatePVExportOverride() {
 
 bool    sdAvailable   = false;
 bool    sdEjected     = false;
+File    logFile;
 unsigned long lastLogMs = 0;
 
 static const uint8_t LOG_EXPECTED_COMMAS = 21; // 22 columns = 21 commas
@@ -1076,6 +1129,7 @@ void initSD() {
                 f.close();
             }
         }
+        logFile = SD.open("log.csv", FILE_WRITE);
     } else {
 #ifdef DEBUG_SERIAL
         Serial.println(F("SD: init failed"));
@@ -1090,13 +1144,7 @@ void initSD() {
 }
 
 void logDataRow() {
-    if (!sdAvailable || sdEjected) return;
-    File f = SD.open("log.csv", FILE_WRITE);
-    if (!f) {
-        sdAvailable = false;
-        sdEjected   = true;
-        return;
-    }
+    if (!sdAvailable || sdEjected || !logFile) return;
 
     char tsBuf[20];
     if (rtcValid)
@@ -1105,37 +1153,38 @@ void logDataRow() {
                  rtcNow.hour(), rtcNow.minute(), rtcNow.second());
     else
         snprintf(tsBuf, sizeof(tsBuf), "INVALID");
-    f.print(tsBuf); f.print(',');
+    logFile.print(tsBuf); logFile.print(',');
     // W temperatures
-    auto pT = [&](int16_t v){ if(v==TEMP_FAULT) f.print("NaN"); else f.print(v/10.0f,1); f.print(','); };
+    auto pT = [&](int16_t v){ if(v==TEMP_FAULT) logFile.print("NaN"); else logFile.print(v/10.0f,1); logFile.print(','); };
     pT(lastWPkt.tempSolarHot); pT(lastWPkt.tempSolarCold);
     pT(lastWPkt.tempUFHSupply); pT(lastWPkt.tempUFHPostTMV);
     pT(lastWPkt.tempWorkshopAir); pT(lastWPkt.tempOutsideAir);
     // H temperatures
     for (uint8_t i = 0; i < H_NUM_SENSORS; i++) {
-        if (sFault[i]) f.print("NaN"); else f.print(sTemp[i], 1); f.print(',');
+        if (sFault[i]) logFile.print("NaN"); else logFile.print(sTemp[i], 1); logFile.print(',');
     }
     // State
-    f.print(lastWPkt.solarPumpDutyPct); f.print(',');
-    f.print(heaterRunning ? heaterTargetPct : 0); f.print(',');
-    f.print(lastWPkt.pvExportW); f.print(',');
-    f.print(lastWPkt.gridImportW); f.print(',');
-    f.print(busVoltageV, 2); f.print(',');
-    f.print(0); f.print(','); // fan1RPM — not available at H (W side)
-    f.print(0); f.print(','); // fan2RPM
-    f.println(lastWPkt.fanDutyPct);
-    f.close();
+    logFile.print(lastWPkt.solarPumpDutyPct); logFile.print(',');
+    logFile.print(heaterRunning ? heaterTargetPct : 0); logFile.print(',');
+    logFile.print(lastWPkt.pvExportW); logFile.print(',');
+    logFile.print(lastWPkt.gridImportW); logFile.print(',');
+    logFile.print(busVoltageV, 2); logFile.print(',');
+    logFile.print(0); logFile.print(','); // fan1RPM — not available at H (W side)
+    logFile.print(0); logFile.print(','); // fan2RPM
+    logFile.println(lastWPkt.fanDutyPct);
+    logFile.flush();
 }
 
 void safeEjectSD() {
     if (!sdAvailable) return;
+    if (logFile) logFile.close();
     SD.end();
     sdEjected   = true;
     sdAvailable = false;
 }
 
 void checkSDReinsert() {
-    if (!sdEjected) return;
+    if (sdAvailable) return;
     // Try to reinitialise; SD.begin() returns true if card present
     if (SD.begin(PIN_SD_CS)) {
         sdEjected   = false;
@@ -1201,6 +1250,7 @@ unsigned long lastButtonMs    = 0;
 bool         displayOn        = true;
 bool         needFullRedraw   = true;
 bool         needPageRedraw   = false;
+uint32_t     faultFlagsAtSleep = 0;
 unsigned long lastDisplayRefreshMs = 0;
 uint8_t      alertResetSeqTx       = 0;  // increment to signal alert reset to W
 unsigned long actionFlashEndMs     = 0;  // non-zero while action-confirmation red flash is active
@@ -1239,6 +1289,7 @@ inline void pollBtns() { btnSelect.poll(); btnUp.poll(); btnDown.poll(); }
 // Forward declarations
 void drawFullPage();
 static void updateHPump();
+static void pollRS485();
 
 // 1ms timer ISR — polls buttons independently of loop speed so any press >4ms is detected
 ISR(TIMER3_COMPA_vect) { pollBtns(); }
@@ -1315,6 +1366,7 @@ const char* faultNameH(uint32_t mask) {
     if (mask & FAULT_H_RS485_COMMS)           return "H RS485 Err";
     if (mask & FAULT_H_BUS_VOLTAGE_LOW)       return "15V Bus Low";
     if (mask & FAULT_H_GRID_OUTAGE)           return "Grid Outage";
+    if (mask & FAULT_H_HEATER_IMPORT_TRIP)   return "Htr Import Trp";
     return "H Sensr Flt";
 }
 
@@ -1842,7 +1894,7 @@ void drawPage5() {
 
 void drawFullPage() {
     tft.fillRect(0, 0, 480, 20, C_NAVY);
-    for (uint8_t s = 0; s < 8; s++) { tft.fillRect(0, 20 + s * 35, 480, 35, C_BLACK); pollBtns(); updateHPump(); }
+    for (uint8_t s = 0; s < 8; s++) { tft.fillRect(0, 20 + s * 35, 480, 35, C_BLACK); pollBtns(); updateHPump(); pollRS485(); }
     drawStatusBar();
     updateHPump();
     switch (currentPage) {
@@ -2053,6 +2105,30 @@ static float calcHPumpDuty() {
     return duty;
 }
 
+static void updateFlush() {
+    if (!heaterRunning) { flushState = FLUSH_IDLE; return; }
+    float h1     = sFault[H_SENSOR_HEATER_OUT]   ? NAN : sTemp[H_SENSOR_HEATER_OUT];
+    float h2     = sFault[H_SENSOR_HEATER_OUT_2] ? NAN : sTemp[H_SENSOR_HEATER_OUT_2];
+    float htrOut = getHeaterOutC();
+    bool  cond   = !isnan(h1) && !isnan(h2) && !isnan(htrOut)
+                   && htrOut >= 80.0f && (h2 - h1) > 3.5f;
+    uint32_t now = millis();
+    switch (flushState) {
+        case FLUSH_IDLE:
+            if (cond) { flushState = FLUSH_ACTIVE; flushTimer = now; }
+            break;
+        case FLUSH_ACTIVE:
+            if (now - flushTimer >= 4000) { flushState = FLUSH_PAUSE; flushTimer = now; }
+            break;
+        case FLUSH_PAUSE:
+            if (now - flushTimer >= 4000) {
+                flushState = cond ? FLUSH_ACTIVE : FLUSH_IDLE;
+                flushTimer = now;
+            }
+            break;
+    }
+}
+
 static void setHPumpDuty(float duty) {
     hPumpDuty = duty;
     if (duty <= 0.0f) { digitalWrite(PIN_SOLAR_PUMP, LOW); hPumpOutputState = false; }
@@ -2223,7 +2299,15 @@ static void pollRS485() {
 #ifdef DEBUG_SERIAL
         if ((calPumpPhase == CALP_IDLE || calPumpPhase == CALP_DONE) && pumpTestState == PT_IDLE)
 #endif
-        updateHeaterDuty(lastWPkt.pvExportW, lastWPkt.gridImportW, manualHeaterMode, wSolarFault);
+        {
+            checkHeaterImportTrip(lastWPkt.gridImportW, lastWPkt.growattValid);
+            // Winter mode: hold off heater until export has been ≥500W for ≥60s (battery charges to 100% first).
+            if (systemMode == MODE_WINTER && !pvExportOverride) {
+                heaterTargetPct = 0; heaterRunning = false;
+            } else {
+                updateHeaterDuty(lastWPkt.pvExportW, lastWPkt.gridImportW, manualHeaterMode, wSolarFault);
+            }
+        }
 
         bool needTS = lastWPkt.requestTimeSync && (millis() - lastTimeSyncSentMs > 5000);
         if (needTS) lastTimeSyncSentMs = millis();
@@ -2293,6 +2377,7 @@ static void dbgFaults() {
     HF(FAULT_H_RS485_COMMS,          "RS485_COMMS")
     HF(FAULT_H_BUS_VOLTAGE_LOW,      "BUS_VOLTAGE_LOW")
     HF(FAULT_H_GRID_OUTAGE,          "GRID_OUTAGE")
+    HF(FAULT_H_HEATER_IMPORT_TRIP,   "HEATER_IMPORT_TRIP")
     HF(FAULT_H_SENSOR_TANK_BOT,      "SENSOR_TANK_BOT")
     HF(FAULT_H_SENSOR_TANK_MID,      "SENSOR_TANK_MID")
     HF(FAULT_H_SENSOR_TANK_TOP,      "SENSOR_TANK_TOP")
@@ -2331,6 +2416,7 @@ static void dbgHeater() {
     Serial.print(F("  duty:      ")); Serial.print(heaterTargetPct);   Serial.println(F("%"));
     Serial.print(F("  power_est: ")); Serial.print(heaterTargetPct * 3000 / 100); Serial.println(F("W"));
     Serial.print(F("  lockout:   ")); Serial.println(heaterHardLockout ? F("YES")  : F("no"));
+    Serial.print(F("  imp_trip:  ")); Serial.println(importTripActive  ? F("YES")  : F("no"));
     Serial.print(F("  ovht_warn: ")); Serial.println(heaterOvheatWarn  ? F("YES")  : F("no"));
     Serial.print(F("  grid:      ")); Serial.println(gridPresent       ? F("ok")   : F("OUTAGE"));
     Serial.print(F("  zc_count:  ")); Serial.println(zcFireCount);
@@ -2902,6 +2988,7 @@ void setup() {
 
 void loop() {
     wdt_reset();
+    pollRS485();  // drain Serial1 immediately — display/SD later in loop can block 500ms+
     updateHPump();
 #ifdef DEBUG_SERIAL
     processSerialInput();
@@ -2947,10 +3034,15 @@ void loop() {
     checkHeaterFaults();
 
     // H-side solar pump direct drive
+    updateFlush();
 #ifdef DEBUG_SERIAL
     updatePumpTest();
-    if (pumpTestState == PT_COOLDOWN) setHPumpDuty(10.0f);
-    else if (simHPumpSpdActive) setHPumpDuty(simHPumpSpdVal);
+    if (pumpTestState == PT_COOLDOWN)    setHPumpDuty(10.0f);
+    else if (flushState == FLUSH_ACTIVE) setHPumpDuty(100.0f);
+    else if (simHPumpSpdActive)          setHPumpDuty(simHPumpSpdVal);
+    else
+#else
+    if (flushState == FLUSH_ACTIVE)      setHPumpDuty(100.0f);
     else
 #endif
     setHPumpDuty(calcHPumpDuty());
@@ -3041,29 +3133,24 @@ void loop() {
         lastLogMs = now;
         updateHPump();
         logDataRow();
+        pollRS485();  // reply to any packet that arrived during SD write
         updateHPump();
     }
 
     // Display refresh
     if (!displayOn) {
-        // Wake on any fault
-        bool anyFault = (hFaultFlags != 0 || (hasWPkt && lastWPkt.wFaultFlags != 0));
-        if (anyFault) wakeDisplay();
+        // Wake only on NEW faults that appeared after the display went to sleep
+        uint32_t curFaults = hFaultFlags | (hasWPkt ? lastWPkt.wFaultFlags : 0);
+        if (curFaults & ~faultFlagsAtSleep) wakeDisplay();
     } else {
         unsigned long msSinceBtn = millis() - lastButtonMs;
-        bool inactivity = (msSinceBtn >= BACKLIGHT_SLEEP_MS);
-        bool anyFault   = (hFaultFlags != 0 || (hasWPkt && lastWPkt.wFaultFlags != 0));
-        if (inactivity && !anyFault) {
-            displayOn = false;
+        if (msSinceBtn >= BACKLIGHT_SLEEP_MS) {
+            displayOn      = false;
             setBacklight(0);
-            // Return to page 1 after 1hr inactivity
+            faultFlagsAtSleep = hFaultFlags | (hasWPkt ? lastWPkt.wFaultFlags : 0);
             currentPage    = 1;
             navMode        = NAV_PAGE;
             needFullRedraw = true;
-        }
-        // Return to page 1 after 1hr
-        if (msSinceBtn >= BACKLIGHT_SLEEP_MS && currentPage != 1) {
-            currentPage = 1; navMode = NAV_PAGE; needFullRedraw = true;
         }
     }
 
@@ -3081,9 +3168,9 @@ void loop() {
         } else if (now - lastDisplayRefreshMs >= 500) {
             lastDisplayRefreshMs = now;
             drawStatusBar();
-            updateHPump();
+            pollRS485();
             drawFaultBar(hasWPkt ? lastWPkt.wFaultFlags : 0, hFaultFlags);
-            updateHPump();
+            pollRS485();
             // Partial refresh of current page data (quick update of values only)
             switch (currentPage) {
                 case 1: drawPage1(hasWPkt ? lastWPkt.wFaultFlags : 0); break;
@@ -3099,4 +3186,5 @@ void loop() {
         }
         updateHPump();
     }
+    pollRS485();  // catch any packet that arrived during display draws
 }

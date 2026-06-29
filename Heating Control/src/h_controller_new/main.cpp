@@ -281,6 +281,9 @@ bool hotTankProtection = false;
 bool morningHeatActive = false;
 bool heaterOvheatWarn = false;
 unsigned long heaterOvheatWarnMs = 0;
+bool          importTripActive  = false;
+unsigned long importHighStartMs = 0;
+unsigned long importZeroStartMs = 0;
 bool gridPresent                 = true;
 unsigned long lastGridLossMs     = 0;
 bool gridOutageFault             = false;
@@ -289,6 +292,10 @@ float         hPumpDuty        = 0.0f;
 bool          hPumpOutputState = false;
 unsigned long hPumpOnMs        = 0;
 unsigned long hPumpOffMs       = 0;
+
+enum FlushState : uint8_t { FLUSH_IDLE, FLUSH_ACTIVE, FLUSH_PAUSE };
+FlushState flushState = FLUSH_IDLE;
+uint32_t   flushTimer = 0;
 
 // Zero-crossing ISR — runs every 10ms on 50Hz grid (every half-cycle).
 // Fixed-burst firing: fires on_hc consecutive half-cycles then off_hc off, repeating.
@@ -385,6 +392,9 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
         heaterLevelIdx = 0; heaterRunning = false; return;
     }
     if (heaterHardLockout) {
+        heaterLevelIdx = 0; heaterRunning = false; return;
+    }
+    if (importTripActive) {
         heaterLevelIdx = 0; heaterRunning = false; return;
     }
     if (hotTankProtection) {
@@ -512,6 +522,44 @@ uint32_t hFaultFlags = 0;
 void setFaultH(uint32_t m)   { hFaultFlags |= m; }
 void clearFaultH(uint32_t m) { hFaultFlags &= ~m; }
 bool hasFaultH(uint32_t m)   { return (hFaultFlags & m) != 0; }
+
+// ============================================================
+//  HEATER IMPORT TRIP  (inverter CB tripped while panels producing)
+// ============================================================
+
+void checkHeaterImportTrip(int16_t gridImportW, bool growattValid) {
+    if (!growattValid) return;
+    unsigned long now     = millis();
+    int16_t       heaterW = (int16_t)((uint32_t)heaterLevelPct10() * 3UL);
+    bool          importHigh = heaterRunning && heaterW > 0 && gridImportW >= heaterW;
+
+    if (!importTripActive) {
+        if (importHigh) {
+            if (!importHighStartMs) importHighStartMs = now;
+            if (now - importHighStartMs >= 20000UL) {
+                importTripActive  = true;
+                importHighStartMs = 0;
+                heaterRunning     = false;
+                heaterLevelIdx    = 0;
+                setFaultH(FAULT_H_HEATER_IMPORT_TRIP);
+            }
+        } else {
+            importHighStartMs = 0;
+        }
+        importZeroStartMs = 0;
+    } else {
+        if (gridImportW <= 0) {
+            if (!importZeroStartMs) importZeroStartMs = now;
+            if (now - importZeroStartMs >= 20000UL) {
+                importTripActive  = false;
+                importZeroStartMs = 0;
+                clearFaultH(FAULT_H_HEATER_IMPORT_TRIP);
+            }
+        } else {
+            importZeroStartMs = 0;
+        }
+    }
+}
 
 #ifdef DEBUG_SERIAL
 // ============================================================
@@ -965,7 +1013,7 @@ void updateHeatSourceSelection() {
             logBurnerCold.request(false);
             botTankValve.request(false);
         } else {
-            botTankValve.request(true);   // restore after dump clears; also unblocks heaterFlowPathOk()
+            botTankValve.request(heaterRunning || heaterHardLockout || lastWPkt.solarPumpActive);
         }
         return;
     }
@@ -1242,7 +1290,7 @@ void safeEjectSD() {
 }
 
 void checkSDReinsert() {
-    if (!sdEjected) return;
+    if (sdAvailable) return;
     // Try to reinitialise; SD.begin() returns true if card present
     if (SD.begin(PIN_SD_CS)) {
         sdEjected   = false;
@@ -1421,6 +1469,7 @@ const char* faultNameH(uint32_t mask) {
     if (mask & FAULT_H_RS485_COMMS)           return "H RS485 Err";
     if (mask & FAULT_H_BUS_VOLTAGE_LOW)       return "15V Bus Low";
     if (mask & FAULT_H_GRID_OUTAGE)           return "Grid Outage";
+    if (mask & FAULT_H_HEATER_IMPORT_TRIP)   return "Htr Import Trp";
     return "H Sensr Flt";
 }
 
@@ -2186,6 +2235,30 @@ static float calcHPumpDuty() {
     return duty;
 }
 
+static void updateFlush() {
+    if (!heaterRunning) { flushState = FLUSH_IDLE; return; }
+    float h1     = sFault[H_SENSOR_HEATER_OUT]   ? NAN : sTemp[H_SENSOR_HEATER_OUT];
+    float h2     = sFault[H_SENSOR_HEATER_OUT_2] ? NAN : sTemp[H_SENSOR_HEATER_OUT_2];
+    float htrOut = getHeaterOutC();
+    bool  cond   = !isnan(h1) && !isnan(h2) && !isnan(htrOut)
+                   && htrOut >= 80.0f && (h2 - h1) > 3.5f;
+    uint32_t now = millis();
+    switch (flushState) {
+        case FLUSH_IDLE:
+            if (cond) { flushState = FLUSH_ACTIVE; flushTimer = now; }
+            break;
+        case FLUSH_ACTIVE:
+            if (now - flushTimer >= 4000) { flushState = FLUSH_PAUSE; flushTimer = now; }
+            break;
+        case FLUSH_PAUSE:
+            if (now - flushTimer >= 4000) {
+                flushState = cond ? FLUSH_ACTIVE : FLUSH_IDLE;
+                flushTimer = now;
+            }
+            break;
+    }
+}
+
 static void setHPumpDuty(float duty) {
     hPumpDuty = duty;
     if (duty <= 0.0f) { digitalWrite(PIN_SOLAR_PUMP, LOW); hPumpOutputState = false; }
@@ -2356,7 +2429,10 @@ static void pollRS485() {
 #ifdef DEBUG_SERIAL
         if ((calPumpPhase == CALP_IDLE || calPumpPhase == CALP_DONE) && pumpTestState == PT_IDLE)
 #endif
-        updateHeaterDuty(lastWPkt.pvExportW, lastWPkt.gridImportW, manualHeaterMode, wSolarFault);
+        {
+            checkHeaterImportTrip(lastWPkt.gridImportW, lastWPkt.growattValid);
+            updateHeaterDuty(lastWPkt.pvExportW, lastWPkt.gridImportW, manualHeaterMode, wSolarFault);
+        }
 
         bool needTS = lastWPkt.requestTimeSync && (millis() - lastTimeSyncSentMs > 5000);
         if (needTS) lastTimeSyncSentMs = millis();
@@ -2426,6 +2502,7 @@ static void dbgFaults() {
     HF(FAULT_H_RS485_COMMS,          "RS485_COMMS")
     HF(FAULT_H_BUS_VOLTAGE_LOW,      "BUS_VOLTAGE_LOW")
     HF(FAULT_H_GRID_OUTAGE,          "GRID_OUTAGE")
+    HF(FAULT_H_HEATER_IMPORT_TRIP,   "HEATER_IMPORT_TRIP")
     HF(FAULT_H_SENSOR_TANK_BOT,      "SENSOR_TANK_BOT")
     HF(FAULT_H_SENSOR_TANK_MID,      "SENSOR_TANK_MID")
     HF(FAULT_H_SENSOR_TANK_TOP,      "SENSOR_TANK_TOP")
@@ -2464,6 +2541,7 @@ static void dbgHeater() {
     Serial.print(F("  duty:      ")); Serial.print(heaterLevelPct());   Serial.println(F("%"));
     Serial.print(F("  power_est: ")); Serial.print(heaterLevelPct10() * 3); Serial.println(F("W"));
     Serial.print(F("  lockout:   ")); Serial.println(heaterHardLockout ? F("YES")  : F("no"));
+    Serial.print(F("  imp_trip:  ")); Serial.println(importTripActive  ? F("YES")  : F("no"));
     Serial.print(F("  ovht_warn: ")); Serial.println(heaterOvheatWarn  ? F("YES")  : F("no"));
     Serial.print(F("  grid:      ")); Serial.println(gridPresent       ? F("ok")   : F("OUTAGE"));
     Serial.print(F("  zc_count:  ")); Serial.println(zcFireCount);
@@ -3322,10 +3400,15 @@ void loop() {
 
     // H-side solar pump direct drive
     updateSocTest();
+    updateFlush();
 #ifdef DEBUG_SERIAL
     updatePumpTest();
-    if (pumpTestState == PT_COOLDOWN) setHPumpDuty(10.0f);
-    else if (simHPumpSpdActive) setHPumpDuty(simHPumpSpdVal);
+    if (pumpTestState == PT_COOLDOWN)    setHPumpDuty(10.0f);
+    else if (flushState == FLUSH_ACTIVE) setHPumpDuty(100.0f);
+    else if (simHPumpSpdActive)          setHPumpDuty(simHPumpSpdVal);
+    else
+#else
+    if (flushState == FLUSH_ACTIVE)      setHPumpDuty(100.0f);
     else
 #endif
     setHPumpDuty(calcHPumpDuty());

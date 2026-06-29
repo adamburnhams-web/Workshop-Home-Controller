@@ -703,3 +703,25 @@ Hard lockout auto-clears when outlet < 88°C with at least one sensor live (unch
 - Detects format by column count: `len(row) >= 9` → new format
 - Reads event from index 8 (new) or index 7 (old)
 - Discards any data row where `w_pump_pct > 0` and resets the stability buffer — W solar pump running changes thermal conditions and invalidates H pump calibration data for that row
+
+---
+
+## H Controller (both) — stagnation flush (`updateFlush`)
+
+Applies to both `controller_h` and `controller_h_new`.
+
+**Purpose:** push trapped air out of the heater circuit. When the immersion heater is running and the two outlet sensors read differently, it indicates an air pocket near one sensor causing localised overheating rather than full water circulation. Running the pump at 100% for a short burst flushes the air pocket through.
+
+**Condition:** all of the following must hold:
+- Heater running
+- Both `htr_out` and `htr_out_2` sensors valid (not faulted)
+- Effective heater outlet (`getHeaterOutC()`) ≥ 80°C
+- `htr_out_2 − htr_out > 3.5°C`
+
+**State machine** (`FlushState`):
+- `FLUSH_IDLE` → `FLUSH_ACTIVE` when condition first true
+- `FLUSH_ACTIVE` (pump forced to 100%) → `FLUSH_PAUSE` after 4s
+- `FLUSH_PAUSE` → `FLUSH_ACTIVE` if condition still true after 4s; → `FLUSH_IDLE` if condition cleared
+- Resets to `FLUSH_IDLE` immediately if heater stops
+
+`FLUSH_ACTIVE` overrides `calcHPumpDuty()` in the loop; in debug builds it also takes priority over `simHPumpSpdActive` but yields to `PT_COOLDOWN`.
