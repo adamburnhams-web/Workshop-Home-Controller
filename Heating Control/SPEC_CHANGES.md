@@ -137,33 +137,32 @@ ILI9488 driver, SPI pins, and display dimensions configured via `build_flags` in
 6. Valves not closing (heater stays off while bot_tank or two_port is mid-close stroke)
 7. Auto mode only: `growattValid = 1` AND PV1+PV2 ≥ 200W (end-of-day gate)
 
-**Auto mode duty calculation** (per RS485 packet, ~250ms):
+**Auto mode duty calculation** (per RS485 packet, ~250ms) — updated, current values:
 ```
 SOC reservation:
-  post-noon (hour ≥ 12) AND soc > 80%: reservationW = 1100W
-  post-noon AND soc > 90%:             reservationW = 500W
-  post-noon AND soc > 97%:             reservationW = 200W
-  pre-noon (hour < 12) AND soc > 50%:  reservationW = 1100W  (same values, lower SOC threshold)
-  otherwise:                            reservationW = 0
+  soc > 95%:                          reservationW = 200W   (regardless of time)
+  hour < 14:00:                       reservationW = 500W
+  hour ≥ 14:00 AND soc > 60%:         reservationW = 1000W
+  hour ≥ 14:00 AND soc ≤ 60%:         reservationW = 3000W
 
-If reservation > 0:
-  available = pvExportW − gridImportW + battChargeW + heaterCurrentW − reservationW
-Else:
-  available = pvExportW − gridImportW + min(0, battChargeW) + heaterCurrentW − 100
+available = pvExportW − gridImportW + battChargeW + heaterCurrentW − reservationW
 
-heaterCurrentW = heaterTargetPct × 3000 / 100
+heaterCurrentW = heaterLevelPct10() × 3   (level-based, was heaterTargetPct × 30)
 rawPct         = clamp(available × 100 / 3000, 0, 100)
 ```
+(Reservation is now always > 0, so the previous `else` branch — `netGridW + min(0, battChargeW) + heaterCurrentW − 100` — is unreachable and has been left in place unused rather than restructured.)
+
+Superseded values: reservation previously switched at noon (not 14:00), was 1kW before noon / 0W until SOC > 80% after noon (then 1kW) — see git history for the exact prior thresholds.
 
 **Start:** rawPct ≥ 17% (~500W) AND sustained for 5s  
 **Stop:** 5 consecutive zero packets (was immediate)  
-**Smoothing:** 8-packet running average before applying to `heaterTargetPct`
+**Smoothing:** 8-packet running average before applying to `heaterLevelIdx` (via `pctToLevel()`)
 
 **Hot pipe cap** (applied after smoothing):
 - `hot_pipe ≥ 90°C` → 0%
-- `hot_pipe 60–90°C` → linear cap: `(90 − hot_pipe) × 3.33%/°C` (100% at 60°C, 0% at 90°C)
+- `hot_pipe 63–90°C` → linear cap: `(90 − hot_pipe) × 3.70%/°C` (100% at 63°C, 0% at 90°C) — threshold raised from 60°C
 
-**`botTankValve.request(true)`** called whenever heater is running.
+**Flow-path valve interlock**: see "H Controller (main) — heater control rework ported from h_new" below — `botTankValve`/`logBurnerCold`/`twoPortValve` are now actively requested into position whenever the heater wants to run, with actual firing gated on confirmation.
 
 ### Hot tank protection (new)
 
@@ -183,26 +182,26 @@ Seventh DS18B20 added: `H_SENSOR_HEATER_OUT_2 = 6`, `H_NUM_SENSORS = 7`, sensor 
 
 **Element-fail detection removed.** The previous 30s/no-temp-rise lockout was unreliable. Replaced by:
 
-- Both sensors faulted → `heaterPowerCapPct = 0` immediately (ISR-level cap), set both fault flags
+- Both sensors faulted → power cap set to 0 immediately (ISR-level cap), set both fault flags
 - Single sensor faulted → raise fault flag after 5s grace; continue on the remaining sensor
-- Hot pipe sensor fault → `heaterPowerCapPct = 0` immediately
-- RS485 stale > 60s while running → `heaterTargetPct = 0`, `heaterRunning = false`
+- Hot pipe sensor fault → power cap set to 0 immediately
+- RS485 stale > 60s while running → heater level forced to 0, `heaterRunning = false`
 
 **Overheat sequencing** (replaces warn→shutdown threshold at 91°C):
-- **91–93°C**: ramp `heaterPowerCapPct` 100→0 (ISR-level cap); request valves open; set `FAULT_H_HEATER_OVERHEAT_WARN`
-- **≥ 93°C**: `heaterPowerCapPct = 0`, `heaterHardLockout = true`, SSR pin cleared, set `FAULT_H_HEATER_OVERHEAT_SHUT`
+- **91–93°C**: ramp power cap 100→0 (ISR-level cap); request valves open
+- **≥ 94°C**: power cap 0, `heaterHardLockout = true`, SSR pin cleared, set `FAULT_H_HEATER_OVERHEAT_SHUT`
 - **Auto-clear** hard lockout when effective heater temp < 88°C AND at least one sensor live (clears fault too)
 - **Page 5 Ack** also clears hard lockout immediately (allows manual recovery without reboot)
 
-`heaterPowerCapPct` is a `volatile uint8_t` applied in the ZC ISR: `heaterSpreadAcc += min(heaterTargetPct, heaterPowerCapPct)`.
+Thresholds/behavior above are unchanged, but the implementation is now level-based (see "H Controller (main) — heater control rework ported from h_new" below): `heaterPowerCapPct`/`heaterTargetPct`/`heaterSpreadAcc` (percent-based) were replaced with `heaterLevelCap`/`heaterLevelIdx` (0–20 level index) + `heaterPhaseHc`/`heaterPhaseOn` (ISR burst-phase tracking), driving the same 20-level fixed-burst table used by `controller_h_new`.
 
 Heater gate in ISR also requires `VSTATE_SOLAR_COLD_OPEN` — heater cannot fire if the solar cold valve is closed.
 
-### H-side solar pump direct drive — rework
+### H-side solar pump direct drive — rework — superseded
 
 **`calcHPumpDuty()` now returns `float`** (was `uint8_t`).
 
-New predictive formula `calcPred(heaterPct, hotPipeC)`:
+New predictive formula `calcPred(heaterPct, hotPipeC)` (historical — see supersession note below):
 ```
 excess   = heaterPct − 20
 pt       = max(0, excess²) × 0.0025        // plateau term
@@ -212,7 +211,7 @@ minDuty  = 4 + heaterPct × 0.05
 pred     = max(raw, minDuty)
 ```
 
-**Two operating branches:**
+**Two operating branches (historical):**
 
 *SOLAR_TANK_PLUS8 mode* (tank top ≤ 75°C):
 - Target = `min(tankTop + 8°C, 87°C)`
@@ -231,6 +230,8 @@ pred     = max(raw, minDuty)
 - 90–91°C: ramp upper → 100%; ≥ 91°C: 100%
 
 Returns 0 when heater is off/lockout applies; 100 during `heaterHardLockout`; minimum 4% when heater running.
+
+**Superseded**: both `calcPred()` and `calcHPumpDuty()` above were replaced with `controller_h_new`'s versions — see "H Controller (h_new) — `calcPred` rewrite: per-level lookup table" and "H Controller (main) — heater control rework ported from h_new" below. The per-level `k`/`alpha` lookup table replaces the quadratic formula; `upperMult` now scales with hot-pipe temperature in both branches instead of only in MAX mode.
 
 **`updateHPump()` moved to Timer1 COMPA ISR** (50ms tick, hardware timer). No longer called from main loop; also called explicitly during `drawFullPage()` strip fills and at end of full redraw to prevent pump stalling during long SPI operations.
 
@@ -539,13 +540,15 @@ Header line: `CAL_HDR: solar_step_C,heater_pct,hot_pipe_C,htr_out_C,pump_pct`
 
 ## H Controller — heater SSR control changes
 
-### Spread firing (Bresenham) replaces burst firing
+### Spread firing (Bresenham) replaces burst firing — superseded
 Spec/previous: SSR fired for the first N consecutive half-cycles of a 100-cycle window (burst).
-Code: Bresenham error-accumulator distributes firing events evenly across all half-cycles.
+Code (historical): Bresenham error-accumulator distributed firing events evenly across all half-cycles.
 
-Effect: at 10% duty the pattern is one pulse every 10 half-cycles (every 100ms) rather than 10 pulses then 900ms silence. Export meters see near-constant load regardless of polling interval, eliminating false over-export readings.
+Effect: at 10% duty the pattern was one pulse every 10 half-cycles (every 100ms) rather than 10 pulses then 900ms silence. Export meters saw near-constant load regardless of polling interval, eliminating false over-export readings.
 
 ISR variable renamed: `heaterCycleCnt` → `heaterSpreadAcc` (accumulator, not a counter).
+
+**Superseded** — see "H Controller (main) — heater control rework ported from h_new" below: `controller_h` now uses the same 20-level fixed-burst scheme as `controller_h_new`; `heaterSpreadAcc` removed.
 
 ### Manual heater test override — `set heater_pct` serial command (DEBUG_SERIAL only)
 Not in spec. Allows the heater SSR to be tested independently of `HEATER_ENABLED` commissioning flag.
@@ -682,8 +685,9 @@ Previous behaviour (from main branch):
 - ≥ 93°C: hard lockout
 
 New behaviour:
-- **91–93.5°C**: proportional heater cap — scales the *current demand level* linearly from 100% to 0% over this range: `cap = heaterLevelPct() × (1 − (hOut − 91) / 2.5)`. Regardless of what the heater is set to, reduction starts at 91°C and reaches 0% at 93.5°C.
+- **91–93°C**: proportional heater cap — scales the *current demand level* linearly from 100% to 0% over this range: `cap = heaterLevelPct() × (1 − (hOut − 91) / 2)`. Regardless of what the heater is set to, reduction starts at 91°C and reaches 0% at 93°C.
 - **≥ 94°C**: hard lockout (was 93°C)
+- Overheat warning fault (`FAULT_H_HEATER_OVERHEAT_WARN`) removed — only the hard shutdown fault (`FAULT_H_HEATER_OVERHEAT_SHUT`) remains.
 
 Using proportional rather than absolute cap means the reduction starts immediately at 91°C for any demand level, not only when the absolute cap drops below the current level.
 
@@ -725,3 +729,35 @@ Applies to both `controller_h` and `controller_h_new`.
 - Resets to `FLUSH_IDLE` immediately if heater stops
 
 `FLUSH_ACTIVE` overrides `calcHPumpDuty()` in the loop; in debug builds it also takes priority over `simHPumpSpdActive` but yields to `PT_COOLDOWN`.
+
+---
+
+## H Controller (main) — heater control rework ported from h_new
+
+Brings `controller_h`'s heater subsystem (levels, pump formula, overheat handling) in line with `controller_h_new`, explicitly excluding the SCT/`soc_test` feature (which remains `h_new`-only).
+
+### 20-level fixed-burst heater scheme (replaces Bresenham spread-firing)
+
+`controller_h` now uses the same `kHeaterLevels[20]` fixed-burst table as `controller_h_new` (see "H Controller — heater level table corrections" above for the two corrected entries — both builds share the corrected values). Each level fires `on_hc` half-cycles then `off_hc` off, repeating, replacing the previous Bresenham per-half-cycle accumulator (see "Spread firing (Bresenham)..." above, superseded).
+
+State renamed/replaced: `heaterSpreadAcc`/`heaterTargetPct`/`heaterPowerCapPct` (percent-based) → `heaterLevelIdx`/`heaterLevelCap` (0–20 level index) + `heaterPhaseHc`/`heaterPhaseOn` (ISR burst-phase tracking). New helpers `pctToLevel()`, `heaterLevelPct()`, `heaterLevelPct10()` convert between percent and level index.
+
+The duplicate 91–92°C overheat power-reduction block previously inline in `updateHeaterDuty()` was removed — `checkHeaterFaults()`'s `heaterLevelCap` taper (91–93°C ramp, ≥94°C hard lockout — thresholds unchanged) already covers it.
+
+### Pump speed formula ported from h_new
+
+`calcPred()` and `calcHPumpDuty()` replaced with `h_new`'s versions (see "H Controller (h_new) — `calcPred` rewrite" and "H pump: hot pipe ≥ 80°C forces 100%" above) — same per-level `k`/`alpha` lookup table, `hotPipeC ≥ 80°C → 100%` fast path, `normalMode`/`effTarget` restructuring, and hot-pipe-scaled `upperMult` ceiling applied in both normal and MAX modes (was MAX-mode-only, pred-based). `socTestPriming` check omitted — no SCT feature on this build.
+
+### Auto-mode reservation and hot-pipe-cap tuning (main-only, not mirrored to h_new)
+
+See updated "Auto mode duty calculation" and "Hot pipe cap" above — noon → 14:00, 1kW → 500W before the threshold, new 3kW/1kW post-threshold SOC bands, 200W override above 95% SOC, and hot-pipe-cap start raised 60°C → 63°C. `controller_h_new` keeps its own separate (more granular) reservation scheme and was not changed.
+
+### Heater flow-path interlock — 2-port valve added, active valve request
+
+`heaterFlowPathOk()` now also requires the 2-port valve open (heater side) and idle, in addition to the existing solar-cold-open + (log-burner-cold or bot-tank-valve open+idle) checks. The heater is blocked while the 2-port valve is moving or parked mid-tank (shared with solar's own routing of the same valve).
+
+`updateHeaterDuty()` reworked so the heater actively calls for its flow-path valves (`logBurnerCold` close, `botTankValve` open, `twoPortValve` open) as soon as the power-surplus hysteresis decides it wants to run — mirroring the existing `MHM_FORCE_ON` behavior — rather than waiting passively for another subsystem (e.g. the solar valve state machine) to position them. The power-surplus rolling average keeps accumulating in the background regardless of valve position; actual firing (`heaterLevelIdx`) stays gated on `heaterFlowPathOk()` and takes effect immediately once the valves are confirmed in place, without re-averaging. `MHM_FORCE_ON` reworked the same way: `heaterRunning` stays true while waiting for the valves; only `heaterLevelIdx` is gated.
+
+### Page 2 display — Consumption row added
+
+New "Cons:" row (instantaneous Watts: `PV1+PV2 + Import − BattCharge − Heater`, matching the existing `kwhConsumption` accumulator formula) added under Import. Heater row moved to directly below Consumption, above Battery (was: after SOC, at the bottom of the power block).
