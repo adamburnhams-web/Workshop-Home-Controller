@@ -1,5 +1,5 @@
 # H & W Integrated Control System — Complete Project Reference
-**Version 6.0** — Requirements Specification
+**Version 6.1** — Requirements Specification
 
 ---
 
@@ -434,8 +434,8 @@ Heater output sensors excluded from the `sensorFaultMaskH` array — handled sep
 - Hot pipe sensor faulted → `heaterPowerCapPct = 0` immediately
 
 **Overheat power cap** (ISR-level, via `heaterPowerCapPct`):
-- 91°C to 93°C: `heaterPowerCapPct` reduced linearly 100→0; valves requested open; `FAULT_H_HEATER_OVERHEAT_WARN` set
-- ≥ 93°C: `heaterPowerCapPct = 0`, `heaterHardLockout = true`, SSR pin cleared, `FAULT_H_HEATER_OVERHEAT_SHUT` set
+- 91°C to 93°C: `heaterPowerCapPct` reduced linearly 100→0; valves requested open
+- ≥ 94°C: `heaterPowerCapPct = 0`, `heaterHardLockout = true`, SSR pin cleared, `FAULT_H_HEATER_OVERHEAT_SHUT` set
 
 **Hard lockout auto-clear:** clears automatically when effective heater temp < 88°C AND at least one sensor is live. Also cleared by Page 5 Ack action (allows manual recovery without reboot).
 
@@ -583,7 +583,7 @@ EEPROM storage: Mode, Night Cooling, Solar Target, Display brightness (30s timeo
 | Door Handle Alert (night) | Handle active whilst locked, 23:00–06:00 | Buzzer minimum 10s | Stops after ≥10s when handle released |
 | Door Handle Alert (day) | Handle active whilst locked, 06:00–23:00 | Buzzer while held | Stops on release |
 | Window Winch Over Open | Safety limit switch while opening | LED + Display + Log + Open direction locked out | LED until Ack. Close direction still available. |
-| RS485 Comms Fault | 5+ consecutive missed H↔W packets | LED + Display + Log | Clears when comms resume |
+| RS485 Comms Fault | No valid packet received for 120s | LED + Display + Log | Clears when comms resume |
 | Fan 1 / Fan 2 Fault | Tach zero while commanded >min speed for >5s | LED + Display + Log | LED until Ack |
 | Fire Alarm | See §6.4 | Lights flash + buzzer at H + local sounder phase 2 | Alert reset on page 4 |
 | Heater sensor fault | One sensor: 5s grace then flag; both sensors: immediate cap | LED + Display. Heater continues on remaining sensor if one remains | Clears on sensor recovery |
@@ -626,7 +626,7 @@ Grid outage detected via zero-crossing detector at H (≤50ms). Heater forced of
 - 9600 baud. Poll interval: 250ms (4 times per second). Custom binary framing in `rs485_packet.h`.
 - Frame: `[0xAA][0x55][DIR][SEQ][LEN_LO][LEN_HI][PAYLOAD][CRC_LO][CRC_HI]`
 - CRC-16/Modbus over DIR+SEQ+LEN+PAYLOAD
-- If 5+ consecutive packets missed (~1.25s): RS485 Comms Fault triggered
+- If no valid packet received for 120s: RS485 Comms Fault triggered (H: 480 missed 250ms polls; W: `COMMS_FAULT_TIMEOUT_MS`)
 - On failure: W continues on last known H values. H continues on last known W values.
 - Growatt stale: `growattValid = 0` after 60s without a valid Modbus response (reduced from 120s)
 - H RS485 rx timeout: 150ms. W RS485 rx timeout: 200ms.
@@ -808,3 +808,4 @@ Default baud rate: 9600. Minimum command period: 850ms. Max read: 125 words.
 | 1.0–5.0 | Initial through major update: 15VDC, display, valves, fans, RS485, Growatt, firmware notes |
 | 5.1–5.9 | Iterative refinements: fault history, button redesign, valve wiring, fan control, RS485 packets, RTC fallback, DS18B20 sensor additions |
 | 6.0 | Full update to match implemented code: DS18B20 13 total (7 at H, 6 at W); dual heater sensor with arbitration (`getHeaterOutC`); solar target SOLAR_TANK_PLUS5 → SOLAR_TANK_PLUS8 (target = tankTop+8, capped 87°C); summer startup straight to phase 3; heater duty algorithm rework (8-packet averaging, 5s start delay, hot pipe cap, SOC reservation tiers, hysteresis stop); `MHM_SOC_LIM` mode added (3 modes total); hot tank protection (83°C); H-side solar pump direct drive (`calcHPumpDuty` predictive formula, float, Timer1 ISR); heater element-fail detection removed; dual sensor 5s grace; ISR power cap `heaterPowerCapPct`; hard lockout auto-clear at 88°C and via page 4 Ack; UFH dump threshold 90°C→93°C; solar overheat threshold 83→91°C; fire alarm documented; hen house door and window manual buttons documented; SD logging: datetime column, header validation; `HEATER_ENABLED` now true; wired-OR solar pump circuit documented; TFT_eSPI library; serial log2file |
+| 6.1 | RS485 Comms Fault threshold raised 60s → 120s on both controllers (link confirmed functional; corrected stale "5 packets/~1.25s" spec text to match actual code behaviour, which was already time-based). |

@@ -67,7 +67,8 @@
 #define PIN_HEN_DOOR_OPEN   42   // board4 ch2: hen house door open
 #define PIN_HEN_DOOR_CLOSE  48   // board4 ch3: hen house door close
 #define PIN_MIDPOINT_LED    49   // board4 ch4: 12VDC status LED relay
-// D50–D53: spare (board4 ch5–ch8)
+#define PIN_SENSOR_PWR_RELAY 50  // board4 ch5: 1-Wire bus power relay (energise=cut power to sensors)
+// D51–D53: spare (board4 ch6–ch8)
 
 #define PIN_RS485_DE_LINK   40   // MAX485 DE/RE for inter-controller link (HIGH=TX)
 #define PIN_RS485_DE_GROWATT 47   // MAX485 DE/RE for Growatt Modbus (HIGH=TX)
@@ -108,8 +109,8 @@ static const uint8_t DS18B20_ADDRS[6][8] = {
 #define NUM_SENSORS         6
 
 // INA219 — solar pump current limits (amps). Both sampled during ON pulse only.
-static const float SOLAR_PUMP_MIN_CURRENT_A = 1.00f;
-static const float SOLAR_PUMP_MAX_CURRENT_A = 2.00f;
+static const float SOLAR_PUMP_MIN_CURRENT_A = 0.20f;
+static const float SOLAR_PUMP_MAX_CURRENT_A = 1.00f;
 
 // PC fan minimum duty before stall. Calibrate on-site.
 static const uint8_t FAN_MIN_DUTY_PCT = 20; // TODO: calibrate
@@ -134,9 +135,13 @@ static const uint16_t VALVE_POWERUP_WAIT_MS = 30000;
 #define ALARM_DURATION_MS   60000UL  // 1-minute alarm auto-stop
 #define HANDLE_ALERT_NIGHT_MIN_MS 10000UL
 #define INTER_CTRL_POLL_MS  250UL
-#define DS18B20_CONV_MS     375UL
+#define DS18B20_CONV_MS              375UL
+#define SENSOR_FAULT_DEBOUNCE_MS   60000UL   // stale sTemp[] keeps feeding pump-duty calc until this expires
+#define SENSOR_PWR_CYCLE_GRACE_MS  40000UL   // time into a failure run before trying the relay power-cycle
+#define BUS_RECOVERY_RETRY_MS      10000UL   // min gap between 1-Wire bus recovery attempts
+#define SENSOR_PWR_CYCLE_MS         2000UL   // 1-Wire bus power-relay cut duration on sensor fault
 #define RS485_RX_TIMEOUT_MS 200UL
-#define COMMS_FAULT_THRESHOLD 20
+#define COMMS_FAULT_TIMEOUT_MS 120000UL // time since last good H packet before flagging comms fault
 #define FAN_RPM_FAULT_DELAY_MS 5000UL
 #define VAC_PUMP_MAX_MS    1800000UL // 30 minutes
 #define VAC_PUMP_PREWARM_MS  2000UL  // pump-on lead time before valve opens
@@ -160,10 +165,12 @@ Adafruit_INA219 ina219;   // address 0x40
 //  SENSOR STATE
 // ============================================================
 
-float     sTemp[NUM_SENSORS];        // current readings in °C (NAN = fault)
-bool      sFault[NUM_SENSORS];       // true = sensor currently faulted
-uint8_t   sFailCount[NUM_SENSORS];   // consecutive invalid readings
-uint8_t   sGoodCount[NUM_SENSORS];   // consecutive valid readings
+float         sTemp[NUM_SENSORS];        // current readings in °C (NAN = fault)
+bool          sFault[NUM_SENSORS];       // true = sensor currently faulted
+uint8_t       sFailCount[NUM_SENSORS];   // consecutive invalid readings
+uint8_t       sGoodCount[NUM_SENSORS];   // consecutive valid readings
+unsigned long sFaultTimerMs[NUM_SENSORS]; // millis() when first bad read of current run started
+bool          sPwrCycled[NUM_SENSORS];    // relay power-cycle already tried for this failure run
 
 static inline bool tempValid(float t) {
     return !isnan(t) && t != 85.0f && t != -127.0f && t != -128.0f
@@ -571,6 +578,8 @@ bool  simPumpSpdActive = false; uint8_t simPumpSpdVal = 0;
 
 unsigned long lastSensorConvMs = 0;
 bool          sensorConvStarted = false;
+unsigned long busRecoveryLastMs = 0;
+uint16_t      busRecoveryCount  = 0;
 
 void startSensorConversion() {
     sensors.setResolution(11);
@@ -578,6 +587,61 @@ void startSensorConversion() {
     sensors.requestTemperatures();
     lastSensorConvMs = millis();
     sensorConvStarted = true;
+}
+
+// All 6 sensors faulting together means the shared bus itself is wedged
+// (noise/glitch near the DC relay wiring), not 6 simultaneous sensor
+// failures. A plain OneWire::reset() is already sent every conversion
+// cycle and isn't clearing it, so force the line low well past the
+// 480us reset spec to break a stuck device out of mid-transaction, then
+// re-enumerate — this is the software equivalent of the power-cycle
+// that currently fixes it.
+void recoverOneWireBus() {
+    pinMode(PIN_ONE_WIRE, OUTPUT);
+    digitalWrite(PIN_ONE_WIRE, LOW);
+    delayMicroseconds(2000);
+    digitalWrite(PIN_ONE_WIRE, HIGH);
+    pinMode(PIN_ONE_WIRE, INPUT);
+    delayMicroseconds(500);
+
+    for (uint8_t i = 0; i < 4; i++) oneWire.reset();
+
+    sensors.begin();
+    sensors.setResolution(12);
+
+    busRecoveryCount++;
+    busRecoveryLastMs = millis();
+#ifdef DEBUG_SERIAL
+    Serial.print(F("W: 1-Wire bus recovery #"));
+    Serial.println(busRecoveryCount);
+#endif
+}
+
+bool          sensorPwrCycling      = false;
+unsigned long sensorPwrCycleStartMs = 0;
+uint16_t      sensorPwrCycleCount   = 0;
+
+// A DS18B20 latched low overrides any host-side reset pulse (OneWire is
+// open-drain — whichever device drives low wins), so recoverOneWireBus()'s
+// data-line toggle alone can't clear it. This cuts real VDD power to the
+// bus via the D50 relay for SENSOR_PWR_CYCLE_MS, which does.
+void startSensorPwrCycle() {
+    if (sensorPwrCycling) return;
+    digitalWrite(PIN_SENSOR_PWR_RELAY, RELAY_ON);
+    sensorPwrCycleStartMs = millis();
+    sensorPwrCycling = true;
+    sensorPwrCycleCount++;
+#ifdef DEBUG_SERIAL
+    Serial.print(F("W: 1-Wire bus power-cycle #"));
+    Serial.println(sensorPwrCycleCount);
+#endif
+}
+
+void updateSensorPwrCycle() {
+    if (sensorPwrCycling && (millis() - sensorPwrCycleStartMs >= SENSOR_PWR_CYCLE_MS)) {
+        digitalWrite(PIN_SENSOR_PWR_RELAY, RELAY_OFF);
+        sensorPwrCycling = false;
+    }
 }
 
 void readSensors() {
@@ -590,6 +654,7 @@ void readSensors() {
         if (tempValid(t)) {
             sTemp[i]      = t;
             sFailCount[i] = 0;
+            sPwrCycled[i] = false;
             if (sGoodCount[i] < 3) sGoodCount[i]++;
             if (sGoodCount[i] >= 3 && sFault[i]) {
                 sFault[i] = false;
@@ -603,8 +668,13 @@ void readSensors() {
             }
         } else {
             sGoodCount[i] = 0;
-            if (sFailCount[i] < 3) sFailCount[i]++;
-            if (sFailCount[i] >= 3 && !sFault[i]) {
+            if (sFailCount[i] == 0) sFaultTimerMs[i] = millis();
+            if (sFailCount[i] < 255) sFailCount[i]++;
+            if (!sPwrCycled[i] && (millis() - sFaultTimerMs[i] >= SENSOR_PWR_CYCLE_GRACE_MS)) {
+                sPwrCycled[i] = true;
+                startSensorPwrCycle();
+            }
+            if (!sFault[i] && (millis() - sFaultTimerMs[i] >= SENSOR_FAULT_DEBOUNCE_MS)) {
                 sFault[i] = true;
                 sTemp[i]  = NAN;
                 static const uint32_t sensorFaultMask[NUM_SENSORS] = {
@@ -616,6 +686,15 @@ void readSensors() {
             }
         }
     }
+
+    bool allFault = true;
+    for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+        if (!sFault[i]) { allFault = false; break; }
+    }
+    if (allFault && (millis() - busRecoveryLastMs >= BUS_RECOVERY_RETRY_MS)) {
+        recoverOneWireBus();
+    }
+
 #ifdef DEBUG_SERIAL
     for (uint8_t i = 0; i < NUM_SENSORS; i++) {
         if (sSimulate[i]) { sTemp[i] = sSim[i]; sFault[i] = false; }
@@ -786,6 +865,8 @@ void setSolarPumpDuty(uint8_t duty) {
         pumpOutputState = false;
     }
 }
+
+void getCurrentTime(uint8_t &h, uint8_t &m);
 
 void updateSolarPump() {
     if (pumpTargetDuty == 0) {
@@ -1150,12 +1231,12 @@ void updateWinterSolar(float tankBottomC) {
 
     // Solar trigger: hot >= 18°C
     bool triggerMet = (hot >= 18.0f);
+    bool pvLow      = !growatt.valid || (growatt.pv1W + growatt.pv2W) < 350;
 
     if (!triggerMet) {
         if (solarPumpActive) {
-            // Hot dropped — check if hot > cold + 2°C to keep running
-            if ((hot - cold) <= 2.0f) {
-                // Stop solar
+            // Stop on end-of-day: low diff + low PV
+            if ((hot - cold) <= 2.0f && pvLow) {
                 solarColdValve.setClose();
                 resetSolarPumpOverrides();
                 setSolarPumpDuty(0);
@@ -1182,8 +1263,8 @@ void updateWinterSolar(float tankBottomC) {
     setSolarPumpDuty(finalDuty);
 
 
-    // Stop condition: hot no longer > cold + 2°C
-    if ((hot - cold) <= 2.0f) {
+    // Stop condition: end of day (low diff + low PV)
+    if ((hot - cold) <= 2.0f && pvLow) {
         solarColdValve.setClose();
         resetSolarPumpOverrides();
         setSolarPumpDuty(0);
@@ -1197,7 +1278,8 @@ void updateWinterSolar(float tankBottomC) {
 // ============================================================
 
 void updateSummerSolar() {
-    static bool solarDumpActive = false;
+    static bool solarDumpActive   = false;
+    static bool hotColdDumpActive = false;
 
     if (sFault[SENSOR_SOLAR_HOT] || sFault[SENSOR_SOLAR_COLD]) {
         if (!solarDumpActive) {
@@ -1218,32 +1300,55 @@ void updateSummerSolar() {
     }
 
     if (solarDumpActive) {
-        // Sensor fault cleared — stop the dump-mode UFH pump and exit dump state
+        // Sensor fault cleared — stop the dump-mode UFH pump/valve and exit dump state
         digitalWrite(PIN_UFH_PUMP, RELAY_OFF);
+        ufhColdValve.setClose();
         solarDumpActive = false;
         solarDumpUFHOn  = false;
     }
 
     float hot     = sTemp[SENSOR_SOLAR_HOT];
     float cold    = sTemp[SENSOR_SOLAR_COLD];
-    // pvActive goes true immediately when PV >= 200W; goes false only after 5 continuous minutes below 200W.
-    // Holds last state during Growatt comms outage. End-of-day also requires arrayLow (panels < 40°C).
-    static bool          lastPvActive    = false;
-    static unsigned long pvBelowStartMs  = 0;
-    if (growatt.valid) {
-        if ((growatt.pv1W + growatt.pv2W) >= 200) {
-            lastPvActive   = true;
-            pvBelowStartMs = 0;
-        } else {
-            if (pvBelowStartMs == 0) pvBelowStartMs = millis();
-            if (millis() - pvBelowStartMs >= 300000UL) lastPvActive = false;
-        }
-    }
-    bool pvActive = lastPvActive;
 
-    // Summer solar startup condition (PV export >= 500W, solar >= 50°C, or heater powered)
-    bool startTrigger = hot >= 50.0f || cold >= 50.0f
+    // Critical overheat: either pipe >= 95°C — too hot to keep circulating or dump through
+    // UFH. Close everything down; only the sensor-fault dump above takes priority over this.
+    if (hot >= 95.0f || cold >= 95.0f) {
+        solarColdValve.setClose();
+        if (hotColdDumpActive) {
+            ufhColdValve.setClose();
+            digitalWrite(PIN_UFH_PUMP, RELAY_OFF);
+            hotColdDumpActive = false;
+            solarDumpUFHOn    = false;
+        }
+        resetSolarPumpOverrides();
+        setSolarPumpDuty(0);
+        solarPumpActive = false;
+        setFault(FAULT_W_SOLAR_OVERHEAT_HOT);
+        return;
+    }
+
+    // Solar starts at 80°C flat in MAX mode; in tank+ mode at tank_top or 80°C,
+    // whichever is reached first. Heater running also forces a start regardless of mode.
+    bool tankTopFault = (lastH.tempTankTop == TEMP_FAULT);
+    float tankTopC    = tankTopFault ? 60.0f : (float)lastH.tempTankTop / 10.0f;
+    bool hotPipeFault = (lastH.tempHotPipe == TEMP_FAULT);
+    float hotPipeC    = hotPipeFault ? 0.0f : (float)lastH.tempHotPipe / 10.0f;
+    SolarTargetMode tgtMode = hasHPacket ? (SolarTargetMode)lastH.solarTargetMode : SOLAR_TANK_PLUS8;
+
+    float startThreshold = (tgtMode == SOLAR_MAX) ? 80.0f : min(tankTopC, 80.0f);
+    bool startTriggerRaw = hot >= startThreshold || cold >= startThreshold
                          || (hasHPacket && lastH.heaterPowerPct > 0);
+
+    // Require the start condition to hold continuously for 20s before actually
+    // starting solar — filters brief sensor blips/noise around the threshold.
+    static unsigned long startTriggerSinceMs = 0;
+    if (startTriggerRaw) {
+        if (startTriggerSinceMs == 0) startTriggerSinceMs = millis();
+    } else {
+        startTriggerSinceMs = 0;
+    }
+    bool startTrigger = startTriggerRaw && startTriggerSinceMs != 0
+                         && (millis() - startTriggerSinceMs >= 20000UL);
 
     if (!startTrigger && !solarPumpActive) return;
 
@@ -1256,6 +1361,13 @@ void updateSummerSolar() {
         solarActiveEver  = true;
     }
 
+    // Recovering from a transient fault after today's sequence already completed —
+    // don't re-run cold-start, just restore the flag/valve so H sees solar running again.
+    if (startTrigger && !solarPumpActive && summerSeqDone) {
+        solarColdValve.setOpen();
+        solarPumpActive = true;
+    }
+
     if (!solarPumpActive && !startTrigger) return;
 
     // Advance to running when H reaches phase 3; pump modulation runs regardless of phase
@@ -1264,12 +1376,8 @@ void updateSummerSolar() {
         summerSeqDone = true;
     }
 
-    // Determine pump target: solar hot vs target (tank+5 or tank+8 from H data)
-    bool tankTopFault = (lastH.tempTankTop == TEMP_FAULT);
-    float tankTopC    = tankTopFault ? 60.0f : (float)lastH.tempTankTop / 10.0f;
-
-    SolarTargetMode tgtMode = hasHPacket ? (SolarTargetMode)lastH.solarTargetMode : SOLAR_TANK_PLUS8;
-    float solarTarget  = (tgtMode == SOLAR_MAX) ? 87.0f : min(tankTopC + 8.0f, 87.0f);
+    // Determine pump target: solar hot vs target (tank+13 or MAX 87 from H data)
+    float solarTarget  = (tgtMode == SOLAR_MAX) ? 87.0f : min(tankTopC + 13.0f, 87.0f);
 
     // Cal override: H sets calPumpActive=1 and drives solarTarget remotely.
     // calSolarTargetC==0 during PRE_RAMP: stop pump so heater can heat up unimpeded.
@@ -1321,35 +1429,65 @@ void updateSummerSolar() {
 #endif
         if (hasHPacket && lastH.heaterPowerPct > 0 && lastH.hPumpDutyPct > finalDuty && hot < solarTarget)
             finalDuty = 0;
-        if (hasHPacket && lastH.twoPortHeaterSide && lastH.summerStartupPhase >= 3
-            && hot < solarTarget && hot < 65.0f
-            && cold < solarTarget && cold < 65.0f)
+        if (hasHPacket && lastH.twoPortHeaterSide && lastH.botTankOpen && lastH.summerStartupPhase >= 3
+            && hot < solarTarget && cold < solarTarget
+            && hot < 80.0f && cold < 80.0f
+            && (tankTopFault || (hot <= tankTopC && cold <= tankTopC))
+            && !hotPipeFault && hotPipeC < tankTopC)
             finalDuty = 0;
         setSolarPumpDuty(finalDuty);
     }
 
 
-    // Hot side overheat: tank bottom < 70°C AND solar hot > 91°C AND pump at 100%
-    if (!tankBotStale && tankBotC < 70.0f && hot > 91.0f && duty == 100) {
+    // Hot or cold side overheat: tank bottom < 70°C AND (solar hot or cold) > 91°C AND pump at 100%.
+    // pumpTargetDuty (not local `duty`) so this also catches the cold-side Rule 4 flush override.
+    bool solarOverheat = (hot > 91.0f || cold > 91.0f);
+    if (!tankBotStale && tankBotC < 70.0f && solarOverheat && pumpTargetDuty == 100) {
         setFault(FAULT_W_SOLAR_OVERHEAT_HOT);
-    } else if (hot <= 91.0f) {
+    } else if (hot <= 91.0f && cold <= 91.0f) {
         clearFault(FAULT_W_SOLAR_OVERHEAT_HOT);
     }
 
-    // Dump through UFH between 91°C and 93°C; close above 93°C (too hot for UFH)
-    if (hot > 91.0f && hot < 93.0f && sTemp[SENSOR_SOLAR_COLD] < 93.0f) {
+    // Dump through UFH (valve + pump) between 91°C and 95°C on either pipe; the >= 95°C
+    // hard stop above already closes this down and returns before we reach here.
+    // Edge-triggered so we don't fight a concurrent legitimate UFH heating session
+    // every loop iteration.
+    bool dumpNeeded = solarOverheat;
+    if (dumpNeeded && !hotColdDumpActive) {
         ufhColdValve.setOpen();
-    } else {
+        digitalWrite(PIN_UFH_PUMP, RELAY_ON);
+        hotColdDumpActive = true;
+        solarDumpUFHOn    = true;
+    } else if (!dumpNeeded && hotColdDumpActive) {
         ufhColdValve.setClose();
+        digitalWrite(PIN_UFH_PUMP, RELAY_OFF);
+        hotColdDumpActive = false;
+        solarDumpUFHOn    = false;
     }
 
-    // End-of-day abort (all phases): PV < 200W + differential < 6°C + both pipes below 40°C.
-    // Sensor faults default to abort-condition-met (cannot confirm heat present).
-    bool pipeCool = sFault[SENSOR_SOLAR_HOT] || sFault[SENSOR_SOLAR_COLD]
-                     || (hot - cold) < 6.0f;
-    bool arrayLow = sFault[SENSOR_SOLAR_HOT] || sFault[SENSOR_SOLAR_COLD]
-                     || (hot < 40.0f && cold < 40.0f);
-    if (!pvActive && pipeCool && arrayLow) {
+    // End-of-day abort: solar exhausted for 10+ consecutive minutes — both solar pipes
+    // below tank-mid, PV low, hot~cold near equilibrium (no more useful gain), heater off,
+    // SOC not already full. Growatt outage (growatt.valid false) assumes PV low / SOC low
+    // rather than blocking shutdown on stale comms.
+    bool socLow = growatt.valid ? (growatt.battSocPct < 95) : true;
+    bool pvLow  = growatt.valid ? ((growatt.pv1W + growatt.pv2W) < 300) : true;
+    bool belowMidTank = hasHPacket && lastH.tempTankMid != TEMP_FAULT
+                        && hot  < (float)lastH.tempTankMid / 10.0f
+                        && cold < (float)lastH.tempTankMid / 10.0f;
+    bool nearEquilibrium = !sFault[SENSOR_SOLAR_HOT] && !sFault[SENSOR_SOLAR_COLD]
+                           && (hot - cold) < 6.0f;
+    bool heaterOff = !(hasHPacket && lastH.heaterPowerPct > 0);
+    bool eodCondition = belowMidTank && pvLow && nearEquilibrium && heaterOff && socLow;
+
+    static unsigned long eodCondStartMs = 0;
+    if (eodCondition) {
+        if (eodCondStartMs == 0) eodCondStartMs = millis();
+    } else {
+        eodCondStartMs = 0;
+    }
+    bool eodPvLow = eodCondStartMs != 0 && (millis() - eodCondStartMs >= 600000UL);
+
+    if (eodPvLow) {
         solarColdValve.setClose();
         ufhColdValve.setClose();
         resetSolarPumpOverrides();
@@ -1587,7 +1725,7 @@ void updateWinchInputs() {
     if (safetyLimit) {
         setFault(FAULT_W_WINCH_OVER_OPEN);
     } else {
-        // Clears automatically when switch opens (but LED clears only on alert reset)
+        clearFault(FAULT_W_WINCH_OVER_OPEN);
     }
 
     // Manual buttons — hold to run; reed lockouts stop the winch automatically
@@ -1874,7 +2012,7 @@ void checkSolarPumpFault() {
             setFault(FAULT_W_SOLAR_PUMP_OVERCURRENT);
             setSolarPumpDuty(0);
             if (!ocDumpActive && !sFault[SENSOR_SOLAR_HOT] && !sFault[SENSOR_SOLAR_COLD]) {
-                if (sTemp[SENSOR_SOLAR_HOT] < 93.0f && sTemp[SENSOR_SOLAR_COLD] < 93.0f) {
+                if (sTemp[SENSOR_SOLAR_HOT] < 95.0f && sTemp[SENSOR_SOLAR_COLD] < 95.0f) {
                     ufhColdValve.setOpen();
                     solarColdValve.setOpen();
                     digitalWrite(PIN_UFH_PUMP, RELAY_ON);
@@ -1907,7 +2045,7 @@ void checkSolarPumpFault() {
                 ucPhase = PUC_FAULT;
                 setFault(FAULT_W_SOLAR_PUMP);
                 if (!sFault[SENSOR_SOLAR_HOT] && !sFault[SENSOR_SOLAR_COLD]) {
-                    if (sTemp[SENSOR_SOLAR_HOT] < 93.0f && sTemp[SENSOR_SOLAR_COLD] < 93.0f) {
+                    if (sTemp[SENSOR_SOLAR_HOT] < 95.0f && sTemp[SENSOR_SOLAR_COLD] < 95.0f) {
                         ufhColdValve.setOpen();
                         solarColdValve.setOpen();
                         digitalWrite(PIN_UFH_PUMP, RELAY_ON);
@@ -2081,7 +2219,7 @@ void receiveHToWPacket() {
     // Timeout — no valid packet received
     missedPackets++;
     rs485RxMiss++;
-    if (missedPackets >= COMMS_FAULT_THRESHOLD && !rs485CommsFault) {
+    if (millis() - lastRxMs >= COMMS_FAULT_TIMEOUT_MS && !rs485CommsFault) {
         rs485CommsFault = true;
         setFault(FAULT_W_RS485_COMMS);
     }
@@ -2176,6 +2314,14 @@ WF(FAULT_W_SOLAR_OVERHEAT_HOT,   "SOLAR_OVERHEAT_HOT")
     WF(FAULT_W_SENSOR_OUTSIDE_AIR,   "SENSOR_OUTSIDE_AIR")
     #undef WF
     if (!any) Serial.println(F("  none"));
+    if (busRecoveryCount > 0) {
+        Serial.print(F("  1-wire bus recoveries: "));
+        Serial.println(busRecoveryCount);
+    }
+    if (sensorPwrCycleCount > 0) {
+        Serial.print(F("  1-wire pwr cycles: "));
+        Serial.println(sensorPwrCycleCount);
+    }
 }
 
 static void dbgMode() {
@@ -2549,6 +2695,7 @@ void setup() {
     pinMode(PIN_WINCH_POWER,     OUTPUT); digitalWrite(PIN_WINCH_POWER,     RELAY_OFF);
     pinMode(PIN_WINCH_DIR_CLOSE, OUTPUT); digitalWrite(PIN_WINCH_DIR_CLOSE, RELAY_OFF);
     pinMode(PIN_MIDPOINT_LED,    OUTPUT); digitalWrite(PIN_MIDPOINT_LED,    RELAY_OFF);
+    pinMode(PIN_SENSOR_PWR_RELAY, OUTPUT); digitalWrite(PIN_SENSOR_PWR_RELAY, RELAY_OFF);
     pinMode(PIN_RS485_DE_LINK,   OUTPUT); digitalWrite(PIN_RS485_DE_LINK,   LOW);        // not a relay
     pinMode(PIN_RS485_DE_GROWATT, OUTPUT); digitalWrite(PIN_RS485_DE_GROWATT, LOW);      // not a relay
     pinMode(PIN_VAC_ISO_OPEN,    OUTPUT); digitalWrite(PIN_VAC_ISO_OPEN,    RELAY_OFF);
@@ -2595,6 +2742,7 @@ void setup() {
         sFault[i] = false;
         sFailCount[i] = 0;
         sGoodCount[i] = 0;
+        sPwrCycled[i] = false;
     }
 #ifdef DEBUG_SERIAL
     memset(sSimulate, 0, sizeof(sSimulate));
@@ -2662,6 +2810,7 @@ void loop() {
 
     if (!sensorConvStarted) startSensorConversion();
     readSensors();
+    updateSensorPwrCycle();
 
     // Valve & winch state machines (non-blocking)
     vacIsoValve.update();

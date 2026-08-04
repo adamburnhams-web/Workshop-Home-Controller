@@ -761,3 +761,31 @@ See updated "Auto mode duty calculation" and "Hot pipe cap" above — noon → 1
 ### Page 2 display — Consumption row added
 
 New "Cons:" row (instantaneous Watts: `PV1+PV2 + Import − BattCharge − Heater`, matching the existing `kwhConsumption` accumulator formula) added under Import. Heater row moved to directly below Consumption, above Battery (was: after SOC, at the bottom of the power block).
+
+---
+
+## RS485 Comms Fault — threshold 60s → 120s
+
+Raised on both controllers: `COMMS_FAULT_THRESHOLD` 240 → 480 (`controller_h`, 250ms poll heartbeat) and `COMMS_FAULT_TIMEOUT_MS` 60000 → 120000 (`controller_w`). Link is confirmed functional for current needs; 120s reduces false-positive fault entries from brief drop-outs (the officially documented figure was already stale — spec said "5 consecutive packets missed (~1.25s)" when the code has always been a 60s-since-last-good-packet timer). `controller_h_new` was left at its own existing (shorter, WIP) threshold, not touched here. The separate 60s heater-safety cutoff (`updateHeaterDuty()`: no W packet for 60s → heater forced off) is a distinct mechanism and was not changed.
+
+## Heater/grid-import trip fault (H controller, both builds)
+
+New `checkHeaterImportTrip()`: if SOC > 15%, battery isn't discharging faster than 3.9A-equivalent, and grid import stays > 100W for 20s continuously while Growatt data is valid, the heater is force-stopped (`heaterRunning = false`, `heaterLevelIdx = 0`) and `FAULT_H_HEATER_IMPORT_TRIP` (new bit, `hFaultFlags` bit 13) is raised — catches the inverter/CB having tripped while panels are still producing, so the heater would otherwise keep calling for power the array can't actually deliver, silently pulling from the grid. Clears after import stays ≤0W for 20s. Unused `FAULT_H_HEATER_OVERHEAT_WARN` bit removed (superseded by the level-based overheat taper in `checkHeaterFaults()`; nothing set it anymore). `botTankOpen` (bottom-tank valve state) added to the H→W packet so W can see it — used by the new summer-solar heater-side idle check below.
+
+## Summer solar startup / end-of-day rework (W controller)
+
+- **Start trigger**: raised from `hot/cold ≥ 50°C` to `hot/cold ≥ 80°C`, OR either solar pipe above H's reported tank-mid temperature (worth circulating even if not yet "hot") — replaces the old PV-export-based trigger entirely.
+- **Solar target**: `tankTop + 13°C` (was `+8°C`), still capped at 87°C.
+- **Heater-side idle check**: the "don't run solar into a heater-cooling loop" skip now also requires `botTankOpen` (bottom-tank valve confirmed open), not just `twoPortHeaterSide` — avoids a false idle read while the valve is still moving.
+- **`pvActive` drop-out window**: extended 5 → 10 minutes below 200W before latching false (reduces cycling on brief cloud cover); comment updated to match.
+- **End-of-day abort**: replaced the old pipe-temperature-based abort (both pipes < 40°C + differential < 6°C) with a time/SOC-based one — aborts at or after 19:00, or once PV has been below 200W for 10+ minutes while battery SOC is under 90%.
+
+## Winch over-open fault — actually clears now
+
+`updateWinchInputs()`: the safety-limit-switch-opens branch previously had only a comment claiming the fault "clears automatically" with no code doing it (`FAULT_W_WINCH_OVER_OPEN` stayed latched until the next full alert-reset). Now calls `clearFault(FAULT_W_WINCH_OVER_OPEN)` there, matching the documented behavior.
+
+## H controller_new — tiered per-sensor fault debounce (WIP, not yet ported to controller_h)
+
+New `sensorFaultGraceMs[]` per sensor: tank/cold-pipe sensors tolerate 8h of stale/failed reads before `sFault[]` actually flips (holds last known value); hot-pipe gets 15s (short, since `checkHeaterFaults()` cuts the heater the moment it faults); heater-outlet sensors are excluded (grace handled separately, below). A new fast `sRawFault[]` (3-sample debounce, no grace) drives the page-1 red "FAULT" readout immediately, decoupled from the slower, grace-gated `sFault[]` that gates the logged fault flag/banner/LED.
+
+Heater-outlet single-sensor-fault handling reworked: previously raised `FAULT_H_SENSOR_HEATER_OUT(_2)` immediately after a 5s grace while continuing to run on the other sensor. Now: continues on the remaining sensor for 90s, then cuts `heaterLevelCap` to 0 (heater stops firing) while still not raising the fault flag until 120s — separates "stop producing heat because we've lost confidence" from "escalate to a logged fault," giving 30s of no-heat-but-no-alarm before the fault actually logs.

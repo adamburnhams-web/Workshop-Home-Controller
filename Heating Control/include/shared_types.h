@@ -63,7 +63,6 @@ enum WinchState : uint8_t {
 #define FAULT_W_FIRE_ALARM           (1UL << 18)
 
 // H-side faults (in hFaultFlags)
-#define FAULT_H_HEATER_OVERHEAT_WARN (1UL << 0)
 #define FAULT_H_HEATER_OVERHEAT_SHUT (1UL << 1)
 #define FAULT_H_HEATER_ELEMENT_FAIL  (1UL << 2)
 #define FAULT_H_RS485_COMMS          (1UL << 3)
@@ -76,6 +75,7 @@ enum WinchState : uint8_t {
 #define FAULT_H_SENSOR_COLD_PIPE     (1UL << 10)
 #define FAULT_H_SENSOR_HEATER_OUT    (1UL << 11)
 #define FAULT_H_SENSOR_HEATER_OUT_2  (1UL << 12)
+#define FAULT_H_HEATER_IMPORT_TRIP   (1UL << 13)
 
 // ── W-side valve state bitmask (valveStates field) ──────────
 #define VSTATE_UFH_COLD_OPEN    (1 << 0)
@@ -201,6 +201,9 @@ struct __attribute__((packed)) HToWPacket {
 
     // 2-port valve state (1 = heater cold side / top-of-tank, 0 = mid-tank side)
     uint8_t twoPortHeaterSide;
+
+    // Bottom-of-tank valve state (1 = open)
+    uint8_t botTankOpen;
 
     // Pump calibration (populated only when DEBUG_SERIAL active; always zero in production)
     uint8_t  calPumpActive;

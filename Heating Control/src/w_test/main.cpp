@@ -1223,7 +1223,8 @@ void updateSummerSolar() {
     float hot     = sTemp[SENSOR_SOLAR_HOT];
     float cold    = sTemp[SENSOR_SOLAR_COLD];
     // pvActive goes true immediately when PV >= 200W; goes false only after 5 continuous minutes below 200W.
-    // Holds last state during Growatt comms outage. End-of-day also requires arrayLow (panels < 40°C).
+    // pvActive goes false after 10 continuous minutes below 200W; resets immediately on >= 200W.
+    // Holds last state during Growatt comms outage.
     static bool          lastPvActive    = false;
     static unsigned long pvBelowStartMs  = 0;
     if (growatt.valid) {
@@ -1232,13 +1233,16 @@ void updateSummerSolar() {
             pvBelowStartMs = 0;
         } else {
             if (pvBelowStartMs == 0) pvBelowStartMs = millis();
-            if (millis() - pvBelowStartMs >= 300000UL) lastPvActive = false;
+            if (millis() - pvBelowStartMs >= 600000UL) lastPvActive = false;
         }
     }
     bool pvActive = lastPvActive;
 
-    // Summer solar startup condition (PV export >= 500W, solar >= 50°C, or heater powered)
-    bool startTrigger = hot >= 50.0f || cold >= 50.0f
+    // Solar starts when panels are above mid-tank temp (worth circulating), above 80°C, or heater running.
+    bool aboveMidTank = hasHPacket && lastH.tempTankMid != TEMP_FAULT
+                        && (hot >= (float)lastH.tempTankMid / 10.0f
+                            || cold >= (float)lastH.tempTankMid / 10.0f);
+    bool startTrigger = hot >= 80.0f || cold >= 80.0f || aboveMidTank
                          || (hasHPacket && lastH.heaterPowerPct > 0);
 
     if (!startTrigger && !solarPumpActive) return;
@@ -1260,12 +1264,12 @@ void updateSummerSolar() {
         summerSeqDone = true;
     }
 
-    // Determine pump target: solar hot vs target (tank+5 or tank+8 from H data)
+    // Determine pump target: solar hot vs target (tank+13 or MAX 87 from H data)
     bool tankTopFault = (lastH.tempTankTop == TEMP_FAULT);
     float tankTopC    = tankTopFault ? 60.0f : (float)lastH.tempTankTop / 10.0f;
 
     SolarTargetMode tgtMode = hasHPacket ? (SolarTargetMode)lastH.solarTargetMode : SOLAR_TANK_PLUS8;
-    float solarTarget  = (tgtMode == SOLAR_MAX) ? 87.0f : min(tankTopC + 8.0f, 87.0f);
+    float solarTarget  = (tgtMode == SOLAR_MAX) ? 87.0f : min(tankTopC + 13.0f, 87.0f);
 
     // Cal override: H sets calPumpActive=1 and drives solarTarget remotely.
     // calSolarTargetC==0 during PRE_RAMP: stop pump so heater can heat up unimpeded.
@@ -1317,7 +1321,7 @@ void updateSummerSolar() {
 #endif
         if (hasHPacket && lastH.heaterPowerPct > 0 && lastH.hPumpDutyPct > finalDuty && hot < solarTarget)
             finalDuty = 0;
-        if (hasHPacket && lastH.twoPortHeaterSide && lastH.summerStartupPhase >= 3
+        if (hasHPacket && lastH.twoPortHeaterSide && lastH.botTankOpen && lastH.summerStartupPhase >= 3
             && hot < solarTarget && hot < 65.0f
             && cold < solarTarget && cold < 65.0f)
             finalDuty = 0;
@@ -1339,13 +1343,10 @@ void updateSummerSolar() {
         ufhColdValve.setClose();
     }
 
-    // End-of-day abort (all phases): PV < 200W + differential < 6°C + both pipes below 40°C.
-    // Sensor faults default to abort-condition-met (cannot confirm heat present).
-    bool pipeCool = sFault[SENSOR_SOLAR_HOT] || sFault[SENSOR_SOLAR_COLD]
-                     || (hot - cold) < 6.0f;
-    bool arrayLow = sFault[SENSOR_SOLAR_HOT] || sFault[SENSOR_SOLAR_COLD]
-                     || (hot < 40.0f && cold < 40.0f);
-    if (!pvActive && pipeCool && arrayLow) {
+    // End-of-day abort: 19:00 or later, OR PV below 200W for 10+ minutes with SOC under 90%.
+    uint8_t eodH, eodM; getCurrentTime(eodH, eodM);
+    bool eodPvLow = !pvActive && growatt.valid && growatt.battSocPct < 90;
+    if (eodH >= 19 || eodPvLow) {
         solarColdValve.setClose();
         ufhColdValve.setClose();
         resetSolarPumpOverrides();
@@ -1601,7 +1602,7 @@ void updateWinchInputs() {
     if (safetyLimit) {
         setFault(FAULT_W_WINCH_OVER_OPEN);
     } else {
-        // Clears automatically when switch opens (but LED clears only on alert reset)
+        clearFault(FAULT_W_WINCH_OVER_OPEN);
     }
 
     // Manual buttons — hold to run; reed lockouts stop the winch automatically
