@@ -1273,10 +1273,11 @@ bool    sdAvailable   = false;
 bool    sdEjected     = false;
 File    logFile;
 unsigned long lastLogMs = 0;
+bool          needTSSinceLastLog = false; // latched: set on any time-sync reply, read+cleared by logDataRow()
 File    energyLogFile;
 unsigned long lastEnergyLogMs = 0;
 
-static const uint8_t LOG_EXPECTED_COMMAS = 35; // 36 columns = 35 commas
+static const uint8_t LOG_EXPECTED_COMMAS = 38; // 39 columns = 38 commas
 static const uint8_t ENERGY_LOG_EXPECTED_COMMAS = 5; // 6 columns = 5 commas
 
 void initSD() {
@@ -1307,7 +1308,8 @@ void initSD() {
                             "bus_v,fan1rpm,fan2rpm,fan_pct,"
                             "h_pump_pct,pv1_w,pv2_w,batt_w,batt_soc_pct,w_faults,h_faults,"
                             "log_valve,bot_valve,two_port_valve,"
-                            "ufh_cold_v,solar_cold_v,vac_iso_v,fan_flap_v"));
+                            "ufh_cold_v,solar_cold_v,vac_iso_v,fan_flap_v,"
+                            "w_rx_good,w_rx_badframe,h_needts"));
                 f.close();
             }
         }
@@ -1390,7 +1392,14 @@ void logDataRow() {
     logFile.print((lastWPkt.valveStates & VSTATE_UFH_COLD_OPEN)   ? 1 : 0); logFile.print(',');
     logFile.print((lastWPkt.valveStates & VSTATE_SOLAR_COLD_OPEN) ? 1 : 0); logFile.print(',');
     logFile.print((lastWPkt.valveStates & VSTATE_VAC_ISO_OPEN)    ? 1 : 0); logFile.print(',');
-    logFile.println((lastWPkt.valveStates & VSTATE_FAN_FLAP_OPEN) ? 1 : 0);
+    logFile.print((lastWPkt.valveStates & VSTATE_FAN_FLAP_OPEN)   ? 1 : 0); logFile.print(',');
+    // RS485 diagnostics: W's running rx counters, and whether H sent a time-sync
+    // reply since the last log row (latched — a sync reply is a single 250ms
+    // event that would otherwise fall between 5s log rows)
+    logFile.print(lastWPkt.rs485RxGood);     logFile.print(',');
+    logFile.print(lastWPkt.rs485RxBadFrame); logFile.print(',');
+    logFile.println(needTSSinceLastLog ? 1 : 0);
+    needTSSinceLastLog = false;
     logFile.flush();
 }
 
@@ -2603,7 +2612,7 @@ static void pollRS485() {
         }
 
         bool needTS = lastWPkt.requestTimeSync && (millis() - lastTimeSyncSentMs > 5000);
-        if (needTS) lastTimeSyncSentMs = millis();
+        if (needTS) { lastTimeSyncSentMs = millis(); needTSSinceLastLog = true; }
         sendHToWPacket(needTS);
     }
 }

@@ -48,9 +48,9 @@
 // Odd board  (D23–D37): D25 D27 D29 D31 D33 D35 D37  (D23 spare)
 #define PIN_UFH_COLD_DIR    22   // even ch1: SPDT direction relay, NO=open, NC=close
 // D23: spare (odd ch1)
-#define PIN_ALARM_SOUNDER   24   // even ch2: alarm sounder at W
+#define PIN_ALARM_SOUNDER   26   // even ch3: alarm sounder at W
 #define PIN_EXT_LIGHTS      25   // odd  ch2: external LED lights
-#define PIN_SOLAR_COLD_DIR  26   // even ch3: SPDT direction relay
+#define PIN_SOLAR_COLD_DIR  24   // even ch2: SPDT direction relay
 #define PIN_WALL_FAN        27   // odd  ch3: wall axial fan (BES speed controller)
 #define PIN_FAN_FLAP        28   // even ch4: fan flap actuator (open before fan ON)
 #define PIN_WINCH_POWER     29   // odd  ch4: winch power (with direction ch5 or ch6)
@@ -141,7 +141,7 @@ static const uint16_t VALVE_POWERUP_WAIT_MS = 30000;
 #define BUS_RECOVERY_RETRY_MS      10000UL   // min gap between 1-Wire bus recovery attempts
 #define SENSOR_PWR_CYCLE_MS         2000UL   // 1-Wire bus power-relay cut duration on sensor fault
 #define RS485_RX_TIMEOUT_MS 200UL
-#define COMMS_FAULT_TIMEOUT_MS 120000UL // time since last good H packet before flagging comms fault
+#define COMMS_FAULT_TIMEOUT_MS 300000UL // time since last good H packet before flagging comms fault
 #define FAN_RPM_FAULT_DELAY_MS 5000UL
 #define VAC_PUMP_MAX_MS    1800000UL // 30 minutes
 #define VAC_PUMP_PREWARM_MS  2000UL  // pump-on lead time before valve opens
@@ -2125,6 +2125,8 @@ void sendWToHPacket() {
     pkt.solarDumpActive    = solarDumpUFHOn ? 1 : 0;
     pkt.wFaultFlags        = wFaultFlags;
     pkt.requestTimeSync    = (!timeSynced || millis() - lastTimeSyncReceivedMs >= TIME_SYNC_INTERVAL_MS) ? 1 : 0;
+    pkt.rs485RxGood        = rs485RxGood;
+    pkt.rs485RxBadFrame    = rs485RxBadFrame;
 
     uint8_t frame[PKT_MAX_FRAME];
     uint16_t len = pktEncode(frame, sizeof(frame), PKT_DIR_WH, txSeqNum++,

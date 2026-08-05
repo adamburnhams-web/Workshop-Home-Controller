@@ -348,8 +348,8 @@ Updated relay board layout (even board, D22–D36):
 | Pin | Load |
 |---|---|
 | D22 | UFH cold valve direction relay |
-| D24 | Alarm sounder |
-| D26 | Solar cold valve direction relay |
+| D24 | Solar cold valve direction relay |
+| D26 | Alarm sounder |
 | D28 | Fan flap actuator |
 | D30 | Door lock H-bridge relay A |
 | D32 | Door lock H-bridge relay B |
