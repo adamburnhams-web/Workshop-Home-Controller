@@ -651,6 +651,14 @@ void readSensors() {
 
     for (uint8_t i = 0; i < NUM_SENSORS; i++) {
         float t = sensors.getTempC((uint8_t*)DS18B20_ADDRS[i]);
+#ifdef DEBUG_SERIAL
+        // Route the simulated value through the same tempValid()/fault
+        // pipeline a real sensor would use, so a sim value that fails
+        // tempValid() (e.g. set solar_hot -127) exercises the actual
+        // grace-period/relay/debounce/dump logic instead of just faking
+        // a healthy reading.
+        if (sSimulate[i]) t = sSim[i];
+#endif
         if (tempValid(t)) {
             sTemp[i]      = t;
             sFailCount[i] = 0;
@@ -695,11 +703,6 @@ void readSensors() {
         recoverOneWireBus();
     }
 
-#ifdef DEBUG_SERIAL
-    for (uint8_t i = 0; i < NUM_SENSORS; i++) {
-        if (sSimulate[i]) { sTemp[i] = sSim[i]; sFault[i] = false; }
-    }
-#endif
 }
 
 // ============================================================
@@ -1258,7 +1261,7 @@ void updateWinterSolar(float tankBottomC) {
     float   wTarget   = (float)WINTER_UFH_TARGET_C / 10.0f;
     uint8_t duty      = calcPumpDuty(hot, wTarget);
     uint8_t finalDuty = applyPumpSpeedOverrides(duty, hot, cold, wTarget);
-    if (hasHPacket && lastH.heaterPowerPct > 0 && lastH.hPumpDutyPct > finalDuty && hot < wTarget)
+    if (hasHPacket && lastH.heaterPowerPct > 0 && lastH.hPumpDutyPct >= finalDuty && hot < wTarget)
         finalDuty = 0;
     setSolarPumpDuty(finalDuty);
 
@@ -1350,7 +1353,13 @@ void updateSummerSolar() {
     bool startTrigger = startTriggerRaw && startTriggerSinceMs != 0
                          && (millis() - startTriggerSinceMs >= 20000UL);
 
-    if (!startTrigger && !solarPumpActive) return;
+    if (!startTrigger && !solarPumpActive) {
+        // Duty can be left non-zero here by a path that forces it (e.g. the
+        // sensor-fault dump) without going through solarPumpActive=true, so
+        // there's no active->inactive transition to zero it on. Force it here.
+        setSolarPumpDuty(0);
+        return;
+    }
 
     if (startTrigger && !summerSeqDone && summerPhase == SUMPH_IDLE) {
         summerPhase = SUMPH_CIRCULATE_TOP;
@@ -1427,7 +1436,7 @@ void updateSummerSolar() {
 #else
         uint8_t finalDuty = applyPumpSpeedOverrides(duty, hot, cold, solarTarget);
 #endif
-        if (hasHPacket && lastH.heaterPowerPct > 0 && lastH.hPumpDutyPct > finalDuty && hot < solarTarget)
+        if (hasHPacket && lastH.heaterPowerPct > 0 && lastH.hPumpDutyPct >= finalDuty && hot < solarTarget)
             finalDuty = 0;
         if (hasHPacket && lastH.twoPortHeaterSide && lastH.botTankOpen && lastH.summerStartupPhase >= 3
             && hot < solarTarget && cold < solarTarget
@@ -2127,6 +2136,10 @@ void sendWToHPacket() {
     pkt.requestTimeSync    = (!timeSynced || millis() - lastTimeSyncReceivedMs >= TIME_SYNC_INTERVAL_MS) ? 1 : 0;
     pkt.rs485RxGood        = rs485RxGood;
     pkt.rs485RxBadFrame    = rs485RxBadFrame;
+    {
+        uint32_t ageMs = millis() - lastRxMs;
+        pkt.rs485RxAgeS = (uint16_t)min(ageMs / 1000UL, 65535UL);
+    }
 
     uint8_t frame[PKT_MAX_FRAME];
     uint16_t len = pktEncode(frame, sizeof(frame), PKT_DIR_WH, txSeqNum++,
@@ -2161,6 +2174,13 @@ void receiveHToWPacket() {
             memcpy(&lastH, payload, sizeof(HToWPacket));
 #ifdef DEBUG_SERIAL
             if (simHtrPctActive) lastH.heaterPowerPct = simHtrPctVal;
+#endif
+#ifdef DEBUG_SERIAL
+            if (missedPackets > 0) {
+                Serial.print(F("\n[RX OK after "));
+                Serial.print(millis() - lastRxMs);
+                Serial.println(F("ms gap]"));
+            }
 #endif
             hasHPacket = true;
             lastRxMs   = millis();
@@ -2221,6 +2241,9 @@ void receiveHToWPacket() {
     // Timeout — no valid packet received
     missedPackets++;
     rs485RxMiss++;
+#ifdef DEBUG_SERIAL
+    Serial.print('.');   // live, no threshold — one dot per ~200ms miss; wire-wiggle test aid
+#endif
     if (millis() - lastRxMs >= COMMS_FAULT_TIMEOUT_MS && !rs485CommsFault) {
         rs485CommsFault = true;
         setFault(FAULT_W_RS485_COMMS);

@@ -114,8 +114,9 @@ static const bool HEATER_ENABLED = true;
 #define DISPLAY_INACTIVITY_MS   30000UL  // 30s → exit item/option mode
 #define TIME_SYNC_INTERVAL_MS   3600000UL
 #define BUS_LOW_THRESH_DV       140      // 14.0V (×0.1V units)
-#define BUS_PSU_THRESH_DV       120      // 12.0V
-#define BUS_PSU_HYSTERESIS_DV   125      // 12.5V
+#define BUS_PSU_THRESH_DV       125      // 12.5V
+#define BUS_PSU_HYSTERESIS_DV   130      // 13.0V
+#define BUS_PSU_ON_DELAY_MS     5000UL   // 5s before PSU turns on
 #define BUS_RESTORE_THRESH_DV   140      // 14.0V
 #define BUS_LOW_DELAY_MS        10000UL  // 10s before fault
 #define HEATER_RATED_W          3000     // immersion element rated power
@@ -428,8 +429,10 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
     static bool          lastHighSoc    = false;
     static unsigned long surplusStartMs = 0;
     static uint8_t       zeroCount      = 0;
-    static uint16_t      rawPctAccum    = 0;
-    static uint8_t       accumCount     = 0;
+    static uint8_t        rawPctBuf[8]  = {0}; // rolling window of last (up to) 8 samples
+    static uint8_t        rawPctBufIdx  = 0;
+    static uint8_t        rawPctBufCount = 0;
+    static uint16_t       rawPctSum      = 0;
 
     // SOC-limited mode: 5% hysteresis, enter at 55%, leave at 50%
     uint8_t soc     = lastWPkt.battSocPct;
@@ -455,10 +458,10 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
         int16_t battChgW   = lastWPkt.battChargeW;
         int32_t netGridW   = (int32_t)pvExportW - gridImportW;
         int32_t battW      = (int32_t)min((int16_t)0, battChgW);
-        // SOC > 95%: battery essentially full, only 200W reservation regardless of time.
+        // SOC > 85%: battery essentially full, only 200W reservation regardless of time.
         // Otherwise before 14:00: 500W reservation always.
         // After 14:00: 3kW reservation while SOC ≤ 60%, then 1kW once battery is charging freely.
-        int32_t reservationW = (soc > 95) ? 200L
+        int32_t reservationW = (soc > 85) ? 200L
                              : (rtcHour() < 14) ? 500L : (soc > 60 ? 1000L : 3000L);
         int32_t available = (reservationW > 0)
             ? (int32_t)pvExportW - gridImportW + (int32_t)battChgW + heaterCurrentW - reservationW
@@ -468,12 +471,14 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
 
     if (highSoc != lastHighSoc) {
         heaterRunning = false; heaterLevelIdx = 0;
-        surplusStartMs = 0; zeroCount = 0; rawPctAccum = 0; accumCount = 0;
+        surplusStartMs = 0; zeroCount = 0;
+        rawPctBufIdx = 0; rawPctBufCount = 0; rawPctSum = 0;
         lastHighSoc = highSoc;
     }
 
     if (!heaterRunning) {
-        zeroCount = 0; rawPctAccum = 0; accumCount = 0;
+        zeroCount = 0;
+        rawPctBufIdx = 0; rawPctBufCount = 0; rawPctSum = 0;
         if (rawPct == 0) return;
         if (!highSoc) {
             // 500W threshold when solar is off; 150W (5%) when solar is already running
@@ -495,16 +500,27 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
     if (rawPct == 0) {
         if (++zeroCount >= 5) {
             heaterRunning = false; heaterLevelIdx = 0;
-            zeroCount = 0; rawPctAccum = 0; accumCount = 0;
+            zeroCount = 0;
+            rawPctBufIdx = 0; rawPctBufCount = 0; rawPctSum = 0;
         }
         return;
     }
     zeroCount = 0;
 
-    rawPctAccum += rawPct;
-    if (++accumCount < 8) return;
-    uint8_t avgPct = (uint8_t)(rawPctAccum / 8);
-    rawPctAccum = 0; accumCount = 0;
+    // Rolling average: each new packet replaces the oldest of up to 8 samples,
+    // so every packet's output reflects the current sample averaged against
+    // the previous 7 rather than waiting for a batch to fill.
+    if (rawPctBufCount < 8) {
+        rawPctBuf[rawPctBufIdx] = (uint8_t)rawPct;
+        rawPctSum += (uint8_t)rawPct;
+        rawPctBufCount++;
+    } else {
+        rawPctSum -= rawPctBuf[rawPctBufIdx];
+        rawPctBuf[rawPctBufIdx] = (uint8_t)rawPct;
+        rawPctSum += (uint8_t)rawPct;
+    }
+    rawPctBufIdx = (rawPctBufIdx + 1) % 8;
+    uint8_t avgPct = (uint8_t)(rawPctSum / rawPctBufCount);
 
     // Hot pipe cap: 100% at 63°C, linear ramp to 0 at 90°C
     if (!sFault[H_SENSOR_HOT_PIPE]) {
@@ -629,6 +645,7 @@ uint32_t      pumpTestCoolStart = 0;
 
 float busVoltageV = 15.0f;
 bool  psu12vActive = false;
+unsigned long psuOnStartMs = 0;
 unsigned long busLowStartMs = 0;
 bool  busLowActive = false;
 
@@ -643,10 +660,17 @@ void updateBusVoltage() {
     uint16_t vdv = (uint16_t)(busVoltageV * 10.0f); // in 0.1V units
 
     // 12V PSU relay
-    if (!psu12vActive && vdv < BUS_PSU_THRESH_DV) {
-        psu12vActive = true;
-        digitalWrite(PIN_PSU_12V, RELAY_ON);
-    } else if (psu12vActive && vdv >= BUS_PSU_HYSTERESIS_DV) {
+    if (!psu12vActive) {
+        if (vdv < BUS_PSU_THRESH_DV) {
+            if (psuOnStartMs == 0) psuOnStartMs = millis();
+            if (millis() - psuOnStartMs >= BUS_PSU_ON_DELAY_MS) {
+                psu12vActive = true;
+                digitalWrite(PIN_PSU_12V, RELAY_ON);
+            }
+        } else {
+            psuOnStartMs = 0;
+        }
+    } else if (vdv >= BUS_PSU_HYSTERESIS_DV) {
         psu12vActive = false;
         digitalWrite(PIN_PSU_12V, RELAY_OFF);
     }
@@ -1214,7 +1238,8 @@ void updatePVExportOverride() {
 // ============================================================
 
 float kwhPV          = 0.0f;
-float kwhImport      = 0.0f;   // net import; negative = net export
+float kwhImport      = 0.0f;   // gross import only
+float kwhExport      = 0.0f;   // gross export only
 float kwhHeater      = 0.0f;
 float kwhConsumption = 0.0f;
 
@@ -1238,7 +1263,7 @@ void accumulateEnergy() {
     if (rtcValid) {
         uint8_t today = rtcNow.day();
         if (energyLastDay != 0xFF && today != energyLastDay) {
-            kwhPV = kwhImport = kwhHeater = kwhConsumption = 0.0f;
+            kwhPV = kwhImport = kwhExport = kwhHeater = kwhConsumption = 0.0f;
         }
         energyLastDay = today;
     }
@@ -1249,7 +1274,11 @@ void accumulateEnergy() {
         float consumptionW = (float)energyLastPvOutW + energyLastImportW
                             - energyLastBattChgW - heaterW;
         kwhPV          += energyLastPvOutW  * dtH / 1000.0f;
-        kwhImport      += energyLastImportW * dtH / 1000.0f;
+        // energyLastImportW is net (gridImportW - pvExportW); the two source
+        // registers are mutually exclusive, so the positive/negative parts of
+        // the net value recover true gross import and gross export exactly.
+        kwhImport      += max((int16_t)0, energyLastImportW)  * dtH / 1000.0f;
+        kwhExport      += max((int16_t)0, (int16_t)-energyLastImportW) * dtH / 1000.0f;
         kwhHeater      += heaterW           * dtH / 1000.0f;
         kwhConsumption += consumptionW      * dtH / 1000.0f;
     }
@@ -1277,7 +1306,7 @@ bool          needTSSinceLastLog = false; // latched: set on any time-sync reply
 File    energyLogFile;
 unsigned long lastEnergyLogMs = 0;
 
-static const uint8_t LOG_EXPECTED_COMMAS = 38; // 39 columns = 38 commas
+static const uint8_t LOG_EXPECTED_COMMAS = 39; // 40 columns = 39 commas
 static const uint8_t ENERGY_LOG_EXPECTED_COMMAS = 5; // 6 columns = 5 commas
 
 void initSD() {
@@ -1309,7 +1338,7 @@ void initSD() {
                             "h_pump_pct,pv1_w,pv2_w,batt_w,batt_soc_pct,w_faults,h_faults,"
                             "log_valve,bot_valve,two_port_valve,"
                             "ufh_cold_v,solar_cold_v,vac_iso_v,fan_flap_v,"
-                            "w_rx_good,w_rx_badframe,h_needts"));
+                            "w_rx_good,w_rx_badframe,h_needts,w_rx_age_s"));
                 f.close();
             }
         }
@@ -1398,7 +1427,8 @@ void logDataRow() {
     // event that would otherwise fall between 5s log rows)
     logFile.print(lastWPkt.rs485RxGood);     logFile.print(',');
     logFile.print(lastWPkt.rs485RxBadFrame); logFile.print(',');
-    logFile.println(needTSSinceLastLog ? 1 : 0);
+    logFile.print(needTSSinceLastLog ? 1 : 0); logFile.print(',');
+    logFile.println(lastWPkt.rs485RxAgeS);
     needTSSinceLastLog = false;
     logFile.flush();
 }
@@ -1821,8 +1851,11 @@ void drawPage2() {
     kwhStr(lv, sizeof(lv), kwhPV);      kwhStr(rv, sizeof(rv), kwhImport);
     wRow(4, 80, 244, 336, y, "PVkWh:", lv, "ImpkWh:", rv); y += ROW;
 
-    kwhStr(lv, sizeof(lv), kwhHeater);  kwhStr(rv, sizeof(rv), kwhConsumption);
-    wRow(4, 96, 244, 336, y, "HtrkWh:", lv, "ConsKWh:", rv); y += ROW;
+    kwhStr(lv, sizeof(lv), kwhExport);  kwhStr(rv, sizeof(rv), kwhHeater);
+    wRow(4, 96, 244, 336, y, "ExpkWh:", lv, "HtrkWh:", rv); y += ROW;
+
+    kwhStr(lv, sizeof(lv), kwhConsumption);
+    wRow(4, 100, 244, 336, y, "ConsKWh:", lv, "            ", ""); y += ROW;
 }
 
 // ── Page 3: Fault History ────────────────────────────────
@@ -3366,10 +3399,12 @@ void loop() {
     // Fault history update — run for H-side faults even without a W packet
     {
         static uint32_t prevWF = 0;
+        static uint32_t prevHF = 0;
         uint32_t curWF = hasWPkt ? lastWPkt.wFaultFlags : 0;
-        if (curWF != prevWF || hFaultFlags != 0) {
+        if (curWF != prevWF || hFaultFlags != prevHF) {
             faultLogUpdate(curWF, hFaultFlags);
             prevWF = curWF;
+            prevHF = hFaultFlags;
         }
     }
 

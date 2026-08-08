@@ -150,6 +150,7 @@ struct __attribute__((packed)) WToHPacket {
     // periodic H->W drop-outs against the hourly time-sync exchange
     uint16_t rs485RxGood;       // total valid H->W frames received by W
     uint16_t rs485RxBadFrame;   // total decoded frames with wrong dir/len received by W
+    uint16_t rs485RxAgeS;       // seconds since W last received a good H->W packet (saturates at 65535)
 };
 
 // ============================================================

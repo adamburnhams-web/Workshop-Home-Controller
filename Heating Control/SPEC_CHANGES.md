@@ -140,7 +140,7 @@ ILI9488 driver, SPI pins, and display dimensions configured via `build_flags` in
 **Auto mode duty calculation** (per RS485 packet, ~250ms) — updated, current values:
 ```
 SOC reservation:
-  soc > 95%:                          reservationW = 200W   (regardless of time)
+  soc > 85%:                          reservationW = 200W   (regardless of time)
   hour < 14:00:                       reservationW = 500W
   hour ≥ 14:00 AND soc > 60%:         reservationW = 1000W
   hour ≥ 14:00 AND soc ≤ 60%:         reservationW = 3000W
@@ -152,11 +152,11 @@ rawPct         = clamp(available × 100 / 3000, 0, 100)
 ```
 (Reservation is now always > 0, so the previous `else` branch — `netGridW + min(0, battChargeW) + heaterCurrentW − 100` — is unreachable and has been left in place unused rather than restructured.)
 
-Superseded values: reservation previously switched at noon (not 14:00), was 1kW before noon / 0W until SOC > 80% after noon (then 1kW) — see git history for the exact prior thresholds.
+Superseded values: reservation previously switched at noon (not 14:00), was 1kW before noon / 0W until SOC > 80% after noon (then 1kW) — see git history for the exact prior thresholds. The 200W-reservation SOC gate was originally 95%, lowered to 85% to release the heater's power cap sooner once the battery is nearly full.
 
 **Start:** rawPct ≥ 17% (~500W) AND sustained for 5s  
 **Stop:** 5 consecutive zero packets (was immediate)  
-**Smoothing:** 8-packet running average before applying to `heaterLevelIdx` (via `pctToLevel()`)
+**Smoothing:** true rolling average of the last 8 samples, recomputed every packet (was: batch-averaged every 8th packet only — see "H Controller — heater duty rolling average" below)
 
 **Hot pipe cap** (applied after smoothing):
 - `hot_pipe ≥ 90°C` → 0%
@@ -288,13 +288,13 @@ Spec suggested ~200 entries. Code uses 80 (`~40 bytes × 80 = 3.2KB`) to stay wi
 
 ---
 
-## H Controller — 12V PSU relay debounce
+## H Controller — 12V PSU relay thresholds/debounce
 
-New on/off delays before switching the 12V backup PSU relay:
-- **ON**: 3s continuously below 12V → relay energises (`BUS_PSU_ON_DELAY_MS = 3000`)
-- **OFF**: 5s continuously above 12.5V (hysteresis threshold) → relay de-energises (`BUS_PSU_OFF_DELAY_MS = 5000`)
+Thresholds and debounce revised again after commissioning — supersedes the 12.0V/3s-on, 12.5V/5s-off values this section previously documented:
+- **ON**: below 12.5V continuously for 5s → relay energises (`BUS_PSU_THRESH_DV = 125`, `BUS_PSU_ON_DELAY_MS = 5000`)
+- **OFF**: at/above 13.0V → relay de-energises immediately, no debounce (`BUS_PSU_HYSTERESIS_DV = 130`)
 
-Previously the relay switched immediately on threshold crossing. Delays prevent relay chatter on a fluctuating bus.
+Originally (pre-debounce) the relay switched immediately on threshold crossing with no delay in either direction.
 
 ---
 
@@ -604,10 +604,12 @@ Override state (`pumpSpdOvMode`) is reset at all solar pump stop points (sensor 
 
 W suppresses its own MOSFET output (D44 → 0) when all three conditions hold:
 - H has a valid packet and heater is running (`lastH.heaterPowerPct > 0`)
-- H's pump duty (`lastH.hPumpDutyPct`) exceeds W's calculated duty
+- H's pump duty (`lastH.hPumpDutyPct`) is greater than or equal to W's calculated duty
 - Solar hot is below target
 
-W resumes output when solar hot reaches target or W's duty is ≥ H's. Diode-OR on the MOSFET gate means the higher of the two signals drives the pump regardless.
+W resumes output when solar hot reaches target or W's duty exceeds H's. Diode-OR on the MOSFET gate means the higher of the two signals drives the pump regardless.
+
+**Updated**: comparison changed from strictly-greater to greater-or-equal (`>` → `>=`, both winter and summer solar paths). Under the old strict comparison, a tie (H and W independently computing the same duty, e.g. both at 4%) left neither side backing off — both pumps ran concurrently, compounding to roughly double the intended flow. `>=` means W now also stands down on a tie, since H always drives its own pump unconditionally (H has no equivalent check against W's duty).
 
 ### Solar pump timing — three-zone clocking
 
@@ -789,3 +791,27 @@ New `checkHeaterImportTrip()`: if SOC > 15%, battery isn't discharging faster th
 New `sensorFaultGraceMs[]` per sensor: tank/cold-pipe sensors tolerate 8h of stale/failed reads before `sFault[]` actually flips (holds last known value); hot-pipe gets 15s (short, since `checkHeaterFaults()` cuts the heater the moment it faults); heater-outlet sensors are excluded (grace handled separately, below). A new fast `sRawFault[]` (3-sample debounce, no grace) drives the page-1 red "FAULT" readout immediately, decoupled from the slower, grace-gated `sFault[]` that gates the logged fault flag/banner/LED.
 
 Heater-outlet single-sensor-fault handling reworked: previously raised `FAULT_H_SENSOR_HEATER_OUT(_2)` immediately after a 5s grace while continuing to run on the other sensor. Now: continues on the remaining sensor for 90s, then cuts `heaterLevelCap` to 0 (heater stops firing) while still not raising the fault flag until 120s — separates "stop producing heat because we've lost confidence" from "escalate to a logged fault," giving 30s of no-heat-but-no-alarm before the fault actually logs.
+
+---
+
+## H Controller — page 3 fault log: stuck-active entries fixed
+
+`faultLogUpdate()` (which marks a page-3 fault-history entry resolved) was only invoked from the main loop when `curWF != prevWF || hFaultFlags != 0` — i.e. gated on `hFaultFlags` being nonzero. The one frame where an H-side fault actually clears (`hFaultFlags` transitions to 0) is exactly the frame that condition goes false if the W-side flags happen not to have changed on the same tick, so the clearing edge was silently skipped: the bottom status banner (which reads `hFaultFlags` live) correctly went quiet, but the page-3 entry stayed red with only a start time, `resolvedMs` never set, until some unrelated W-fault change incidentally triggered the next call.
+
+Fix: added a `prevHF` shadow of `hFaultFlags`, compared the same way `prevWF` already was (`curWF != prevWF || hFaultFlags != prevHF`), so any change — including clearing — reliably triggers `faultLogUpdate()`.
+
+## H Controller — heater duty rolling average (was: batch average)
+
+`updateHeaterDuty()`'s `rawPct` smoothing was previously a batch average: it accumulated 8 packets (~2s) into a sum, then applied the average to `heaterLevelIdx` once every 8th packet, leaving the applied level untouched (and no smoothing in progress) on the other 7. A step change in available power landing mid-window could take up to ~4s (two windows) to fully settle, in one or two discrete jumps rather than a ramp.
+
+Replaced with a true rolling window: an 8-slot circular buffer plus a running sum, with the oldest sample evicted and the newest added every packet (no re-summing). `heaterLevelIdx` is now recomputed from `rawPctSum / rawPctBufCount` on **every** packet (~250ms), using the actual sample count (not always 8) while the buffer is still filling after a fresh start. All existing reset points (SOC-mode toggle, heater stop, 5-consecutive-zero-packet shutoff) reset the buffer/count/sum the same way the old accumulator was reset, so a new run never blends in stale samples from before a stop.
+
+## H Controller — page 2: gross import/export split (was: net only)
+
+`kwhImport` previously accumulated **net** grid flow (`gridImportW − pvExportW`; negative during net export), so any export simply reduced the displayed import figure — gross daily import and gross daily export were not separately visible.
+
+Since `gridImportW` and `pvExportW` are mutually-exclusive Growatt registers (only one is nonzero at a time), the existing net value's positive/negative parts exactly recover true gross import and export without needing new packet fields:
+- `kwhImport` now accumulates only the positive part of net (`max(net, 0)`) — gross import only
+- New `kwhExport` accumulates only the negative part (`max(-net, 0)`) — gross export only
+
+Page 2 gained a third daily-totals row: `PVkWh`/`ImpkWh`, `ExpkWh`/`HtrkWh`, `ConsKWh`. The `Cons:`/`ConsKWh` consumption calculation is unchanged and still uses the net import value internally (`energyLastImportW`) — only the accumulated/displayed totals were split. The SD energy-log CSV columns are unchanged (still `kwhPV,kwhImport,kwhHeater,kwhConsumption,soc`) — `kwhExport` is not yet logged to SD.
