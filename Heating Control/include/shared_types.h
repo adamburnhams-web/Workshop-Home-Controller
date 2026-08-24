@@ -76,6 +76,7 @@ enum WinchState : uint8_t {
 #define FAULT_H_SENSOR_HEATER_OUT    (1UL << 11)
 #define FAULT_H_SENSOR_HEATER_OUT_2  (1UL << 12)
 #define FAULT_H_HEATER_IMPORT_TRIP   (1UL << 13)
+#define FAULT_H_HEATER_MANUAL_LOCKOUT (1UL << 14)
 
 // ── W-side valve state bitmask (valveStates field) ──────────
 #define VSTATE_UFH_COLD_OPEN    (1 << 0)
@@ -168,6 +169,11 @@ struct __attribute__((packed)) HToWPacket {
     // Heater state
     uint8_t heaterPowerPct;
     uint8_t heaterRestricted;
+    // 1 = heater wants to run (pre-flow-path intent), set as soon as heaterRunning
+    // goes true — unlike heaterPowerPct, this isn't blocked waiting on W's solar
+    // cold valve, so W can use it to break the mutual start deadlock (see
+    // heaterFlowPathOk() on H, which itself requires W's solar cold valve open).
+    uint8_t heaterWantsPower;
 
     // System configuration
     uint8_t systemMode;         // SystemMode enum

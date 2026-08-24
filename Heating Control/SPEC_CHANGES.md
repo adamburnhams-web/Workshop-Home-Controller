@@ -140,6 +140,7 @@ ILI9488 driver, SPI pins, and display dimensions configured via `build_flags` in
 **Auto mode duty calculation** (per RS485 packet, ~250ms) — updated, current values:
 ```
 SOC reservation:
+  soc > 95%:                          reservationW = 0W     (battery full, no headroom needed)
   soc > 85%:                          reservationW = 200W   (regardless of time)
   hour < 14:00:                       reservationW = 500W
   hour ≥ 14:00 AND soc > 60%:         reservationW = 1000W
@@ -150,9 +151,9 @@ available = pvExportW − gridImportW + battChargeW + heaterCurrentW − reserva
 heaterCurrentW = heaterLevelPct10() × 3   (level-based, was heaterTargetPct × 30)
 rawPct         = clamp(available × 100 / 3000, 0, 100)
 ```
-(Reservation is now always > 0, so the previous `else` branch — `netGridW + min(0, battChargeW) + heaterCurrentW − 100` — is unreachable and has been left in place unused rather than restructured.)
+**Updated**: added the `soc > 95% → 0W` tier (previously the top tier was `soc > 85% → 200W`, unconditionally). Since `reservationW` can now be 0, the formula above is applied unconditionally rather than switching to the old dead `else` branch this section previously described — that branch (`netGridW + min(0, battChargeW) + heaterCurrentW − 100`, along with the now-unused `netGridW`/`battW` locals) has been removed rather than resurrected.
 
-Superseded values: reservation previously switched at noon (not 14:00), was 1kW before noon / 0W until SOC > 80% after noon (then 1kW) — see git history for the exact prior thresholds. The 200W-reservation SOC gate was originally 95%, lowered to 85% to release the heater's power cap sooner once the battery is nearly full.
+Superseded values: reservation previously switched at noon (not 14:00), was 1kW before noon / 0W until SOC > 80% after noon (then 1kW) — see git history for the exact prior thresholds. The 200W-reservation SOC gate was originally 95%, lowered to 85% to release the heater's power cap sooner once the battery is nearly full (95% is now the threshold for the new 0W tier instead).
 
 **Start:** rawPct ≥ 17% (~500W) AND sustained for 5s  
 **Stop:** 5 consecutive zero packets (was immediate)  
@@ -192,6 +193,7 @@ Seventh DS18B20 added: `H_SENSOR_HEATER_OUT_2 = 6`, `H_NUM_SENSORS = 7`, sensor 
 - **≥ 94°C**: power cap 0, `heaterHardLockout = true`, SSR pin cleared, set `FAULT_H_HEATER_OVERHEAT_SHUT`
 - **Auto-clear** hard lockout when effective heater temp < 88°C AND at least one sensor live (clears fault too)
 - **Page 5 Ack** also clears hard lockout immediately (allows manual recovery without reboot)
+- **≥ 95°C**: additionally sets `heaterManualLockout = true` + `FAULT_H_HEATER_MANUAL_LOCKOUT` (new bit 14) — everything the ≥94°C hard lockout does, plus it does **not** auto-clear at <88°C. Only page 4 "Alrt Reset" clears it (re-latches immediately on the next check if still ≥94/95°C). Reuses the existing generic mid-point-LED flash on W (any nonzero `hFaultFlags` bit already flashes it 1s on/1s off) — no W-side change needed.
 
 Thresholds/behavior above are unchanged, but the implementation is now level-based (see "H Controller (main) — heater control rework ported from h_new" below): `heaterPowerCapPct`/`heaterTargetPct`/`heaterSpreadAcc` (percent-based) were replaced with `heaterLevelCap`/`heaterLevelIdx` (0–20 level index) + `heaterPhaseHc`/`heaterPhaseOn` (ISR burst-phase tracking), driving the same 20-level fixed-burst table used by `controller_h_new`.
 
@@ -780,7 +782,7 @@ New `checkHeaterImportTrip()`: if SOC > 15%, battery isn't discharging faster th
 - **Solar target**: `tankTop + 13°C` (was `+8°C`), still capped at 87°C.
 - **Heater-side idle check**: the "don't run solar into a heater-cooling loop" skip now also requires `botTankOpen` (bottom-tank valve confirmed open), not just `twoPortHeaterSide` — avoids a false idle read while the valve is still moving.
 - **`pvActive` drop-out window**: extended 5 → 10 minutes below 200W before latching false (reduces cycling on brief cloud cover); comment updated to match.
-- **End-of-day abort**: replaced the old pipe-temperature-based abort (both pipes < 40°C + differential < 6°C) with a time/SOC-based one — aborts at or after 19:00, or once PV has been below 200W for 10+ minutes while battery SOC is under 90%.
+- **End-of-day abort**: replaced again — was a compound PV/temperature-equilibrium heuristic (both solar pipes below tank-mid, PV < 300W, hot~cold within 6°C, heater off, SOC < 95%, sustained 10 min); now a straight comparison against today's actual sunset time. See "W Controller — summer solar end-of-day: sunset-table cutoff" below.
 
 ## Winch over-open fault — actually clears now
 
@@ -804,7 +806,9 @@ Fix: added a `prevHF` shadow of `hFaultFlags`, compared the same way `prevWF` al
 
 `updateHeaterDuty()`'s `rawPct` smoothing was previously a batch average: it accumulated 8 packets (~2s) into a sum, then applied the average to `heaterLevelIdx` once every 8th packet, leaving the applied level untouched (and no smoothing in progress) on the other 7. A step change in available power landing mid-window could take up to ~4s (two windows) to fully settle, in one or two discrete jumps rather than a ramp.
 
-Replaced with a true rolling window: an 8-slot circular buffer plus a running sum, with the oldest sample evicted and the newest added every packet (no re-summing). `heaterLevelIdx` is now recomputed from `rawPctSum / rawPctBufCount` on **every** packet (~250ms), using the actual sample count (not always 8) while the buffer is still filling after a fresh start. All existing reset points (SOC-mode toggle, heater stop, 5-consecutive-zero-packet shutoff) reset the buffer/count/sum the same way the old accumulator was reset, so a new run never blends in stale samples from before a stop.
+Replaced with a true rolling window: a circular buffer plus a running sum, with the oldest sample evicted and the newest added every packet (no re-summing). `heaterLevelIdx` is now recomputed from `rawPctSum / rawPctBufCount` on **every** packet (~250ms), using the actual sample count (not always the full window) while the buffer is still filling after a fresh start. All existing reset points (SOC-mode toggle, heater stop, 5-consecutive-zero-packet shutoff) reset the buffer/count/sum the same way the old accumulator was reset, so a new run never blends in stale samples from before a stop.
+
+Window widened from 8 to **12** samples (~3s at the 250ms packet rate) — smoother output at the cost of a slightly longer settling time on a genuine step change.
 
 ## H Controller — page 2: gross import/export split (was: net only)
 
@@ -815,3 +819,55 @@ Since `gridImportW` and `pvExportW` are mutually-exclusive Growatt registers (on
 - New `kwhExport` accumulates only the negative part (`max(-net, 0)`) — gross export only
 
 Page 2 gained a third daily-totals row: `PVkWh`/`ImpkWh`, `ExpkWh`/`HtrkWh`, `ConsKWh`. The `Cons:`/`ConsKWh` consumption calculation is unchanged and still uses the net import value internally (`energyLastImportW`) — only the accumulated/displayed totals were split. The SD energy-log CSV columns are unchanged (still `kwhPV,kwhImport,kwhHeater,kwhConsumption,soc`) — `kwhExport` is not yet logged to SD.
+
+## H Controller — heater level table: 20 → 16 levels
+
+Four levels removed from `kHeaterLevels[]`: 5.0%, 42.9%, 57.1%, 95.0% (previously levels 1, 9, 11, 19 of 20). Table size is now driven by a named `HEATER_LEVEL_COUNT = 16` constant rather than a hardcoded `20` scattered across the file — `pctToLevel()`'s scan bound, `heaterLevelCap`'s "no cap" sentinel/reset value (all three reset sites: normal idle, overheat-clear, page-4 alert-reset), and `pkt.heaterRestricted`'s comparison all now reference it.
+
+`calcHPumpDuty()`'s `calcPred()` per-level k/alpha lookup table (`LEVELS[]`/`K_TBL[]`/`A_TBL[]`, see "H Controller (h_new) — `calcPred` rewrite" above) had its 4 corresponding rows (5%, 43%, 57%, 95%) dropped in lockstep — no refit needed, since each row is an independent per-level fit and the remaining levels' calibration data is unaffected by removing others. Scan bound changed from `< 19` to `< HEATER_LEVEL_COUNT - 1`.
+
+Test sweep tables (`PUMP_TEST_POWERS[]`, `STRESS_TEST_POWERS[]`) are unaffected — they specify arbitrary target percentages resolved through `pctToLevel()` at runtime, not tied to a fixed level count.
+
+## W Controller — summer solar end-of-day: sunset-table cutoff
+
+Replaces the compound PV/temperature-equilibrium end-of-day heuristic in `updateSummerSolar()` (both solar pipes below tank-mid, PV < 300W, hot~cold within 6°C, heater off, SOC < 95%, all sustained 10 minutes) with a direct comparison against today's actual civil sunset time for Alton, UK. Past sunset there's no more solar gain physically possible regardless of what the pipes/PV/SOC currently read, so the heuristic is gone entirely rather than combined with the time check.
+
+New `kSunsetUtcMin[365]` PROGMEM table (minutes-since-midnight-UTC sunset, indexed by day-of-year on a non-leap reference calendar), plus supporting helpers, all new in `w_controller/main.cpp` ahead of `updateSummerSolar()`:
+- `dayOfYearForSunset(month, day)` — maps a calendar date onto the 1–365 table index. On a leap year, **Feb 29 reuses the Feb 28 entry** (day 59) rather than shifting the table, so every date from Mar 1 onward stays aligned with the non-leap reference regardless of the current year.
+- `dayOfWeek()` (Sakamoto's algorithm), `daysInMonth()`, `lastSundayOfMonth()`, `isBST()` — the table is UTC (per the source data), but the RTC is kept in UK civil (wall-clock) time, so the local comparison needs to know whether British Summer Time is in effect. UK clocks go forward the last Sunday of March and back the last Sunday of October (~01:00 UTC each time); the exact transition hour is ignored since this only feeds an evening sunset check, nowhere near 1am.
+- `sunsetLocalMinutes()` — today's sunset converted to UK local minutes-since-midnight (`sunsetUtc + (isBST ? 60 : 0)`).
+
+W previously only captured `syncHour`/`syncMinute`/`syncSecond` from H's hourly time-sync packet (`HToWPacket`); `syncDay`/`syncMonth`/`syncYear` were already being sent but unused. Added `curDay`/`curMonth`/`curYear` to W's local state, captured alongside the existing time fields at the same sync point.
+
+`updateSummerSolar()`'s end-of-day check is now: `getCurrentTime()` (existing live-clock estimate, ticks between hourly syncs) compared against `sunsetLocalMinutes()`. No debounce needed — unlike the old PV/temperature reading, a time comparison doesn't fluctuate, so it's a clean one-way trigger for the rest of the day once past sunset. Before the first time sync, `getCurrentTime()` defaults to noon, which is always before sunset, so the check simply doesn't fire until a real sync arrives.
+
+**Placement matters**: the check sits immediately after the critical-overheat block and *before* the start-trigger logic, with an early `return` when past sunset — it does not run only as a teardown at the end of the function. An earlier version placed it at the end instead, which meant a start condition (e.g. hot pipe ≥ 80°C) true at the same time as past-sunset would open the valve and start the pump via the start-trigger block, then have the end-of-day teardown immediately undo it on the very same tick — `summerPhase` resets to `SUMPH_IDLE` either way, so the next loop (~250ms later) would repeat the exact same start-then-stop sequence indefinitely for as long as both conditions held, chattering the solar valve every loop. Gating at the top prevents the start logic from ever running once past sunset, so there's nothing to undo.
+
+**Not affected**: manual heater-on (`MHM_FORCE_ON`) at H has no time-of-day awareness and isn't gated by this at all — it runs any time. A separate, unconditional check in the main W loop (`if (heaterPowerPct > 0) solarColdValve.setOpen();`, pre-existing, outside `updateSummerSolar()`) keeps the return flow path open for H's own direct-drive pump regardless of season/sunset. Only W's own solar collector pump is affected by the sunset cutoff, which is correct — there's no collector gain after dark regardless of what the heater is doing.
+
+**Year handling**: `dayOfYearForSunset()` only uses month/day, never year, so the 2026-sourced table is reused unchanged for any year (sunset time for a given calendar date drifts at most ~1 minute year to year — immaterial here). `isBST()` is the only year-dependent piece (the last Sunday of March/October moves each year) and is parameterized by the actual synced year, computed live via Sakamoto's algorithm rather than a fixed table — so it doesn't run out or need updating for future years, short of the UK changing its DST rule.
+
+## H Controller — automatic BST/GMT clock adjustment
+
+The DS3231 RTC has no timezone/DST concept — previously it just free-ran from whatever date/time was last manually set via page 4 (Set Hour/Min/Sec) or the `rtc` serial command, meaning BST changeovers required a manual ±1h adjustment twice a year or the whole system's wall-clock read an hour wrong for half the year.
+
+`checkAutoBST()` (called from `readRTC()`, so once per second alongside the existing RTC poll) now does this automatically, while keeping the existing UX unchanged — installers still set the RTC to whatever a wall clock reads, nothing about page 4 changes:
+- Ports the same `dayOfWeek()`/`daysInMonth()`/`lastSundayOfMonth()`/`isBST()` date-math helpers added for the W-side sunset feature (see above) into `h_controller/main.cpp`, since H owns the actual RTC hardware.
+- Compares today's computed BST/GMT state against a 1-byte EEPROM flag (`EE_BST_STATE`, new address 5). On mismatch, shifts the RTC by exactly ±1h via `rtc.adjust(rtcNow ± TimeSpan(3600))` and updates the flag — so the shift only ever fires once per transition, and survives a reboot near the transition boundary without double-applying or silently missing it.
+- Gated on `rtcNow.hour() >= 3` before acting (mismatch detection still runs every second, but the shift itself waits): applying at midnight would either jump the clock an hour early (spring) or roll the *date* backward a day (autumn, subtracting 1h from just after midnight) — the latter would double-trigger the SD energy log's day-rollover reset. Waiting until hour ≥ 3 keeps both directions clear of any midnight boundary. Net effect: the clock settles to the correct offset within the first few hours of the transition day rather than at the exact 01:00 UTC instant — acceptable imprecision for a heating controller, nothing time-sensitive runs at 1–3am.
+- First-ever boot (fresh/blank EEPROM byte, i.e. not 0 or 1): adopts the current computed state without shifting, so it doesn't surprise-shift a clock the installer just set by hand for the first time.
+
+## H Controller — hot-pipe rate-of-rise pump override
+
+Analysis of `Data/LOG.CSV` (~12 days, 20 historical crossings of the existing 91°C heater-outlet pump spike) found two distinct overheat mechanisms, not one:
+- **Fast-rise (7 of 20)**: hot_pipe climbing 7–11°C/min while H-pump duty was still low/ramping (19–44%) — morning solar-surge events (~09:25–09:55) where hot_pipe outruns the pump before `calcHPumpDuty()`'s normal curve catches up.
+- **Pump-saturated (13 of 20)**: hot_pipe climbing slowly (0–2.3°C/min) but pump was already at 68–100% duty at the 86°C crossing — the duty curve simply has no more headroom. A rate rule doesn't address this class; it would need a heater-power-cap fix instead.
+
+First pass used a 60s-trailing-window average (7°C/min threshold), which cleanly separated the 7 fast-rise events from 48 non-overheat 86°C+ cycles with 0 false positives — but a 60s average dilutes a short sharp burst (e.g. 4°C in 30s preceded by flat readings averages to only 4°C/min over the full window, well under threshold). Replaced with a much shorter, more responsive window plus an explicit hold so a single-shot trigger doesn't chatter:
+
+**Final rule** — `heaterOutC >= 86°C` AND hot_pipe risen `>= 1.0°C` within the trailing 10s. On trigger, pump is forced to 100% for a rolling 15s hold that keeps re-extending every loop the criteria is still true (so it releases 15s after the *last* time the fast rise was seen, not 15s after the first). Simulated against the full 12-day log this fires 18 independent hold periods (~1.5/day) — clustered around the same known morning-surge windows, not spurious noise.
+
+**Implementation** (`h_controller/main.cpp`):
+- `updateHotPipeRiseBuf()` (called once per `loop()`, alongside `readSensors()`) samples `hot_pipe` every 2s into a 6-slot circular buffer (~10–12s of history). Buffer resets on `H_SENSOR_HOT_PIPE` fault so a stale pre-fault reading never contaminates the calc after recovery.
+- `getHotPipeRise10sC()` returns the °C delta against the oldest buffered sample, or `NAN` until the buffer has filled (~12s after boot/fault recovery).
+- `calcHPumpDuty()` gains an early-out block with a local static hold latch (`hpHoldStartMs`/`hpHolding`): criteria true → hold timer resets to now; hold releases once 15s have elapsed since the criteria was last true. Evaluated right after the existing `hotPipeC >= 80.0f → 100%` override and before the normal/MAX-mode duty curves — doesn't touch the existing 90°C/91°C heaterOutC-based ramp-to-100% logic, this is a strictly earlier, additional trigger for the fast-surge case.

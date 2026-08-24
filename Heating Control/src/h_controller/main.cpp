@@ -100,6 +100,7 @@ static const bool HEATER_ENABLED = true;
 #define EE_SOLAR_TARGET      2   // uint8_t SolarTargetMode
 #define EE_DISPLAY_BRIGHT    3   // uint8_t 10–100 %
 #define EE_FAN_BASE_SPEED    4   // uint8_t 0–100 % (also written by W via its own EEPROM)
+#define EE_BST_STATE         5   // uint8_t: 0=GMT applied, 1=BST applied, other=uninitialized
 
 // ============================================================
 //  SYSTEM CONSTANTS
@@ -232,12 +233,13 @@ static inline bool tempValid(float t) {
 //  HEATER SSR  —  zero-crossing ISR + cycle-burst control
 // ============================================================
 
-// 20-level fixed-burst heater table. Each level fires on_hc half-cycles (10ms each) then
-// off_hc half-cycles off, repeating. pct10 = actual duty × 10 (e.g. 143 = 14.3%).
+// 16-level fixed-burst heater table (levels 5.0%, 42.9%, 57.1%, 95.0% removed from the
+// original 20). Each level fires on_hc half-cycles (10ms each) then off_hc half-cycles
+// off, repeating. pct10 = actual duty × 10 (e.g. 143 = 14.3%).
 // Levels named by exact duty, not nominal request.
 struct HeaterLevel { uint8_t on_hc; uint8_t off_hc; uint16_t pct10; };
-static const HeaterLevel kHeaterLevels[20] PROGMEM = {
-    {  1, 19,   50 },  //  5.0%
+static const uint8_t HEATER_LEVEL_COUNT = 16;
+static const HeaterLevel kHeaterLevels[HEATER_LEVEL_COUNT] PROGMEM = {
     {  1,  9,  100 },  // 10.0%
     {  1,  7,  143 },  // 14.3%
     {  1,  4,  200 },  // 20.0%
@@ -245,9 +247,7 @@ static const HeaterLevel kHeaterLevels[20] PROGMEM = {
     {  2,  5,  286 },  // 28.6%
     {  1,  2,  333 },  // 33.3%
     {  2,  3,  400 },  // 40.0%
-    {  3,  4,  429 },  // 42.9%
     {  1,  1,  500 },  // 50.0%
-    {  4,  3,  571 },  // 57.1%
     {  3,  2,  600 },  // 60.0%
     {  2,  1,  667 },  // 66.7%
     {  5,  2,  714 },  // 71.4%
@@ -255,13 +255,12 @@ static const HeaterLevel kHeaterLevels[20] PROGMEM = {
     {  4,  1,  800 },  // 80.0%
     {  6,  1,  857 },  // 85.7%
     {  9,  1,  900 },  // 90.0%
-    { 19,  1,  950 },  // 95.0%
     {  1,  0, 1000 },  // 100.0%
 };
 
 volatile unsigned long lastZCMicros  = 0;
-volatile uint8_t  heaterLevelIdx  = 0;    // 0=off, 1–20=active level index
-volatile uint8_t  heaterLevelCap  = 20;   // ISR-level cap (0–20; 20=no cap)
+volatile uint8_t  heaterLevelIdx  = 0;    // 0=off, 1–16=active level index
+volatile uint8_t  heaterLevelCap  = HEATER_LEVEL_COUNT;   // ISR-level cap (0–16; 16=no cap)
 volatile uint8_t  heaterPhaseHc   = 0;    // half-cycle count within current phase
 volatile bool     heaterPhaseOn   = true; // true=ON phase, false=OFF phase
 volatile uint32_t zcFireCount     = 0;
@@ -274,11 +273,16 @@ static const bool simHeaterActive = false;
 
 bool heaterRunning    = false;
 bool heaterHardLockout = false;   // set on element fail / UFH hard lockout — clears on restart
+bool heaterManualLockout = false; // set on 95°C overtemp — unlike heaterHardLockout, only clears via page 4 "Alrt Reset"
 bool hotTankProtection = false;
+bool tankBotHeaterBlock = false;  // 80°C on / 79°C off hysteresis, see updateHeaterDuty()
 bool morningHeatActive = false;
 bool          importTripActive  = false;
 unsigned long importHighStartMs = 0;
 unsigned long importZeroStartMs = 0;
+bool          pvWasZero         = true;
+unsigned long pvZeroSinceMs     = 0;
+unsigned long dawnHoldUntilMs   = 0;
 bool gridPresent                 = true;
 unsigned long lastGridLossMs     = 0;
 bool gridOutageFault             = false;
@@ -341,7 +345,7 @@ void zeroCrossISR() {
 // Returns highest level index whose duty does not exceed pct (0–100). Returns 0 if pct==0.
 static uint8_t pctToLevel(uint8_t pct) {
     uint8_t best = 0;
-    for (uint8_t i = 0; i < 20; i++) {
+    for (uint8_t i = 0; i < HEATER_LEVEL_COUNT; i++) {
         if (pgm_read_word(&kHeaterLevels[i].pct10) <= (uint16_t)pct * 10) best = i + 1;
         else break;
     }
@@ -400,6 +404,14 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
     if (morningHeatActive) {
         heaterLevelIdx = 0; heaterRunning = false; return;
     }
+    if (!sFault[H_SENSOR_TANK_BOT]) {
+        float tBot = sTemp[H_SENSOR_TANK_BOT];
+        if (!tankBotHeaterBlock && tBot >= 80.0f)      tankBotHeaterBlock = true;
+        else if (tankBotHeaterBlock && tBot < 79.0f)   tankBotHeaterBlock = false;
+    }
+    if (tankBotHeaterBlock) {
+        heaterLevelIdx = 0; heaterRunning = false; return;
+    }
     if (manualMode == MHM_FORCE_ON) {
         // Call for the flow-path valves regardless of position; actual firing stays
         // blocked until heaterFlowPathOk() confirms they've reached it.
@@ -408,14 +420,14 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
         twoPortValve.request(true);
         heaterRunning = true;
 
-        // Same hot pipe cap as the PV/SOC-surplus path: 100% at 63°C, ramp to 0 at 90°C.
+        // Same hot pipe cap as the PV/SOC-surplus path: 100% at 61°C, ramp to 0 at 86°C.
         uint8_t pct = 100;
         if (!sFault[H_SENSOR_HOT_PIPE]) {
             float hp = sTemp[H_SENSOR_HOT_PIPE];
-            if (hp >= 90.0f) {
+            if (hp >= 86.0f) {
                 pct = 0;
-            } else if (hp > 63.0f) {
-                pct = (uint8_t)((90.0f - hp) * (100.0f / 27.0f));
+            } else if (hp > 61.0f) {
+                pct = (uint8_t)((86.0f - hp) * (100.0f / 25.0f));
             }
         }
         heaterLevelIdx = heaterFlowPathOk() ? pctToLevel(pct) : 0;
@@ -429,7 +441,7 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
     static bool          lastHighSoc    = false;
     static unsigned long surplusStartMs = 0;
     static uint8_t       zeroCount      = 0;
-    static uint8_t        rawPctBuf[8]  = {0}; // rolling window of last (up to) 8 samples
+    static uint8_t        rawPctBuf[12] = {0}; // rolling window of last (up to) 12 samples
     static uint8_t        rawPctBufIdx  = 0;
     static uint8_t        rawPctBufCount = 0;
     static uint16_t       rawPctSum      = 0;
@@ -456,16 +468,14 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
             heaterRunning = false; heaterLevelIdx = 0; return;
         }
         int16_t battChgW   = lastWPkt.battChargeW;
-        int32_t netGridW   = (int32_t)pvExportW - gridImportW;
-        int32_t battW      = (int32_t)min((int16_t)0, battChgW);
-        // SOC > 85%: battery essentially full, only 200W reservation regardless of time.
+        // SOC > 95%: battery full, no reservation at all.
+        // SOC 86-95%: battery essentially full, only 200W reservation regardless of time.
         // Otherwise before 14:00: 500W reservation always.
         // After 14:00: 3kW reservation while SOC ≤ 60%, then 1kW once battery is charging freely.
-        int32_t reservationW = (soc > 85) ? 200L
+        int32_t reservationW = (soc > 95) ? 0L
+                             : (soc > 85) ? 200L
                              : (rtcHour() < 14) ? 500L : (soc > 60 ? 1000L : 3000L);
-        int32_t available = (reservationW > 0)
-            ? (int32_t)pvExportW - gridImportW + (int32_t)battChgW + heaterCurrentW - reservationW
-            : netGridW + heaterCurrentW + battW - 100L;
+        int32_t available = (int32_t)pvExportW - gridImportW + (int32_t)battChgW + heaterCurrentW - reservationW;
         rawPct = (int16_t)constrain(available * 100L / 3000L, 0L, 100L);
     }
 
@@ -507,10 +517,10 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
     }
     zeroCount = 0;
 
-    // Rolling average: each new packet replaces the oldest of up to 8 samples,
+    // Rolling average: each new packet replaces the oldest of up to 12 samples,
     // so every packet's output reflects the current sample averaged against
-    // the previous 7 rather than waiting for a batch to fill.
-    if (rawPctBufCount < 8) {
+    // the previous 11 rather than waiting for a batch to fill.
+    if (rawPctBufCount < 12) {
         rawPctBuf[rawPctBufIdx] = (uint8_t)rawPct;
         rawPctSum += (uint8_t)rawPct;
         rawPctBufCount++;
@@ -519,16 +529,16 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
         rawPctBuf[rawPctBufIdx] = (uint8_t)rawPct;
         rawPctSum += (uint8_t)rawPct;
     }
-    rawPctBufIdx = (rawPctBufIdx + 1) % 8;
+    rawPctBufIdx = (rawPctBufIdx + 1) % 12;
     uint8_t avgPct = (uint8_t)(rawPctSum / rawPctBufCount);
 
-    // Hot pipe cap: 100% at 63°C, linear ramp to 0 at 90°C
+    // Hot pipe cap: 100% at 61°C, linear ramp to 0 at 86°C
     if (!sFault[H_SENSOR_HOT_PIPE]) {
         float hp = sTemp[H_SENSOR_HOT_PIPE];
-        if (hp >= 90.0f) {
+        if (hp >= 86.0f) {
             avgPct = 0;
-        } else if (hp > 63.0f) {
-            uint8_t cap = (uint8_t)((90.0f - hp) * (100.0f / 27.0f));  // ~3.70% per °C over 27°C span
+        } else if (hp > 61.0f) {
+            uint8_t cap = (uint8_t)((86.0f - hp) * (100.0f / 25.0f));  // 4.00% per °C over 25°C span
             if (avgPct > cap) avgPct = cap;
         }
     }
@@ -550,9 +560,34 @@ bool hasFaultH(uint32_t m)   { return (hFaultFlags & m) != 0; }
 //  HEATER IMPORT TRIP  (inverter CB tripped while panels producing)
 // ============================================================
 
-void checkHeaterImportTrip(int16_t gridImportW, uint8_t soc, int16_t battChargeW, bool growattValid) {
+// Growatt pauses battery discharge and pulls a small fixed import (~210-220W)
+// for ~5-6 min during its dawn PV/grid-sync startup, every morning as soon as
+// PV first registers after a night at zero. That reads as importHigh but isn't
+// a real inverter-CB trip, so hold off the check across a window comfortably
+// longer than the observed blip.
+static const unsigned long DAWN_HOLD_MS     = 420000UL; // 7 min
+static const unsigned long NIGHT_PV_ZERO_MS = 1200000UL; // 20 min of zero PV = "night"
+
+void checkHeaterImportTrip(int16_t gridImportW, uint8_t soc, int16_t battChargeW, bool growattValid,
+                            int16_t pv1W, int16_t pv2W) {
     if (!growattValid) return;
     unsigned long now = millis();
+
+    bool pvZero = (pv1W <= 0 && pv2W <= 0);
+    if (pvZero) {
+        if (!pvWasZero) pvZeroSinceMs = now;
+        pvWasZero = true;
+    } else {
+        if (pvWasZero && (now - pvZeroSinceMs >= NIGHT_PV_ZERO_MS)) {
+            dawnHoldUntilMs = now + DAWN_HOLD_MS;
+        }
+        pvWasZero = false;
+    }
+    if (dawnHoldUntilMs) {
+        if (now < dawnHoldUntilMs) return;
+        dawnHoldUntilMs = 0;
+    }
+
     int32_t battDischargeW = battChargeW < 0 ? (int32_t)(-battChargeW) : 0L;
     bool    importHigh = soc > 15 && battDischargeW < 3900L && gridImportW > 100;
 
@@ -808,12 +843,46 @@ static inline float getHeaterOutC() {
 }
 
 // ============================================================
+//  HOT PIPE FAST-RISE DETECTOR  (10s trailing window, 2s samples)
+//  Feeds calcHPumpDuty()'s early-spike override — see SPEC_CHANGES.md
+//  "H Controller — hot-pipe rate-of-rise pump override".
+// ============================================================
+
+#define HP_RISE_SAMPLE_MS 2000UL
+#define HP_RISE_BUF_LEN         6   // ~10-12s of history at HP_RISE_SAMPLE_MS
+
+static float         hpRiseBuf[HP_RISE_BUF_LEN];
+static unsigned long hpRiseBufMs[HP_RISE_BUF_LEN];
+static uint8_t        hpRiseBufIdx   = 0;
+static uint8_t        hpRiseBufCount = 0;
+
+void updateHotPipeRiseBuf() {
+    static unsigned long lastSampleMs = 0;
+    if (sFault[H_SENSOR_HOT_PIPE]) { hpRiseBufCount = 0; lastSampleMs = 0; return; }
+    unsigned long now = millis();
+    if (now - lastSampleMs < HP_RISE_SAMPLE_MS) return;
+    lastSampleMs = now;
+    hpRiseBuf[hpRiseBufIdx]   = sTemp[H_SENSOR_HOT_PIPE];
+    hpRiseBufMs[hpRiseBufIdx] = now;
+    hpRiseBufIdx = (hpRiseBufIdx + 1) % HP_RISE_BUF_LEN;
+    if (hpRiseBufCount < HP_RISE_BUF_LEN) hpRiseBufCount++;
+}
+
+// hot_pipe rise in degC over the oldest ~10-12s of buffered history; NAN
+// until the buffer has filled (~12s after boot or hot_pipe fault recovery).
+static float getHotPipeRise10sC() {
+    if (hpRiseBufCount < HP_RISE_BUF_LEN || sFault[H_SENSOR_HOT_PIPE]) return NAN;
+    return sTemp[H_SENSOR_HOT_PIPE] - hpRiseBuf[hpRiseBufIdx];
+}
+
+// ============================================================
 //  HEATER FAULT CHECKS  (called from main loop)
 // ============================================================
 
 void checkHeaterFaults() {
-    static unsigned long htrOut1FaultMs = 0;
-    static unsigned long htrOut2FaultMs = 0;
+    static unsigned long htrOut1FaultMs  = 0;
+    static unsigned long htrOut2FaultMs  = 0;
+    static unsigned long htrBothFaultMs  = 0;
 
     bool f1 = sFault[H_SENSOR_HEATER_OUT];
     bool f2 = sFault[H_SENSOR_HEATER_OUT_2];
@@ -823,9 +892,11 @@ void checkHeaterFaults() {
     else    { htrOut1FaultMs = 0; clearFaultH(FAULT_H_SENSOR_HEATER_OUT); }
     if (f2) { if (!htrOut2FaultMs) htrOut2FaultMs = millis(); }
     else    { htrOut2FaultMs = 0; clearFaultH(FAULT_H_SENSOR_HEATER_OUT_2); }
+    if (!(f1 && f2)) htrBothFaultMs = 0;
 
-    // Hard lockout clears when effective temp < 88°C and at least one sensor is live
-    if (heaterHardLockout && hasFaultH(FAULT_H_HEATER_OVERHEAT_SHUT) && !(f1 && f2)) {
+    // Hard lockout clears when effective temp < 88°C and at least one sensor is live.
+    // heaterManualLockout (95°C latch) is excluded — that one only clears via page 4 "Alrt Reset".
+    if (heaterHardLockout && !heaterManualLockout && hasFaultH(FAULT_H_HEATER_OVERHEAT_SHUT) && !(f1 && f2)) {
         float effT = getHeaterOutC();
         if (!isnan(effT) && effT < 88.0f) {
             heaterHardLockout = false;
@@ -838,15 +909,20 @@ void checkHeaterFaults() {
     }
 
     if (!heaterRunning || heaterLevelIdx == 0) {
-        heaterLevelCap     = 20;
+        heaterLevelCap     = HEATER_LEVEL_COUNT;
         return;
     }
 
-    // Both sensors faulted: shut down heater immediately
+    // Both sensors faulted: shut down heater immediately, but only raise the
+    // fault flags once the joint fault has persisted 60s — brief shared 1-Wire
+    // bus glitches recover within a few seconds and shouldn't log/alert.
     if (f1 && f2) {
         heaterLevelCap = 0;
-        setFaultH(FAULT_H_SENSOR_HEATER_OUT);
-        setFaultH(FAULT_H_SENSOR_HEATER_OUT_2);
+        if (!htrBothFaultMs) htrBothFaultMs = millis();
+        if (millis() - htrBothFaultMs >= 60000UL) {
+            setFaultH(FAULT_H_SENSOR_HEATER_OUT);
+            setFaultH(FAULT_H_SENSOR_HEATER_OUT_2);
+        }
         return;
     }
 
@@ -882,6 +958,13 @@ void checkHeaterFaults() {
         heaterHardLockout = true;
         PORTA &= ~(1 << PA5);
         setFaultH(FAULT_H_HEATER_OVERHEAT_SHUT);
+        // 95°C: latch off until a manual "Alrt Reset" on page 4 — doesn't auto-clear at
+        // 88°C like the plain 94°C hard lockout above. Once latched it stays latched even
+        // as hOut falls back out of this >=94°C branch (see the guarded auto-clear above).
+        if (hOut >= 95.0f && !heaterManualLockout) {
+            heaterManualLockout = true;
+            setFaultH(FAULT_H_HEATER_MANUAL_LOCKOUT);
+        }
     } else if (hOut > 91.0f) {
         if (!ovhtValvesRequested) {
             twoPortValve.request(true);
@@ -893,7 +976,7 @@ void checkHeaterFaults() {
         heaterLevelCap = (cap < 1.0f) ? 0 : pctToLevel((uint8_t)roundf(cap));
     } else {
         ovhtValvesRequested = false;
-        heaterLevelCap     = 20;
+        heaterLevelCap     = HEATER_LEVEL_COUNT;
         clearFaultH(FAULT_H_SENSOR_HOT_PIPE);
     }
 }
@@ -908,6 +991,66 @@ unsigned long lastRTCReadMs = 0;
 // RTC fallback: if Mega loses power and no backup, we rely on W time sync
 bool rtcBatteryLow = false;
 
+// ── UK BST auto-adjust ───────────────────────────────────────
+// The RTC stores UK civil (wall-clock) time, same as before — installers still set
+// it by eye from page 4 / the `rtc` command. This just automates the twice-yearly
+// manual +/-1h shift a wall clock needs, so nobody has to remember to do it.
+
+// Sakamoto's algorithm: day of week for a Gregorian date, 0=Sunday.
+static uint8_t dayOfWeek(uint16_t y, uint8_t m, uint8_t d) {
+    static const uint8_t t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+    if (m < 3) y--;
+    return (uint8_t)((y + y / 4 - y / 100 + y / 400 + t[m - 1] + d) % 7);
+}
+
+static uint8_t daysInMonth(uint16_t y, uint8_t m) {
+    static const uint8_t dim[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) return 29;
+    return dim[m - 1];
+}
+
+static uint8_t lastSundayOfMonth(uint16_t y, uint8_t m) {
+    uint8_t last = daysInMonth(y, m);
+    return last - dayOfWeek(y, m, last);
+}
+
+// UK clocks: forward last Sunday of March, back last Sunday of October (both ~01:00
+// UTC). Date-only (ignores the exact transition hour) — checkAutoBST() below only
+// acts once the RTC's own hour reads >=3, well clear of the transition window.
+static bool isBST(uint16_t y, uint8_t m, uint8_t d) {
+    if (m < 3 || m > 10) return false;
+    if (m > 3 && m < 10) return true;
+    if (m == 3) return d >= lastSundayOfMonth(y, 3);
+    return d < lastSundayOfMonth(y, 10);
+}
+
+// Detects a BST/GMT state change and nudges the RTC by exactly 1h to match, once,
+// persisting the applied state in EEPROM so a reboot near the transition can't
+// double-apply or miss it. Gated on hour >= 3 so the +-1h shift never crosses a
+// midnight boundary — a fall-back subtraction right after midnight would roll the
+// date backward a day, which would double-trigger the SD energy log's day-rollover.
+void checkAutoBST() {
+    if (!rtcValid || rtcNow.hour() < 3) return;
+
+    bool    shouldBeBST = isBST(rtcNow.year(), rtcNow.month(), rtcNow.day());
+    uint8_t stored      = EEPROM.read(EE_BST_STATE);
+
+    if (stored > 1) {
+        // Uninitialized EEPROM byte (fresh chip / first flash) — adopt the current
+        // state without shifting, so this doesn't surprise-shift a clock the
+        // installer just set by hand for the first time.
+        EEPROM.update(EE_BST_STATE, shouldBeBST ? 1 : 0);
+        return;
+    }
+
+    bool storedIsBST = (stored == 1);
+    if (shouldBeBST != storedIsBST) {
+        DateTime shifted = shouldBeBST ? (rtcNow + TimeSpan(3600)) : (rtcNow - TimeSpan(3600));
+        rtc.adjust(shifted);
+        EEPROM.update(EE_BST_STATE, shouldBeBST ? 1 : 0);
+    }
+}
+
 void readRTC() {
     if (millis() - lastRTCReadMs < 1000) return;
     lastRTCReadMs = millis();
@@ -915,6 +1058,7 @@ void readRTC() {
         rtcNow  = rtc.now();
         rtcValid = rtcNow.isValid();
         rtcBatteryLow = rtc.lostPower();
+        checkAutoBST();
     }
 }
 
@@ -1012,7 +1156,7 @@ void checkHotTankProtection() {
     if (sFault[H_SENSOR_TANK_BOT]) return;
     float tBot = sTemp[H_SENSOR_TANK_BOT];
     if (!hotTankProtection && tBot > 83.0f)      hotTankProtection = true;
-    else if (hotTankProtection && tBot < 82.0f)  hotTankProtection = false;
+    else if (hotTankProtection && tBot < 80.0f)  hotTankProtection = false;
 
     // Re-assert every loop (request() no-ops once already there) so a manual
     // override during protection can't leave the valves stuck out of position.
@@ -1306,12 +1450,13 @@ bool          needTSSinceLastLog = false; // latched: set on any time-sync reply
 File    energyLogFile;
 unsigned long lastEnergyLogMs = 0;
 
-static const uint8_t LOG_EXPECTED_COMMAS = 39; // 40 columns = 39 commas
-static const uint8_t ENERGY_LOG_EXPECTED_COMMAS = 5; // 6 columns = 5 commas
+static const uint8_t LOG_EXPECTED_COMMAS = 40; // 41 columns = 40 commas
+static const uint8_t ENERGY_LOG_EXPECTED_COMMAS = 6; // 7 columns = 6 commas
 
 void initSD() {
     if (SD.begin(PIN_SD_CS)) {
         sdAvailable = true;
+        sdEjected   = false;
 #ifdef DEBUG_SERIAL
         Serial.println(F("SD: ok"));
 #endif
@@ -1336,7 +1481,7 @@ void initSD() {
                             "pump_pct,htr_pct,export_w,import_w,"
                             "bus_v,fan1rpm,fan2rpm,fan_pct,"
                             "h_pump_pct,pv1_w,pv2_w,batt_w,batt_soc_pct,w_faults,h_faults,"
-                            "log_valve,bot_valve,two_port_valve,"
+                            "log_valve,log_burner_hot,bot_valve,two_port_valve,"
                             "ufh_cold_v,solar_cold_v,vac_iso_v,fan_flap_v,"
                             "w_rx_good,w_rx_badframe,h_needts,w_rx_age_s"));
                 f.close();
@@ -1360,7 +1505,7 @@ void initSD() {
         if (needEnergyHeader) {
             File f = SD.open("energy.csv", FILE_WRITE);
             if (f) {
-                f.println(F("datetime,pv_kwh,import_kwh,heater_kwh,consumption_kwh,soc_pct"));
+                f.println(F("datetime,pv_kwh,import_kwh,export_kwh,heater_kwh,consumption_kwh,soc_pct"));
                 f.close();
             }
         }
@@ -1416,6 +1561,7 @@ void logDataRow() {
     logFile.print("0x"); logFile.print(lastWPkt.wFaultFlags, HEX); logFile.print(',');
     logFile.print("0x"); logFile.print(hFaultFlags, HEX); logFile.print(',');
     logFile.print(logBurnerCold.isOpen); logFile.print(',');
+    logFile.print(logBurnerHot);         logFile.print(',');
     logFile.print(botTankValve.isOpen);  logFile.print(',');
     logFile.print(twoPortValve.isOpen);  logFile.print(',');
     logFile.print((lastWPkt.valveStates & VSTATE_UFH_COLD_OPEN)   ? 1 : 0); logFile.print(',');
@@ -1446,6 +1592,7 @@ void logEnergyRow() {
     energyLogFile.print(tsBuf); energyLogFile.print(',');
     energyLogFile.print(kwhPV, 3);          energyLogFile.print(',');
     energyLogFile.print(kwhImport, 3);      energyLogFile.print(',');
+    energyLogFile.print(kwhExport, 3);      energyLogFile.print(',');
     energyLogFile.print(kwhHeater, 3);      energyLogFile.print(',');
     energyLogFile.print(kwhConsumption, 3); energyLogFile.print(',');
     energyLogFile.println(energyLastSocPct);
@@ -1457,18 +1604,21 @@ void safeEjectSD() {
     if (logFile) logFile.close();
     if (energyLogFile) energyLogFile.close();
     SD.end();
+    // SdVolume's raw block cache is static and survives SD.end()/begin() —
+    // without clearing it, re-init on reinsert reuses the old card's cached
+    // boot sector instead of reading the new one, so it fails forever until reset.
+    SdVolume::cacheClear();
     sdEjected   = true;
     sdAvailable = false;
 }
 
 void checkSDReinsert() {
     if (sdAvailable) return;
-    // Try to reinitialise; SD.begin() returns true if card present
-    if (SD.begin(PIN_SD_CS)) {
-        sdEjected   = false;
-        sdAvailable = true;
-        initSD();
-    }
+    static uint32_t lastAttemptMs = 0;
+    uint32_t now = millis();
+    if (now - lastAttemptMs < 2000) return; // SD.begin() blocks up to 2s on failure; don't hammer every loop
+    lastAttemptMs = now;
+    initSD(); // does its own SD.begin() and sets sdAvailable/sdEjected on success
 }
 
 // ============================================================
@@ -1641,6 +1791,7 @@ const char* faultNameW(uint32_t mask) {
     return "W Sensr Flt";
 }
 const char* faultNameH(uint32_t mask) {
+    if (mask & FAULT_H_HEATER_MANUAL_LOCKOUT) return "Htr 95C LOCK";
     if (mask & FAULT_H_HEATER_OVERHEAT_SHUT)  return "Htr Ovht STP";
     if (mask & FAULT_H_HEATER_ELEMENT_FAIL)   return "Htr Elem Flt";
     if (mask & FAULT_H_RS485_COMMS)           return "H RS485 Err";
@@ -1851,8 +2002,8 @@ void drawPage2() {
     kwhStr(lv, sizeof(lv), kwhPV);      kwhStr(rv, sizeof(rv), kwhImport);
     wRow(4, 80, 244, 336, y, "PVkWh:", lv, "ImpkWh:", rv); y += ROW;
 
-    kwhStr(lv, sizeof(lv), kwhExport);  kwhStr(rv, sizeof(rv), kwhHeater);
-    wRow(4, 96, 244, 336, y, "ExpkWh:", lv, "HtrkWh:", rv); y += ROW;
+    kwhStr(lv, sizeof(lv), kwhHeater);  kwhStr(rv, sizeof(rv), kwhExport);
+    wRow(4, 96, 244, 336, y, "HtrkWh:", lv, "ExpkWh:", rv); y += ROW;
 
     kwhStr(lv, sizeof(lv), kwhConsumption);
     wRow(4, 100, 244, 336, y, "ConsKWh:", lv, "            ", ""); y += ROW;
@@ -2052,10 +2203,14 @@ void page4Action(uint8_t item) {
         faultHistScrollOffset = 0;
         faultLogPrevW = hasWPkt ? lastWPkt.wFaultFlags : 0;
         faultLogPrevH = hFaultFlags;
-        // Clear heater lockout so heater can restart if temperature has recovered
-        heaterHardLockout  = false;
-        heaterLevelCap     = 20;
+        // Clear heater lockout so heater can restart if temperature has recovered.
+        // If hOut is still >=94/95°C, updateHeaterFaultChecks() re-latches on the very
+        // next call — same as the existing 94°C behavior this reset already relied on.
+        heaterHardLockout   = false;
+        heaterManualLockout = false;
+        heaterLevelCap      = HEATER_LEVEL_COUNT;
         clearFaultH(FAULT_H_HEATER_OVERHEAT_SHUT);
+        clearFaultH(FAULT_H_HEATER_MANUAL_LOCKOUT);
     }
     actionFlashEndMs = millis() + 300;
 }
@@ -2332,25 +2487,26 @@ PktReceiver pktRx;
 static float calcPred(uint8_t heaterPct, float hotPipeC) {
     // Per-level k and alpha fitted from new_pump SCT data (pump = k / (85-hp)^alpha);
     // alpha isotonic-smoothed across levels so higher heater % never predicts less pump
-    static const uint8_t LEVELS[20] = {
-          5,  10,  14,  20,  25,  29,  33,  40,  43,  50,
-         57,  60,  67,  71,  75,  80,  86,  90,  95, 100
+    // Entries for 5%, 43%, 57%, 95% removed to match kHeaterLevels (16 levels, was 20).
+    static const uint8_t LEVELS[HEATER_LEVEL_COUNT] = {
+         10,  14,  20,  25,  29,  33,  40,  50,
+         60,  67,  71,  75,  80,  86,  90, 100
     };
-    static const float K_TBL[20] = {
-          11.7f,   43.7f,  109.6f,  352.8f,  785.4f,
-        1345.3f, 2122.9f, 3968.6f, 4894.7f, 7145.8f,
-        9249.8f,10065.2f,11824.9f,12839.2f,13980.7f,
-       15805.3f,19139.8f,22614.3f,29520.0f,41692.6f
+    static const float K_TBL[HEATER_LEVEL_COUNT] = {
+          43.7f,  109.6f,  352.8f,  785.4f,
+        1345.3f, 2122.9f, 3968.6f, 7145.8f,
+       10065.2f,11824.9f,12839.2f,13980.7f,
+       15805.3f,19139.8f,22614.3f,41692.6f
     };
-    static const float A_TBL[20] = {
-        0.323f, 0.638f, 0.851f, 1.111f, 1.281f,
-        1.390f, 1.477f, 1.586f, 1.618f, 1.668f,
-        1.691f, 1.695f, 1.699f, 1.701f, 1.704f,
-        1.714f, 1.737f, 1.762f, 1.806f, 1.868f
+    static const float A_TBL[HEATER_LEVEL_COUNT] = {
+        0.638f, 0.851f, 1.111f, 1.281f,
+        1.390f, 1.477f, 1.586f, 1.668f,
+        1.695f, 1.699f, 1.701f, 1.704f,
+        1.714f, 1.737f, 1.762f, 1.868f
     };
 
     uint8_t i = 0;
-    while (i < 19 && LEVELS[i] != heaterPct) i++;
+    while (i < HEATER_LEVEL_COUNT - 1 && LEVELS[i] != heaterPct) i++;
     float k     = K_TBL[i];
     float alpha = A_TBL[i];
 
@@ -2368,6 +2524,30 @@ static float calcHPumpDuty() {
     float hotPipeC   = sTemp[H_SENSOR_HOT_PIPE];
 
     if (hotPipeC >= 80.0f) return 100.0f;
+
+    // Fast-rise override: hot_pipe climbing >=1C within 10s while heater outlet
+    // is already >=86C predicts an imminent overheat spike (morning solar-surge
+    // events in SD log analysis, Aug 2026 — see SPEC_CHANGES.md). Once triggered,
+    // pump is held at 100% for a rolling 15s — the hold keeps re-extending every
+    // loop the criteria is still true, so it only releases 15s after the LAST
+    // time the fast rise was seen, not 15s after the first.
+    {
+        static unsigned long hpHoldStartMs = 0;
+        static bool          hpHolding     = false;
+
+        bool hpCriteria = heaterOutC >= 86.0f;
+        if (hpCriteria) {
+            float rise = getHotPipeRise10sC();
+            hpCriteria = !isnan(rise) && rise >= 1.0f;
+        }
+        if (hpCriteria) {
+            hpHoldStartMs = millis();
+            hpHolding     = true;
+        } else if (hpHolding && millis() - hpHoldStartMs >= 15000UL) {
+            hpHolding = false;
+        }
+        if (hpHolding) return 100.0f;
+    }
 
 #ifdef DEBUG_SERIAL
     if (calHtrOverride) {
@@ -2514,7 +2694,8 @@ void sendHToWPacket(bool timeSyncReq) {
     { float effT = getHeaterOutC(); pkt.tempHeaterOut = isnan(effT) ? TEMP_FAULT : (int16_t)(effT * 10.0f); }
 
     pkt.heaterPowerPct    = (heaterRunning && heaterLevelIdx > 0) ? max(heaterLevelPct(), (uint8_t)1) : 0;
-    pkt.heaterRestricted  = (heaterLevelCap < 20) ? 1 : 0;
+    pkt.heaterRestricted  = (heaterLevelCap < HEATER_LEVEL_COUNT) ? 1 : 0;
+    pkt.heaterWantsPower  = heaterRunning ? 1 : 0;
     pkt.twoPortHeaterSide = twoPortValve.isOpen ? 1 : 0;
     pkt.botTankOpen       = botTankValve.isOpen ? 1 : 0;
 
@@ -2635,7 +2816,8 @@ static void pollRS485() {
         if ((calPumpPhase == CALP_IDLE || calPumpPhase == CALP_DONE) && pumpTestState == PT_IDLE)
 #endif
         {
-            checkHeaterImportTrip(lastWPkt.gridImportW, lastWPkt.battSocPct, lastWPkt.battChargeW, lastWPkt.growattValid);
+            checkHeaterImportTrip(lastWPkt.gridImportW, lastWPkt.battSocPct, lastWPkt.battChargeW, lastWPkt.growattValid,
+                                   lastWPkt.pv1W, lastWPkt.pv2W);
             // Winter mode: hold off heater until export has been ≥500W for ≥60s (battery charges to 100% first).
             if (systemMode == MODE_WINTER && !pvExportOverride) {
                 heaterLevelIdx = 0; heaterRunning = false;
@@ -2706,6 +2888,7 @@ static void dbgValves() {
 static void dbgFaults() {
     bool any = false;
     #define HF(m,n) if(hasFaultH(m)){Serial.println(F("  " n));any=true;}
+    HF(FAULT_H_HEATER_MANUAL_LOCKOUT,"HEATER_MANUAL_LOCKOUT (95C latch)")
     HF(FAULT_H_HEATER_OVERHEAT_SHUT, "HEATER_OVERHEAT_SHUT")
     HF(FAULT_H_HEATER_ELEMENT_FAIL,  "HEATER_ELEMENT_FAIL")
     HF(FAULT_H_RS485_COMMS,          "RS485_COMMS")
@@ -2740,6 +2923,7 @@ static void dbgMode() {
     Serial.print(F("  heater:       ")); Serial.print(heaterRunning ? F("ON ") : F("off "));
     Serial.print(heaterLevelPct()); Serial.println(F("%"));
     Serial.print(F("  htr_lockout:  ")); Serial.println(heaterHardLockout  ? F("YES")    : F("no"));
+    Serial.print(F("  htr_manual_lockout (95C, needs Alrt Reset): ")); Serial.println(heaterManualLockout ? F("YES") : F("no"));
     Serial.print(F("  rs485:        ")); Serial.println(rs485Fault         ? F("FAULT")  : F("ok"));
     Serial.print(F("  rtc_valid:    ")); Serial.println(rtcValid            ? F("yes")    : F("no"));
     Serial.print(F("  sd:           ")); Serial.println(sdAvailable         ? F("ok")     : F("no"));
@@ -2751,6 +2935,7 @@ static void dbgHeater() {
     Serial.print(F("  power_est: ")); Serial.print(heaterLevelPct10() * 3); Serial.println(F("W"));
     Serial.print(F("  lockout:   ")); Serial.println(heaterHardLockout ? F("YES")  : F("no"));
     Serial.print(F("  imp_trip:  ")); Serial.println(importTripActive  ? F("YES")  : F("no"));
+    if (dawnHoldUntilMs) { Serial.print(F("  dawn_hold: ")); Serial.print((dawnHoldUntilMs - millis()) / 1000UL); Serial.println(F("s left")); }
     Serial.print(F("  grid:      ")); Serial.println(gridPresent       ? F("ok")   : F("OUTAGE"));
     Serial.print(F("  zc_count:  ")); Serial.println(zcFireCount);
     Serial.print(F("  zc_age_ms: ")); Serial.println((micros() - lastZCMicros) / 1000UL);
@@ -3331,6 +3516,7 @@ void loop() {
     // Sensors
     if (!convStarted) startConversion();
     readSensors();
+    updateHotPipeRiseBuf();
 
     // Log burner module
     readLogBurnerModule();

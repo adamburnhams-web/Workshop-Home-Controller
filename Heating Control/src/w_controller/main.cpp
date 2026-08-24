@@ -537,6 +537,7 @@ PktReceiver pktRx;
 // ============================================================
 
 uint8_t  curHour = 0, curMinute = 0, curSecond = 0;
+uint8_t  curDay = 1, curMonth = 1, curYear = 26; // date of last time sync (year - 2000); used for sunset lookup
 bool     timeSynced = false;
 unsigned long lastTimeSyncRequestMs = 0;
 unsigned long lastTimeSyncReceivedMs = 0;
@@ -1171,15 +1172,24 @@ void updateVacuum() {
     }
     vacIsoValve.update();
 
-    // Reset session flag when a new heating day starts (morningHeatActive goes 0→1)
-    static bool prevMorningHeat = false;
-    bool curMorningHeat = hasHPacket ? lastH.morningHeatActive : false;
-    if (!prevMorningHeat && curMorningHeat) {
-        vacFullThisSession = false;
-        if (vacState == VAC_FAULT) clearFault(FAULT_W_VAC_PUMP_OVERTIME);
-        vacState = VAC_IDLE;
+    // Reset session flag on real calendar-day rollover (curDay comes from H's
+    // time sync). Previously tied to morningHeatActive's 0->1 edge, but that
+    // only fires when the UFH morning-boost trigger runs (workshop air below
+    // target at 5am) — on any day it doesn't, vacFullThisSession stayed stuck
+    // true from the prior day and the vacuum cycle silently never ran.
+    static uint8_t lastVacResetDay = 0;
+    static bool    vacResetDayInit = false;
+    if (timeSynced) {
+        if (!vacResetDayInit) {
+            lastVacResetDay = curDay;
+            vacResetDayInit = true;
+        } else if (curDay != lastVacResetDay) {
+            lastVacResetDay = curDay;
+            vacFullThisSession = false;
+            if (vacState == VAC_FAULT) clearFault(FAULT_W_VAC_PUMP_OVERTIME);
+            vacState = VAC_IDLE;
+        }
     }
-    prevMorningHeat = curMorningHeat;
 }
 
 // ============================================================
@@ -1277,6 +1287,124 @@ void updateWinterSolar(float tankBottomC) {
 
 
 // ============================================================
+//  SUNSET TABLE  (UK, Alton — used for summer solar end-of-day cutoff)
+// ============================================================
+
+// Sunset time, minutes since midnight UTC, indexed by day-of-year 1-365 (non-leap
+// reference year). On a leap year, Feb 29 reuses the Feb 28 entry (day 59) rather than
+// shifting the table — see dayOfYearForSunset() below.
+static const uint16_t kSunsetUtcMin[365] PROGMEM = {
+    // Jan (1-31)
+     866, 867, 869, 871, 872, 874, 876, 878, 880, 881,
+     883, 886, 888, 890, 892, 894, 896, 898, 901, 903,
+     905, 908, 910, 912, 915, 917, 919, 922, 924, 926,
+     929,
+    // Feb (32-59)
+     931, 933, 936, 938, 940, 943, 945, 947, 950, 952,
+     954, 956, 959, 961, 963, 965, 968, 970, 972, 974,
+     976, 978, 980, 983, 985, 987, 989, 991,
+    // Mar (60-90)
+     993, 995, 997, 999,1001,1003,1005,1006,1008,1010,
+    1012,1014,1016,1018,1019,1021,1023,1025,1027,1028,
+    1030,1032,1033,1035,1037,1039,1040,1042,1044,1045,
+    1047,
+    // Apr (91-120)
+    1048,1050,1052,1053,1055,1057,1058,1060,1061,1063,
+    1064,1066,1067,1069,1070,1072,1074,1075,1077,1078,
+    1079,1081,1082,1084,1085,1087,1088,1090,1091,1092,
+    // May (121-151)
+    1094,1095,1097,1098,1099,1101,1102,1103,1105,1106,
+    1107,1109,1110,1111,1112,1114,1115,1116,1117,1118,
+    1119,1121,1122,1123,1124,1125,1126,1127,1128,1129,
+    1130,
+    // Jun (152-181)
+    1131,1131,1132,1133,1134,1135,1135,1136,1137,1137,
+    1138,1138,1139,1139,1140,1140,1141,1141,1141,1141,
+    1142,1142,1142,1142,1142,1142,1142,1142,1142,1142,
+    // Jul (182-212)
+    1142,1141,1141,1141,1141,1140,1140,1139,1139,1138,
+    1138,1137,1136,1136,1135,1134,1133,1132,1131,1131,
+    1130,1129,1127,1126,1125,1124,1123,1122,1120,1119,
+    1118,
+    // Aug (213-243)
+    1116,1115,1114,1112,1111,1109,1108,1106,1104,1103,
+    1101,1100,1098,1096,1094,1093,1091,1089,1087,1085,
+    1083,1081,1079,1078,1076,1074,1072,1069,1067,1065,
+    1063,
+    // Sep (244-273)
+    1061,1059,1057,1055,1053,1050,1048,1046,1044,1042,
+    1039,1037,1035,1033,1030,1028,1026,1023,1021,1019,
+    1016,1014,1012,1009,1007,1004,1002,1000, 997, 995,
+    // Oct (274-304)
+     993, 990, 988, 985, 983, 980, 978, 976, 973, 971,
+     968, 966, 964, 961, 959, 956, 954, 951, 949, 947,
+     944, 942, 940, 937, 935, 933, 930, 928, 926, 923,
+     921,
+    // Nov (305-334)
+     919, 916, 914, 912, 910, 908, 905, 903, 901, 899,
+     897, 895, 893, 891, 889, 887, 885, 883, 882, 880,
+     878, 876, 875, 873, 872, 870, 869, 867, 866, 865,
+    // Dec (335-365)
+     863, 862, 861, 860, 859, 858, 857, 857, 856, 856,
+     855, 855, 854, 854, 854, 854, 854, 854, 854, 855,
+     855, 856, 856, 857, 858, 859, 860, 861, 862, 863,
+     864,
+};
+
+// Non-leap cumulative days before each month (Jan=index0).
+static const uint16_t kCumDaysBeforeMonth[12] PROGMEM = {
+    0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334
+};
+
+// Day-of-year (1-365) on the non-leap reference calendar used by kSunsetUtcMin[].
+// Feb 29 maps onto Feb 28 (day 59) so leap years reuse that day's sunset time
+// unchanged, and every date from Mar 1 onward lines up with the table regardless
+// of whether the current year is a leap year.
+static uint16_t dayOfYearForSunset(uint8_t month, uint8_t day) {
+    if (month == 2 && day == 29) day = 28;
+    return pgm_read_word(&kCumDaysBeforeMonth[month - 1]) + day;
+}
+
+// Sakamoto's algorithm: day of week for a Gregorian date, 0=Sunday.
+static uint8_t dayOfWeek(uint16_t y, uint8_t m, uint8_t d) {
+    static const uint8_t t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+    if (m < 3) y--;
+    return (uint8_t)((y + y / 4 - y / 100 + y / 400 + t[m - 1] + d) % 7);
+}
+
+static uint8_t daysInMonth(uint16_t y, uint8_t m) {
+    static const uint8_t dim[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) return 29;
+    return dim[m - 1];
+}
+
+static uint8_t lastSundayOfMonth(uint16_t y, uint8_t m) {
+    uint8_t last = daysInMonth(y, m);
+    return last - dayOfWeek(y, m, last);
+}
+
+// UK clocks: forward last Sunday of March, back last Sunday of October (both ~01:00
+// UTC). Ignoring the exact transition hour is fine here — this only feeds an evening
+// sunset comparison, nowhere near the 1am changeover.
+static bool isBST(uint16_t y, uint8_t m, uint8_t d) {
+    if (m < 3 || m > 10) return false;
+    if (m > 3 && m < 10) return true;
+    if (m == 3) return d >= lastSundayOfMonth(y, 3);
+    return d < lastSundayOfMonth(y, 10);
+}
+
+// Today's sunset, minutes since midnight in UK local (civil) time — matches the
+// RTC's wall-clock convention (BST-aware, set by hand from a clock on the wall).
+static uint16_t sunsetLocalMinutes() {
+    uint16_t doy = dayOfYearForSunset(curMonth, curDay);
+    if (doy < 1) doy = 1;
+    if (doy > 365) doy = 365;
+    uint16_t sunsetUtc = pgm_read_word(&kSunsetUtcMin[doy - 1]);
+    uint16_t fullYear  = 2000 + curYear;
+    return sunsetUtc + (isBST(fullYear, curMonth, curDay) ? 60 : 0);
+}
+
+// ============================================================
 //  SUMMER SOLAR  (simplified — full sequence coordinated with H)
 // ============================================================
 
@@ -1330,8 +1458,37 @@ void updateSummerSolar() {
         return;
     }
 
+    // End-of-day cutoff: past today's actual sunset (kSunsetUtcMin, BST-adjusted —
+    // see sunsetLocalMinutes() above), there's no more solar gain physically possible.
+    // Must gate (and return before) the start-trigger logic below, not just tear down
+    // after it runs — otherwise a start condition true at the same time as pastSunset
+    // would open the valve/start the pump, then immediately be undone by a teardown
+    // check placed later in the function, re-triggering every loop indefinitely as long
+    // as both conditions held. Before the first time sync, getCurrentTime() defaults to
+    // noon (always before sunset), so this doesn't fire until a real sync arrives.
+    uint8_t eodH, eodM; getCurrentTime(eodH, eodM);
+    uint16_t nowMinutes = (uint16_t)eodH * 60 + eodM;
+    bool pastSunset = nowMinutes >= sunsetLocalMinutes();
+
+    if (pastSunset) {
+        if (solarPumpActive || summerPhase != SUMPH_IDLE) {
+            solarColdValve.setClose();
+            ufhColdValve.setClose();
+            resetSolarPumpOverrides();
+            solarPumpActive = false;
+            summerPhase     = SUMPH_IDLE;
+            summerSeqDone   = false;
+        }
+        setSolarPumpDuty(0);
+        return;
+    }
+
     // Solar starts at 80°C flat in MAX mode; in tank+ mode at tank_top or 80°C,
-    // whichever is reached first. Heater running also forces a start regardless of mode.
+    // whichever is reached first. Heater wanting to run also forces a start
+    // regardless of mode — must key off heaterWantsPower (pre-flow-path intent),
+    // not heaterPowerPct: heaterPowerPct stays 0 until H's heaterFlowPathOk() sees
+    // our solar cold valve already open, which would otherwise deadlock (neither
+    // side ever makes the first move).
     bool tankTopFault = (lastH.tempTankTop == TEMP_FAULT);
     float tankTopC    = tankTopFault ? 60.0f : (float)lastH.tempTankTop / 10.0f;
     bool hotPipeFault = (lastH.tempHotPipe == TEMP_FAULT);
@@ -1340,7 +1497,7 @@ void updateSummerSolar() {
 
     float startThreshold = (tgtMode == SOLAR_MAX) ? 80.0f : min(tankTopC, 80.0f);
     bool startTriggerRaw = hot >= startThreshold || cold >= startThreshold
-                         || (hasHPacket && lastH.heaterPowerPct > 0);
+                         || (hasHPacket && lastH.heaterWantsPower);
 
     // Require the start condition to hold continuously for 20s before actually
     // starting solar — filters brief sensor blips/noise around the threshold.
@@ -1474,37 +1631,6 @@ void updateSummerSolar() {
         solarDumpUFHOn    = false;
     }
 
-    // End-of-day abort: solar exhausted for 10+ consecutive minutes — both solar pipes
-    // below tank-mid, PV low, hot~cold near equilibrium (no more useful gain), heater off,
-    // SOC not already full. Growatt outage (growatt.valid false) assumes PV low / SOC low
-    // rather than blocking shutdown on stale comms.
-    bool socLow = growatt.valid ? (growatt.battSocPct < 95) : true;
-    bool pvLow  = growatt.valid ? ((growatt.pv1W + growatt.pv2W) < 300) : true;
-    bool belowMidTank = hasHPacket && lastH.tempTankMid != TEMP_FAULT
-                        && hot  < (float)lastH.tempTankMid / 10.0f
-                        && cold < (float)lastH.tempTankMid / 10.0f;
-    bool nearEquilibrium = !sFault[SENSOR_SOLAR_HOT] && !sFault[SENSOR_SOLAR_COLD]
-                           && (hot - cold) < 6.0f;
-    bool heaterOff = !(hasHPacket && lastH.heaterPowerPct > 0);
-    bool eodCondition = belowMidTank && pvLow && nearEquilibrium && heaterOff && socLow;
-
-    static unsigned long eodCondStartMs = 0;
-    if (eodCondition) {
-        if (eodCondStartMs == 0) eodCondStartMs = millis();
-    } else {
-        eodCondStartMs = 0;
-    }
-    bool eodPvLow = eodCondStartMs != 0 && (millis() - eodCondStartMs >= 600000UL);
-
-    if (eodPvLow) {
-        solarColdValve.setClose();
-        ufhColdValve.setClose();
-        resetSolarPumpOverrides();
-        setSolarPumpDuty(0);
-        solarPumpActive = false;
-        summerPhase     = SUMPH_IDLE;
-        summerSeqDone   = false;
-    }
 }
 
 // ============================================================
@@ -2197,6 +2323,9 @@ void receiveHToWPacket() {
                 curHour   = lastH.syncHour;
                 curMinute = lastH.syncMinute;
                 curSecond = lastH.syncSecond;
+                curDay    = lastH.syncDay;
+                curMonth  = lastH.syncMonth;
+                curYear   = lastH.syncYear;
                 timeBaseMs = millis();
                 timeSynced = true;
                 lastTimeSyncReceivedMs = millis();
