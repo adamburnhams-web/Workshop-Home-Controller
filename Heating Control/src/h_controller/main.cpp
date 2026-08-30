@@ -283,6 +283,7 @@ unsigned long importZeroStartMs = 0;
 bool          pvWasZero         = true;
 unsigned long pvZeroSinceMs     = 0;
 unsigned long dawnHoldUntilMs   = 0;
+bool          pvZeroTrackedOnce = false;  // see checkHeaterImportTrip() boot-arm note
 bool gridPresent                 = true;
 unsigned long lastGridLossMs     = 0;
 bool gridOutageFault             = false;
@@ -297,6 +298,10 @@ unsigned long hPumpOffMs       = 0;
 enum FlushState : uint8_t { FLUSH_IDLE, FLUSH_ACTIVE, FLUSH_PAUSE };
 FlushState flushState = FLUSH_IDLE;
 uint32_t   flushTimer = 0;
+
+enum ImbalPulseState : uint8_t { IMBAL_IDLE, IMBAL_ON, IMBAL_OFF };
+ImbalPulseState imbalPulseState = IMBAL_IDLE;
+uint32_t        imbalPulseTimer = 0;
 
 // True when W solar-cold is open, 2-port is fully on the heater side and idle,
 // AND at least one H-side return path is fully open and idle.
@@ -365,6 +370,8 @@ static uint16_t heaterLevelPct10() {
 }
 
 uint8_t rtcHour();   // defined after RTC section
+uint8_t rtcMinute(); // defined after RTC section
+uint8_t rtcSecond(); // defined after RTC section
 
 #ifdef DEBUG_SERIAL
 uint8_t simHeaterVal = 0;
@@ -470,11 +477,27 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
         int16_t battChgW   = lastWPkt.battChargeW;
         // SOC > 95%: battery full, no reservation at all.
         // SOC 86-95%: battery essentially full, only 200W reservation regardless of time.
-        // Otherwise before 14:00: 500W reservation always.
-        // After 14:00: 3kW reservation while SOC ≤ 60%, then 1kW once battery is charging freely.
-        int32_t reservationW = (soc > 95) ? 0L
-                             : (soc > 85) ? 200L
-                             : (rtcHour() < 14) ? 500L : (soc > 60 ? 1000L : 3000L);
+        // Otherwise, time-of-day tiers (SOC threshold tightens as the day's solar
+        // window narrows, so heater takes more of the export later in the low-sun hours):
+        //   before 11:00:00          SOC ≤20% 3kW, 21-25% 1kW, >25% 500W
+        //   11:00:00 - 13:00:00      SOC ≤40% 3kW, 41-55% 1kW, >55% 500W
+        //   13:00:01 - 13:59:59      SOC ≤50% 3kW, 51-80% 1kW, >80% 400W
+        //   14:00:00 onward          SOC ≤60% 3kW, >60% 1kW
+        uint32_t nowSec = (uint32_t)rtcHour() * 3600UL + (uint32_t)rtcMinute() * 60UL + rtcSecond();
+        int32_t reservationW;
+        if (soc > 95) {
+            reservationW = 0L;
+        } else if (soc > 85) {
+            reservationW = 200L;
+        } else if (nowSec < 39600UL) {          // before 11:00:00
+            reservationW = (soc <= 20) ? 3000L : (soc <= 25) ? 1000L : 500L;
+        } else if (nowSec <= 46800UL) {         // 11:00:00 - 13:00:00
+            reservationW = (soc <= 40) ? 3000L : (soc <= 55) ? 1000L : 500L;
+        } else if (nowSec < 50400UL) {          // 13:00:01 - 13:59:59
+            reservationW = (soc <= 50) ? 3000L : (soc <= 80) ? 1000L : 400L;
+        } else {                                // 14:00:00 onward
+            reservationW = (soc > 60) ? 1000L : 3000L;
+        }
         int32_t available = (int32_t)pvExportW - gridImportW + (int32_t)battChgW + heaterCurrentW - reservationW;
         rawPct = (int16_t)constrain(available * 100L / 3000L, 0L, 100L);
     }
@@ -561,11 +584,11 @@ bool hasFaultH(uint32_t m)   { return (hFaultFlags & m) != 0; }
 // ============================================================
 
 // Growatt pauses battery discharge and pulls a small fixed import (~210-220W)
-// for ~5-6 min during its dawn PV/grid-sync startup, every morning as soon as
-// PV first registers after a night at zero. That reads as importHigh but isn't
-// a real inverter-CB trip, so hold off the check across a window comfortably
-// longer than the observed blip.
-static const unsigned long DAWN_HOLD_MS     = 420000UL; // 7 min
+// during its dawn PV/grid-sync startup, every morning as soon as PV first
+// registers after a night at zero. Observed duration varies morning to
+// morning (5-6 min typical, but two mornings in Aug 2026 tripped the fault
+// through the old 7 min hold) — held well clear of the worst case seen.
+static const unsigned long DAWN_HOLD_MS     = 3600000UL; // 60 min
 static const unsigned long NIGHT_PV_ZERO_MS = 1200000UL; // 20 min of zero PV = "night"
 
 void checkHeaterImportTrip(int16_t gridImportW, uint8_t soc, int16_t battChargeW, bool growattValid,
@@ -575,10 +598,16 @@ void checkHeaterImportTrip(int16_t gridImportW, uint8_t soc, int16_t battChargeW
 
     bool pvZero = (pv1W <= 0 && pv2W <= 0);
     if (pvZero) {
-        if (!pvWasZero) pvZeroSinceMs = now;
+        if (!pvWasZero) { pvZeroSinceMs = now; pvZeroTrackedOnce = true; }
         pvWasZero = true;
     } else {
-        if (pvWasZero && (now - pvZeroSinceMs >= NIGHT_PV_ZERO_MS)) {
+        // pvZeroSinceMs defaults to 0 at boot, so until a real nonzero->zero
+        // transition has actually been captured (pvZeroTrackedOnce), the
+        // elapsed-time check can't be trusted — a reboot less than 20 min
+        // before dawn would otherwise fail to arm the hold and leave the
+        // Growatt blip unprotected. Arm unconditionally on the first-ever
+        // transition after boot instead; later dawns use the real duration.
+        if (pvWasZero && (!pvZeroTrackedOnce || (now - pvZeroSinceMs >= NIGHT_PV_ZERO_MS))) {
             dawnHoldUntilMs = now + DAWN_HOLD_MS;
         }
         pvWasZero = false;
@@ -2589,11 +2618,11 @@ static float calcHPumpDuty() {
             duty = dutyAt90 + t * (100.0f - dutyAt90);
         } else if (heaterOutC >= target) {
             duty = pred + (heaterOutC - target) * 0.2f;
-        } else if (heaterOutC >= target - 7.0f) {
-            float t = (heaterOutC - (target - 7.0f)) / 7.0f;
-            duty = pred * 0.9f + t * (pred * 0.1f);
+        } else if (heaterOutC >= target - 10.0f) {
+            float t = (heaterOutC - (target - 10.0f)) / 10.0f;
+            duty = pred * 0.8f + t * (pred * 0.2f);
         } else {
-            duty = pred * 0.9f;
+            duty = pred * 0.8f;
         }
     } else {
         // MAX mode (or tank top fault): fixed 85°C target with pred→upper ramp.
@@ -2605,11 +2634,11 @@ static float calcHPumpDuty() {
         } else if (heaterOutC >= 85.0f) {
             float t = (heaterOutC - 85.0f) / 5.0f;
             duty = pred + t * (upper - pred);
-        } else if (heaterOutC >= 78.0f) {
-            float t = (heaterOutC - 78.0f) / 7.0f;
-            duty = pred * 0.9f + t * (pred * 0.1f);
+        } else if (heaterOutC >= 75.0f) {
+            float t = (heaterOutC - 75.0f) / 10.0f;
+            duty = pred * 0.8f + t * (pred * 0.2f);
         } else {
-            duty = pred * 0.9f;
+            duty = pred * 0.8f;
         }
     }
 
@@ -2637,6 +2666,42 @@ static void updateFlush() {
             if (now - flushTimer >= 4000) {
                 flushState = cond ? FLUSH_ACTIVE : FLUSH_IDLE;
                 flushTimer = now;
+            }
+            break;
+    }
+}
+
+// Short pump nudge when the two heater-outlet sensors disagree by >10C in the
+// 65-80C band — below the FLUSH band above, so the two never overlap. Wider
+// off-time at the cooler end (65-70C) since the imbalance is less urgent there.
+static void updateImbalancePulse() {
+    if (!heaterRunning || heaterLevelIdx == 0) { imbalPulseState = IMBAL_IDLE; return; }
+    float h1 = sFault[H_SENSOR_HEATER_OUT]   ? NAN : sTemp[H_SENSOR_HEATER_OUT];
+    float h2 = sFault[H_SENSOR_HEATER_OUT_2] ? NAN : sTemp[H_SENSOR_HEATER_OUT_2];
+    if (isnan(h1) || isnan(h2)) { imbalPulseState = IMBAL_IDLE; return; }
+
+    float hi   = fmaxf(h1, h2);
+    float diff = fabsf(h1 - h2);
+
+    uint32_t onMs = 0, offMs = 0;
+    if (diff > 10.0f) {
+        if      (hi >= 65.0f && hi < 70.0f) { onMs = 500UL; offMs = 20000UL; }
+        else if (hi >= 70.0f && hi < 80.0f) { onMs = 500UL; offMs = 10000UL; }
+    }
+    bool cond = onMs > 0;
+
+    uint32_t now = millis();
+    switch (imbalPulseState) {
+        case IMBAL_IDLE:
+            if (cond) { imbalPulseState = IMBAL_ON; imbalPulseTimer = now; }
+            break;
+        case IMBAL_ON:
+            if (now - imbalPulseTimer >= onMs) { imbalPulseState = IMBAL_OFF; imbalPulseTimer = now; }
+            break;
+        case IMBAL_OFF:
+            if (now - imbalPulseTimer >= offMs) {
+                imbalPulseState = cond ? IMBAL_ON : IMBAL_IDLE;
+                imbalPulseTimer = now;
             }
             break;
     }
@@ -3562,14 +3627,17 @@ void loop() {
 
     // H-side solar pump direct drive
     updateFlush();
+    updateImbalancePulse();
 #ifdef DEBUG_SERIAL
     updatePumpTest();
-    if (pumpTestState == PT_COOLDOWN)    setHPumpDuty(10.0f);
-    else if (flushState == FLUSH_ACTIVE) setHPumpDuty(100.0f);
-    else if (simHPumpSpdActive)          setHPumpDuty(simHPumpSpdVal);
+    if (pumpTestState == PT_COOLDOWN)     setHPumpDuty(10.0f);
+    else if (flushState == FLUSH_ACTIVE)  setHPumpDuty(100.0f);
+    else if (imbalPulseState == IMBAL_ON) setHPumpDuty(100.0f);
+    else if (simHPumpSpdActive)           setHPumpDuty(simHPumpSpdVal);
     else
 #else
-    if (flushState == FLUSH_ACTIVE)      setHPumpDuty(100.0f);
+    if (flushState == FLUSH_ACTIVE)       setHPumpDuty(100.0f);
+    else if (imbalPulseState == IMBAL_ON) setHPumpDuty(100.0f);
     else
 #endif
     setHPumpDuty(calcHPumpDuty());

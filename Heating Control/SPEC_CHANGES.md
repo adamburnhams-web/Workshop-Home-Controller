@@ -142,16 +142,19 @@ ILI9488 driver, SPI pins, and display dimensions configured via `build_flags` in
 SOC reservation:
   soc > 95%:                          reservationW = 0W     (battery full, no headroom needed)
   soc > 85%:                          reservationW = 200W   (regardless of time)
-  hour < 14:00:                       reservationW = 500W
-  hour ≥ 14:00 AND soc > 60%:         reservationW = 1000W
-  hour ≥ 14:00 AND soc ≤ 60%:         reservationW = 3000W
+  before 11:00:00:      soc ≤20% 3000W,  21-25% 1000W,  >25% 500W
+  11:00:00-13:00:00:    soc ≤40% 3000W,  41-55% 1000W,  >55% 500W
+  13:00:01-13:59:59:    soc ≤50% 3000W,  51-80% 1000W,  >80% 400W
+  14:00:00 onward:      soc ≤60% 3000W,  >60% 1000W
 
 available = pvExportW − gridImportW + battChargeW + heaterCurrentW − reservationW
 
 heaterCurrentW = heaterLevelPct10() × 3   (level-based, was heaterTargetPct × 30)
 rawPct         = clamp(available × 100 / 3000, 0, 100)
 ```
-**Updated**: added the `soc > 95% → 0W` tier (previously the top tier was `soc > 85% → 200W`, unconditionally). Since `reservationW` can now be 0, the formula above is applied unconditionally rather than switching to the old dead `else` branch this section previously described — that branch (`netGridW + min(0, battChargeW) + heaterCurrentW − 100`, along with the now-unused `netGridW`/`battW` locals) has been removed rather than resurrected.
+**Updated (Aug 2026)**: the single 14:00 cutoff (500W before / 1000-3000W after, by SOC) replaced with four time-of-day tiers, each with its own SOC breakpoints — the SOC threshold for the 3kW/1kW/500W split tightens as the day's solar window narrows, so the heater gives up more of its claimed export earlier in the afternoon rather than only at a single hard 14:00 line. `rtcMinute()`/`rtcSecond()` forward-declared alongside the existing `rtcHour()` to build the second-of-day comparison (`nowSec`).
+
+Previously added: the `soc > 95% → 0W` tier (previously the top tier was `soc > 85% → 200W`, unconditionally). Since `reservationW` can now be 0, the formula above is applied unconditionally rather than switching to the old dead `else` branch this section previously described — that branch (`netGridW + min(0, battChargeW) + heaterCurrentW − 100`, along with the now-unused `netGridW`/`battW` locals) has been removed rather than resurrected.
 
 Superseded values: reservation previously switched at noon (not 14:00), was 1kW before noon / 0W until SOC > 80% after noon (then 1kW) — see git history for the exact prior thresholds. The 200W-reservation SOC gate was originally 95%, lowered to 85% to release the heater's power cap sooner once the battery is nearly full (95% is now the threshold for the new 0W tier instead).
 
@@ -387,6 +390,10 @@ New `VAC_PUMP_START` state inserted between `VAC_IDLE` and `VAC_OPENING`:
 Previously the isolation valve opened first and the pump started only after the valve fully opened. Prewarm builds pressure before the valve exposes the vacuum circuit.
 
 `VAC_EXTRA_RUN_MS` increased from 300s (5 min) to 600s (10 min).
+
+### Overtime fault — isolation valve now closes
+
+`VAC_PUMPING` → `VAC_FAULT` (pump ran `VAC_PUMP_MAX_MS` without `vacSensorFull`) previously only turned the pump off, leaving `vacIsoValve` open on fault. Now also calls `vacIsoValve.request(false)` so the isolation valve closes along with the pump stopping — an overtime fault means something's wrong with the vacuum circuit, so it shouldn't stay exposed after the fault latches.
 
 ---
 
@@ -776,6 +783,10 @@ Raised on both controllers: `COMMS_FAULT_THRESHOLD` 240 → 480 (`controller_h`,
 
 New `checkHeaterImportTrip()`: if SOC > 15%, battery isn't discharging faster than 3.9A-equivalent, and grid import stays > 100W for 20s continuously while Growatt data is valid, the heater is force-stopped (`heaterRunning = false`, `heaterLevelIdx = 0`) and `FAULT_H_HEATER_IMPORT_TRIP` (new bit, `hFaultFlags` bit 13) is raised — catches the inverter/CB having tripped while panels are still producing, so the heater would otherwise keep calling for power the array can't actually deliver, silently pulling from the grid. Clears after import stays ≤0W for 20s. Unused `FAULT_H_HEATER_OVERHEAT_WARN` bit removed (superseded by the level-based overheat taper in `checkHeaterFaults()`; nothing set it anymore). `botTankOpen` (bottom-tank valve state) added to the H→W packet so W can see it — used by the new summer-solar heater-side idle check below.
 
+**Dawn-blip hold, widened + boot-arm fix (Aug 2026)**: Growatt pauses battery discharge and pulls a small fixed import (~210-220W) during its dawn PV/grid-sync startup every morning as soon as PV first registers after a night at zero — that reads as `importHigh` but isn't a real trip, so the check is held off for `DAWN_HOLD_MS` once a qualifying zero→nonzero PV transition is seen (qualifying = PV was zero for ≥20 min, `NIGHT_PV_ZERO_MS`). Two mornings tripped the fault through the original 7-minute hold (blip duration varies morning to morning), so `DAWN_HOLD_MS` is now 60 min.
+
+Also fixed while investigating: `pvZeroSinceMs` defaults to 0 at boot and is only updated on an *observed* nonzero→zero transition, so a reboot (watchdog reset, brownout — this system has had bus-voltage issues, see PSU relay work above) occurring less than 20 minutes before sunrise left the 20-min-of-night check unable to pass, so the dawn hold silently failed to arm for that one morning — the trip check then ran completely unprotected straight through the real Growatt blip. New `pvZeroTrackedOnce` flag: the very first zero→nonzero PV transition seen after any boot now always arms the hold, regardless of measured duration; every dawn after that uses the real event-driven duration as before (self-heals from the first full night/dawn cycle post-boot).
+
 ## Summer solar startup / end-of-day rework (W controller)
 
 - **Start trigger**: raised from `hot/cold ≥ 50°C` to `hot/cold ≥ 80°C`, OR either solar pipe above H's reported tank-mid temperature (worth circulating even if not yet "hot") — replaces the old PV-export-based trigger entirely.
@@ -783,6 +794,12 @@ New `checkHeaterImportTrip()`: if SOC > 15%, battery isn't discharging faster th
 - **Heater-side idle check**: the "don't run solar into a heater-cooling loop" skip now also requires `botTankOpen` (bottom-tank valve confirmed open), not just `twoPortHeaterSide` — avoids a false idle read while the valve is still moving.
 - **`pvActive` drop-out window**: extended 5 → 10 minutes below 200W before latching false (reduces cycling on brief cloud cover); comment updated to match.
 - **End-of-day abort**: replaced again — was a compound PV/temperature-equilibrium heuristic (both solar pipes below tank-mid, PV < 300W, hot~cold within 6°C, heater off, SOC < 95%, sustained 10 min); now a straight comparison against today's actual sunset time. See "W Controller — summer solar end-of-day: sunset-table cutoff" below.
+
+### Low-differential pump suppression (new)
+
+`hot − cold < 0.5°C` sustained for 5 continuous minutes means the pump is circulating with no useful solar gain (fully mixed loop), so `finalDuty` is forced to 0 — same force-0 style as the existing heater-side-idle check above, gated by the same target/80°C/tank-top caps so it releases the moment real gain (or a gate condition) returns.
+
+The sustained timer (`lowDeltaSinceMs`) resets immediately the instant the delta rises back above 0.5°C. A separate `lowDeltaWasForced` latch handles the case where the delta stays low but a gate trips (e.g. hot momentarily ≥ 80°C) mid-suppression: on the next gate-ok tick the timer is reset rather than left at its already-sustained value, so re-suppression always needs a fresh 5 minutes instead of re-firing the instant the gate clears — while the timer is otherwise left alone tick-to-tick during continuous suppression, so suppression doesn't self-interrupt every 5 minutes.
 
 ## Winch over-open fault — actually clears now
 
@@ -871,3 +888,27 @@ First pass used a 60s-trailing-window average (7°C/min threshold), which cleanl
 - `updateHotPipeRiseBuf()` (called once per `loop()`, alongside `readSensors()`) samples `hot_pipe` every 2s into a 6-slot circular buffer (~10–12s of history). Buffer resets on `H_SENSOR_HOT_PIPE` fault so a stale pre-fault reading never contaminates the calc after recovery.
 - `getHotPipeRise10sC()` returns the °C delta against the oldest buffered sample, or `NAN` until the buffer has filled (~12s after boot/fault recovery).
 - `calcHPumpDuty()` gains an early-out block with a local static hold latch (`hpHoldStartMs`/`hpHolding`): criteria true → hold timer resets to now; hold releases once 15s have elapsed since the criteria was last true. Evaluated right after the existing `hotPipeC >= 80.0f → 100%` override and before the normal/MAX-mode duty curves — doesn't touch the existing 90°C/91°C heaterOutC-based ramp-to-100% logic, this is a strictly earlier, additional trigger for the fast-surge case.
+
+## H Controller — heater-outlet imbalance pulse (`updateImbalancePulse`)
+
+A second, milder response to the same `htr_out`/`htr_out_2` disagreement that drives the stagnation flush above, but for the 65–80°C band below the flush's 80°C floor — the two never overlap. Intent: nudge a stalled/stratified pocket at one outlet sensor loose well before it reaches flush territory, without the flush's full 4s-on burst.
+
+**Condition:** heater running, both outlet sensors valid, and the two disagree by more than 10°C (`|htr_out − htr_out_2| > 10°C`). The higher of the two readings selects the pulse timing:
+- 65°C ≤ high reading < 70°C → 0.5s on / 20s off
+- 70°C ≤ high reading < 80°C → 0.5s on / 10s off
+- Outside 65–80°C, or disagreement ≤ 10°C → idle (no pulse)
+
+**State machine** (`ImbalPulseState`): `IMBAL_IDLE` → `IMBAL_ON` (pump forced 100%) → `IMBAL_OFF` → back to `IMBAL_ON` if the condition still holds, else `IMBAL_IDLE`. Resets to `IMBAL_IDLE` immediately if the heater stops or either sensor faults.
+
+Only `IMBAL_ON` is dispatched as an override (pump forced to 100%) — `IMBAL_OFF` is not special-cased, so it falls through to `calcHPumpDuty()` and the pump runs its normal computed duty for the 10s/20s gap between pulses, rather than sitting off. This is an *additional* short spike on top of whatever the pump is already doing, not a full on/off replacement of normal control. Evaluated in the main loop right after `updateFlush()`; in debug builds `IMBAL_ON` outranks `simHPumpSpdActive` but yields to `PT_COOLDOWN` and `FLUSH_ACTIVE`.
+
+The original stagnation flush (`FLUSH_ACTIVE`/`FLUSH_PAUSE`, above) already worked this way — only `FLUSH_ACTIVE` is dispatched as a 100% override; `FLUSH_PAUSE` was never special-cased and has always fallen through to `calcHPumpDuty()`, so the 4s gap between flush bursts already runs normal duty rather than forcing the pump off.
+
+## H Controller — `calcHPumpDuty()` below-target floor: 0.9 → 0.8, ramp band 7°C → 10°C
+
+Both branches' low-end floor (well below target, where duty was pinned at a flat `pred × 0.9`) dropped to `pred × 0.8`, with the ramp back up to full `pred` starting 10°C below target instead of 7°C:
+
+- **Normal mode** (`solarTargetMode == SOLAR_TANK_PLUS8`): floor applies below `effTarget − 10°C` (was `− 7°C`); ramps 0.8→1.0×`pred` from `effTarget − 10°C` to `effTarget`.
+- **MAX mode** (or tank-top fault, fixed 85°C target): floor applies below 75°C (was 78°C); ramps 0.8→1.0×`pred` from 75°C to 85°C.
+
+Same shape as before, just a slightly deeper underdrive further from target and a wider ramp band.

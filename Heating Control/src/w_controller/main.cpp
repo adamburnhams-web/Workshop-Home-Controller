@@ -1142,6 +1142,7 @@ void updateVacuum() {
             } else if (now - vacStateEnteredMs >= VAC_PUMP_MAX_MS) {
                 // Overtime fault
                 digitalWrite(PIN_VAC_PUMP, RELAY_OFF);
+                vacIsoValve.request(false); // close isolation valve
                 setFault(FAULT_W_VAC_PUMP_OVERTIME);
                 vacState = VAC_FAULT;
             }
@@ -1601,6 +1602,36 @@ void updateSummerSolar() {
             && (tankTopFault || (hot <= tankTopC && cold <= tankTopC))
             && !hotPipeFault && hotPipeC < tankTopC)
             finalDuty = 0;
+
+        // Low differential: hot/cold within 0.5°C for 5min continuous means the pump is
+        // circulating with no useful solar gain. Same force-0 style as above, gated by
+        // the same MAX/tank+ target caps so it backs off as soon as real gain resumes.
+        // Once suppression lifts for any reason (delta recovers, or a gate trips e.g.
+        // hot momentarily >=80C) the timer resets, so re-suppression always needs a
+        // fresh 5min rather than re-firing the instant the gate condition returns —
+        // but the timer is left alone tick-to-tick while continuously suppressed, so
+        // suppression itself doesn't self-interrupt every 5min.
+        static unsigned long lowDeltaSinceMs = 0;
+        static bool lowDeltaWasForced = false;
+        bool lowDeltaNow = !sFault[SENSOR_SOLAR_HOT] && !sFault[SENSOR_SOLAR_COLD]
+                            && (hot - cold) < 0.5f;
+        if (lowDeltaNow) {
+            if (lowDeltaSinceMs == 0) lowDeltaSinceMs = millis();
+        } else {
+            lowDeltaSinceMs = 0;
+        }
+        bool lowDeltaSustained = lowDeltaSinceMs != 0 && (millis() - lowDeltaSinceMs >= 300000UL);
+        bool lowDeltaGatesOk = hot < solarTarget && cold < solarTarget
+                                && hot < 80.0f && cold < 80.0f
+                                && (tankTopFault || (hot <= tankTopC && cold <= tankTopC));
+        if (lowDeltaSustained && lowDeltaGatesOk) {
+            finalDuty = 0;
+            lowDeltaWasForced = true;
+        } else {
+            if (lowDeltaWasForced) lowDeltaSinceMs = 0;
+            lowDeltaWasForced = false;
+        }
+
         setSolarPumpDuty(finalDuty);
     }
 
