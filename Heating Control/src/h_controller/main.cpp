@@ -277,13 +277,13 @@ bool heaterManualLockout = false; // set on 95°C overtemp — unlike heaterHard
 bool hotTankProtection = false;
 bool tankBotHeaterBlock = false;  // 80°C on / 79°C off hysteresis, see updateHeaterDuty()
 bool morningHeatActive = false;
-bool          importTripActive  = false;
-unsigned long importHighStartMs = 0;
-unsigned long importZeroStartMs = 0;
-bool          pvWasZero         = true;
-unsigned long pvZeroSinceMs     = 0;
-unsigned long dawnHoldUntilMs   = 0;
-bool          pvZeroTrackedOnce = false;  // see checkHeaterImportTrip() boot-arm note
+bool          importTripActive   = false;
+unsigned long importHighStartMs  = 0;
+unsigned long importZeroStartMs  = 0;
+uint8_t       dawnHoldDay        = 0;     // day-of-month the dawn hold last opened (0 = never)
+bool          dawnHoldActive     = false;
+unsigned long dawnPvHighStartMs  = 0;
+unsigned long dawnHoldEndMs      = 0;
 bool gridPresent                 = true;
 unsigned long lastGridLossMs     = 0;
 bool gridOutageFault             = false;
@@ -372,6 +372,8 @@ static uint16_t heaterLevelPct10() {
 uint8_t rtcHour();   // defined after RTC section
 uint8_t rtcMinute(); // defined after RTC section
 uint8_t rtcSecond(); // defined after RTC section
+extern bool     rtcValid; // defined after RTC section
+extern DateTime rtcNow;   // defined after RTC section
 
 #ifdef DEBUG_SERIAL
 uint8_t simHeaterVal = 0;
@@ -476,19 +478,16 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
         }
         int16_t battChgW   = lastWPkt.battChargeW;
         // SOC > 95%: battery full, no reservation at all.
-        // SOC 86-95%: battery essentially full, only 200W reservation regardless of time.
         // Otherwise, time-of-day tiers (SOC threshold tightens as the day's solar
         // window narrows, so heater takes more of the export later in the low-sun hours):
         //   before 11:00:00          SOC ≤20% 3kW, 21-25% 1kW, >25% 500W
         //   11:00:00 - 13:00:00      SOC ≤40% 3kW, 41-55% 1kW, >55% 500W
         //   13:00:01 - 13:59:59      SOC ≤50% 3kW, 51-80% 1kW, >80% 400W
-        //   14:00:00 onward          SOC ≤60% 3kW, >60% 1kW
+        //   14:00:00 onward          SOC <95% 3kW
         uint32_t nowSec = (uint32_t)rtcHour() * 3600UL + (uint32_t)rtcMinute() * 60UL + rtcSecond();
         int32_t reservationW;
         if (soc > 95) {
             reservationW = 0L;
-        } else if (soc > 85) {
-            reservationW = 200L;
         } else if (nowSec < 39600UL) {          // before 11:00:00
             reservationW = (soc <= 20) ? 3000L : (soc <= 25) ? 1000L : 500L;
         } else if (nowSec <= 46800UL) {         // 11:00:00 - 13:00:00
@@ -496,7 +495,7 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
         } else if (nowSec < 50400UL) {          // 13:00:01 - 13:59:59
             reservationW = (soc <= 50) ? 3000L : (soc <= 80) ? 1000L : 400L;
         } else {                                // 14:00:00 onward
-            reservationW = (soc > 60) ? 1000L : 3000L;
+            reservationW = 3000L;
         }
         int32_t available = (int32_t)pvExportW - gridImportW + (int32_t)battChgW + heaterCurrentW - reservationW;
         rawPct = (int16_t)constrain(available * 100L / 3000L, 0L, 100L);
@@ -580,42 +579,50 @@ void clearFaultH(uint32_t m) { hFaultFlags &= ~m; }
 bool hasFaultH(uint32_t m)   { return (hFaultFlags & m) != 0; }
 
 // ============================================================
-//  HEATER IMPORT TRIP  (inverter CB tripped while panels producing)
+//  RCBO TRIP  (inverter CB tripped while panels producing)
 // ============================================================
 
-// Growatt pauses battery discharge and pulls a small fixed import (~210-220W)
-// during its dawn PV/grid-sync startup, every morning as soon as PV first
-// registers after a night at zero. Observed duration varies morning to
-// morning (5-6 min typical, but two mornings in Aug 2026 tripped the fault
-// through the old 7 min hold) — held well clear of the worst case seen.
-static const unsigned long DAWN_HOLD_MS     = 3600000UL; // 60 min
-static const unsigned long NIGHT_PV_ZERO_MS = 1200000UL; // 20 min of zero PV = "night"
+// Growatt pulls a small parasitic import (~210-220W, battery discharge
+// paused) during its dawn grid-sync startup. That can begin fractionally
+// before the panels show any measurable output, so a hold keyed off "PV
+// went nonzero" can arm too late and let the blip trip the fault (seen
+// Sep 2026). Instead hold off unconditionally from 03:00 — well before any
+// possible daybreak — until 30 min after PV has sustained >=100W for a full
+// minute, by which point the inverter's startup dance is long over.
+static const uint32_t      DAWN_WINDOW_START_SEC = 3UL * 3600UL; // 03:00:00
+static const int16_t       DAWN_PV_THRESHOLD_W   = 100;
+static const unsigned long DAWN_PV_SUSTAIN_MS    = 60000UL;      // 1 min
+static const unsigned long DAWN_END_HOLD_MS      = 1800000UL;    // 30 min
 
 void checkHeaterImportTrip(int16_t gridImportW, uint8_t soc, int16_t battChargeW, bool growattValid,
                             int16_t pv1W, int16_t pv2W) {
-    if (!growattValid) return;
     unsigned long now = millis();
 
-    bool pvZero = (pv1W <= 0 && pv2W <= 0);
-    if (pvZero) {
-        if (!pvWasZero) { pvZeroSinceMs = now; pvZeroTrackedOnce = true; }
-        pvWasZero = true;
-    } else {
-        // pvZeroSinceMs defaults to 0 at boot, so until a real nonzero->zero
-        // transition has actually been captured (pvZeroTrackedOnce), the
-        // elapsed-time check can't be trusted — a reboot less than 20 min
-        // before dawn would otherwise fail to arm the hold and leave the
-        // Growatt blip unprotected. Arm unconditionally on the first-ever
-        // transition after boot instead; later dawns use the real duration.
-        if (pvWasZero && (!pvZeroTrackedOnce || (now - pvZeroSinceMs >= NIGHT_PV_ZERO_MS))) {
-            dawnHoldUntilMs = now + DAWN_HOLD_MS;
+    if (rtcValid) {
+        uint8_t  today  = rtcNow.day();
+        uint32_t nowSec = (uint32_t)rtcHour() * 3600UL + (uint32_t)rtcMinute() * 60UL + rtcSecond();
+        if (nowSec >= DAWN_WINDOW_START_SEC && dawnHoldDay != today) {
+            dawnHoldDay       = today;
+            dawnHoldActive    = true;
+            dawnPvHighStartMs = 0;
+            dawnHoldEndMs     = 0;
         }
-        pvWasZero = false;
     }
-    if (dawnHoldUntilMs) {
-        if (now < dawnHoldUntilMs) return;
-        dawnHoldUntilMs = 0;
+
+    if (dawnHoldActive) {
+        if (growattValid && (int32_t)pv1W + pv2W >= DAWN_PV_THRESHOLD_W) {
+            if (!dawnPvHighStartMs) dawnPvHighStartMs = now;
+            if (!dawnHoldEndMs && now - dawnPvHighStartMs >= DAWN_PV_SUSTAIN_MS) {
+                dawnHoldEndMs = now + DAWN_END_HOLD_MS;
+            }
+        } else {
+            dawnPvHighStartMs = 0;
+        }
+        if (dawnHoldEndMs && now >= dawnHoldEndMs) dawnHoldActive = false;
+        if (dawnHoldActive) return;
     }
+
+    if (!growattValid) return;
 
     int32_t battDischargeW = battChargeW < 0 ? (int32_t)(-battChargeW) : 0L;
     bool    importHigh = soc > 15 && battDischargeW < 3900L && gridImportW > 100;
@@ -1826,7 +1833,7 @@ const char* faultNameH(uint32_t mask) {
     if (mask & FAULT_H_RS485_COMMS)           return "H RS485 Err";
     if (mask & FAULT_H_BUS_VOLTAGE_LOW)       return "15V Bus Low";
     if (mask & FAULT_H_GRID_OUTAGE)           return "Grid Outage";
-    if (mask & FAULT_H_HEATER_IMPORT_TRIP)   return "Htr Import Trp";
+    if (mask & FAULT_H_HEATER_IMPORT_TRIP)   return "RCBO Trip";
     return "H Sensr Flt";
 }
 
@@ -2618,8 +2625,10 @@ static float calcHPumpDuty() {
             duty = dutyAt90 + t * (100.0f - dutyAt90);
         } else if (heaterOutC >= target) {
             duty = pred + (heaterOutC - target) * 0.2f;
-        } else if (heaterOutC >= target - 10.0f) {
-            float t = (heaterOutC - (target - 10.0f)) / 10.0f;
+        } else if (heaterOutC >= target - 5.0f) {
+            duty = pred;
+        } else if (heaterOutC >= target - 55.0f) {
+            float t = (heaterOutC - (target - 55.0f)) / 50.0f;
             duty = pred * 0.8f + t * (pred * 0.2f);
         } else {
             duty = pred * 0.8f;
@@ -2634,8 +2643,10 @@ static float calcHPumpDuty() {
         } else if (heaterOutC >= 85.0f) {
             float t = (heaterOutC - 85.0f) / 5.0f;
             duty = pred + t * (upper - pred);
-        } else if (heaterOutC >= 75.0f) {
-            float t = (heaterOutC - 75.0f) / 10.0f;
+        } else if (heaterOutC >= 80.0f) {
+            duty = pred;
+        } else if (heaterOutC >= 30.0f) {
+            float t = (heaterOutC - 30.0f) / 50.0f;
             duty = pred * 0.8f + t * (pred * 0.2f);
         } else {
             duty = pred * 0.8f;
@@ -2959,7 +2970,7 @@ static void dbgFaults() {
     HF(FAULT_H_RS485_COMMS,          "RS485_COMMS")
     HF(FAULT_H_BUS_VOLTAGE_LOW,      "BUS_VOLTAGE_LOW")
     HF(FAULT_H_GRID_OUTAGE,          "GRID_OUTAGE")
-    HF(FAULT_H_HEATER_IMPORT_TRIP,   "HEATER_IMPORT_TRIP")
+    HF(FAULT_H_HEATER_IMPORT_TRIP,   "RCBO_TRIP")
     HF(FAULT_H_SENSOR_TANK_BOT,      "SENSOR_TANK_BOT")
     HF(FAULT_H_SENSOR_TANK_MID,      "SENSOR_TANK_MID")
     HF(FAULT_H_SENSOR_TANK_TOP,      "SENSOR_TANK_TOP")
@@ -2999,8 +3010,12 @@ static void dbgHeater() {
     Serial.print(F("  duty:      ")); Serial.print(heaterLevelPct());   Serial.println(F("%"));
     Serial.print(F("  power_est: ")); Serial.print(heaterLevelPct10() * 3); Serial.println(F("W"));
     Serial.print(F("  lockout:   ")); Serial.println(heaterHardLockout ? F("YES")  : F("no"));
-    Serial.print(F("  imp_trip:  ")); Serial.println(importTripActive  ? F("YES")  : F("no"));
-    if (dawnHoldUntilMs) { Serial.print(F("  dawn_hold: ")); Serial.print((dawnHoldUntilMs - millis()) / 1000UL); Serial.println(F("s left")); }
+    Serial.print(F("  rcbo_trip: ")); Serial.println(importTripActive  ? F("YES")  : F("no"));
+    if (dawnHoldActive) {
+        Serial.print(F("  dawn_hold: active"));
+        if (dawnHoldEndMs) { Serial.print(F(", ")); Serial.print((dawnHoldEndMs - millis()) / 1000UL); Serial.print(F("s left")); }
+        Serial.println();
+    }
     Serial.print(F("  grid:      ")); Serial.println(gridPresent       ? F("ok")   : F("OUTAGE"));
     Serial.print(F("  zc_count:  ")); Serial.println(zcFireCount);
     Serial.print(F("  zc_age_ms: ")); Serial.println((micros() - lastZCMicros) / 1000UL);

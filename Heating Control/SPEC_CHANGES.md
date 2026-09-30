@@ -141,11 +141,10 @@ ILI9488 driver, SPI pins, and display dimensions configured via `build_flags` in
 ```
 SOC reservation:
   soc > 95%:                          reservationW = 0W     (battery full, no headroom needed)
-  soc > 85%:                          reservationW = 200W   (regardless of time)
   before 11:00:00:      soc ≤20% 3000W,  21-25% 1000W,  >25% 500W
   11:00:00-13:00:00:    soc ≤40% 3000W,  41-55% 1000W,  >55% 500W
   13:00:01-13:59:59:    soc ≤50% 3000W,  51-80% 1000W,  >80% 400W
-  14:00:00 onward:      soc ≤60% 3000W,  >60% 1000W
+  14:00:00 onward:      soc <95% 3000W
 
 available = pvExportW − gridImportW + battChargeW + heaterCurrentW − reservationW
 
@@ -155,6 +154,8 @@ rawPct         = clamp(available × 100 / 3000, 0, 100)
 **Updated (Aug 2026)**: the single 14:00 cutoff (500W before / 1000-3000W after, by SOC) replaced with four time-of-day tiers, each with its own SOC breakpoints — the SOC threshold for the 3kW/1kW/500W split tightens as the day's solar window narrows, so the heater gives up more of its claimed export earlier in the afternoon rather than only at a single hard 14:00 line. `rtcMinute()`/`rtcSecond()` forward-declared alongside the existing `rtcHour()` to build the second-of-day comparison (`nowSec`).
 
 Previously added: the `soc > 95% → 0W` tier (previously the top tier was `soc > 85% → 200W`, unconditionally). Since `reservationW` can now be 0, the formula above is applied unconditionally rather than switching to the old dead `else` branch this section previously described — that branch (`netGridW + min(0, battChargeW) + heaterCurrentW − 100`, along with the now-unused `netGridW`/`battW` locals) has been removed rather than resurrected.
+
+**Updated again:** the flat `soc > 85% → 200W` tier removed entirely — SOC 86–95% now falls through to the same time-of-day tiers as everything else ≤95%. The 14:00-onward tier simplified from `soc ≤60% 3kW, >60% 1kW` to a flat `soc <95% 3kW` (the `soc > 95%` case above already gives 0W, so this tier now covers the whole remaining range with the strictest reservation, holding back more export/battery headroom from the heater through the low-sun end of the day).
 
 Superseded values: reservation previously switched at noon (not 14:00), was 1kW before noon / 0W until SOC > 80% after noon (then 1kW) — see git history for the exact prior thresholds. The 200W-reservation SOC gate was originally 95%, lowered to 85% to release the heater's power cap sooner once the battery is nearly full (95% is now the threshold for the new 0W tier instead).
 
@@ -912,3 +913,26 @@ Both branches' low-end floor (well below target, where duty was pinned at a flat
 - **MAX mode** (or tank-top fault, fixed 85°C target): floor applies below 75°C (was 78°C); ramps 0.8→1.0×`pred` from 75°C to 85°C.
 
 Same shape as before, just a slightly deeper underdrive further from target and a wider ramp band.
+
+**Updated again:** ramp band widened to 50°C and ends 5°C short of target, with a flat full-`pred` plateau in the last 5°C:
+
+| Heater outlet | Duty |
+|---|---|
+| < target − 55°C | `pred × 0.8` |
+| target − 55°C → target − 5°C | linear 0.8→1.0×`pred` |
+| target − 5°C → target | `pred` |
+| ≥ target | unchanged (normal: `pred + 0.2%/°C`; MAX: `pred`→`upper` over 85–90°C) |
+
+- **Normal mode:** target = `effTarget` (`min(tank_top + 8, 87)`).
+- **MAX mode:** target = 85°C → floor below 30°C, ramp 30–80°C, `pred` 80–85°C.
+
+## H Controller — RCBO trip (formerly "heater import trip") dawn-hold redesign
+
+Renamed `FAULT_H_HEATER_IMPORT_TRIP`'s display strings from "Htr Import Trp"/"HEATER_IMPORT_TRIP" to "RCBO Trip"/"RCBO_TRIP" (macro name unchanged). The underlying fault detection (grid import > 100W for 20s with SOC > 15% and battery not discharging → force-stop heater) is unchanged.
+
+The dawn-hold guard around it was rebuilt after a fault still tripped at first light on 2026-09-02 despite the existing 60 min hold (added Aug 30, keyed off PV output going nonzero). Root cause: the Growatt's dawn grid-sync parasitic import (the thing the hold exists to mask) can begin fractionally *before* the panels show any measurable wattage, not strictly after — so on the morning it tripped, the 20s import-high timer had already armed and fired before `pv1W + pv2W` ever went nonzero, i.e. before the PV-triggered hold had any reason to arm.
+
+**New rule**, no longer tied to a PV zero→nonzero transition at all: hold unconditionally from 03:00:00 (RTC, well before any possible daybreak) until 30 min after PV has sustained ≥100W for a full minute. Implementation (`checkHeaterImportTrip()`):
+- Opens once per calendar day the first time `rtcValid` and time-of-day ≥ 03:00:00 is observed, tracked via `dawnHoldDay` (day-of-month) so it can't re-open mid-day. Not gated on `growattValid` — that gate only matters for the actual trip-check below, and gating the window open on it too would reproduce the same before-vs-after race with Growatt comms coming up.
+- While active, watches for `growattValid && pv1W + pv2W >= 100` sustained 60s (`dawnPvHighStartMs`); once seen, arms a 30 min closing deadline (`dawnHoldEndMs`). A momentary dip below 100W before the 60s is up resets the sustain timer, same debounce spirit as the fault detection it's guarding.
+- `!rtcValid` (RTC not yet synced, e.g. just after boot) skips opening the window at all — matches the existing pattern elsewhere in the file (e.g. `checkAutoBST()`) of doing nothing time-based until the clock is known good, rather than guessing.
