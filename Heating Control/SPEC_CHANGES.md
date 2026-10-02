@@ -936,3 +936,21 @@ The dawn-hold guard around it was rebuilt after a fault still tripped at first l
 - Opens once per calendar day the first time `rtcValid` and time-of-day ≥ 03:00:00 is observed, tracked via `dawnHoldDay` (day-of-month) so it can't re-open mid-day. Not gated on `growattValid` — that gate only matters for the actual trip-check below, and gating the window open on it too would reproduce the same before-vs-after race with Growatt comms coming up.
 - While active, watches for `growattValid && pv1W + pv2W >= 100` sustained 60s (`dawnPvHighStartMs`); once seen, arms a 30 min closing deadline (`dawnHoldEndMs`). A momentary dip below 100W before the 60s is up resets the sustain timer, same debounce spirit as the fault detection it's guarding.
 - `!rtcValid` (RTC not yet synced, e.g. just after boot) skips opening the window at all — matches the existing pattern elsewhere in the file (e.g. `checkAutoBST()`) of doing nothing time-based until the clock is known good, rather than guessing.
+
+## H Controller — display page 6: battery SOC / low-battery / wash message
+
+**Status bar:** `P<n>/5` page indicator removed. Pages now cycle 1–6 (`NUM_PAGES`); serial `page <1-6>`.
+
+**Page 6 content** (`drawPage6()`), all centred horizontally in the 20–300px content area:
+- **SOC:** large `NN%` (~120px ink height) — green normally, red below 25%, grey `--` when Growatt data invalid. Digits are TFT_eSPI font 8 (`LOAD_FONT8` added to `controller_h` build flags) rendered at 12/7 scale by a custom `drawRleScaled()` — TFT_eSPI silently caps `setTextSize` at 7 and only scales by whole numbers. Font 8 has no `%`, so the sign is drawn with anti-aliased `drawSmoothArc`/`drawWideLine`.
+- **Battery Low:** below the SOC when SOC < 25%, red FreeSansBold24pt scaled (`drawGfxScaled()`) so its ink spans 460px. Vertical free space split 1:2:2 (top:middle:bottom) so the SOC sits high.
+- **Wash message:** 06:00–09:00 with SOC > 25%, page 6 shows "You can put the / wash on love :)" instead of the SOC — green FreeSans24pt (regular), two lines, widest line 410px, 18px line gap, block centred vertically.
+- Redraws on SOC / low / wash state change, and unconditionally every 60s.
+
+**Low-SOC behaviour** (`updateSocLow()`, called every loop before the display sleep check):
+- `socLow` latches when SOC < 25% and jumps the display to page 6 (once). It re-arms only when SOC rises **above** 25% — paging away is not overridden until SOC recovers and drops again; the 25/26 gap also stops flip-flopping at the boundary.
+- While `socLow` and RTC time is 05:30–23:00, the backlight is held on (no 1h sleep; wakes if asleep). If the display sleeps outside that window with `socLow` set, it resets to page 6 instead of page 1, so it comes back on page 6 at 05:30.
+
+**Wash-message behaviour:** while the 06:00–09:00 / SOC > 25% condition holds, the backlight is held on, and on the condition first becoming true the display jumps to page 6 once (same edge-triggered rule — paging away isn't overridden). Clears at 09:00, if SOC falls to 25% or below, or if Growatt data goes invalid.
+
+Flash for `controller_h` rose ~42% → ~58% (font 8 + FreeSansBold24pt + FreeSans24pt).

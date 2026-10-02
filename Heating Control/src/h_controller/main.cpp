@@ -1710,6 +1710,11 @@ void faultLogUpdate(uint32_t curW, uint32_t curH) {
 // ============================================================
 
 uint8_t      currentPage      = 1;
+#define      NUM_PAGES          6
+#define      SOC_LOW_PCT        25
+bool         socLow           = false;  // latched below SOC_LOW_PCT; re-arms only once SOC rises above it
+bool         page6Dirty       = true;
+bool         washMsg          = false;  // 06:00–09:00 with SOC above SOC_LOW_PCT: page 6 shows the wash message
 enum NavMode { NAV_PAGE, NAV_ITEM, NAV_OPTION };
 NavMode      navMode          = NAV_PAGE;
 uint8_t      selectedItem     = 0;
@@ -1799,9 +1804,6 @@ void drawStatusBar() {
 
     tft.setCursor(272, 2);
     tft.print(solarTargetMode == SOLAR_TANK_PLUS8 ? "TK+ " : "MAX ");
-
-    tft.setCursor(328, 2);
-    tft.print("P"); tft.print(currentPage); tft.print("/5");
 
     tft.setCursor(380, 2);
     char buf[9];
@@ -2387,6 +2389,197 @@ void drawPage5() {
     if (lastWPkt.winchReedFlags & WREED_SAFETY_LIMIT)  { tft.setTextColor(C_RED,   C_BLACK); tft.print(" OVER!"); }
 }
 
+// ── Page 6: battery SOC ───────────────────────────────────
+
+// TFT_eSPI only scales RLE fonts by whole numbers (max 7), so this renders at num/den
+// by mapping each source row/run onto the scaled grid with fillRect.
+static void drawRleScaled(const char* s, int16_t x, int16_t y, uint8_t font,
+                          uint16_t num, uint16_t den, uint16_t col) {
+    const uint8_t*              wt = (const uint8_t*)pgm_read_ptr(&fontdata[font].widthtbl);
+    const uint8_t* const*       ct = (const uint8_t* const*)pgm_read_ptr(&fontdata[font].chartbl);
+    uint8_t                     h  = pgm_read_byte(&fontdata[font].height);
+    uint16_t sx = 0;
+    for (; *s; s++) {
+        uint8_t idx = (uint8_t)(*s - 32);
+        uint8_t w   = pgm_read_byte(wt + idx);
+        const uint8_t* p = (const uint8_t*)pgm_read_ptr(&ct[idx]);
+        uint16_t pos = 0, total = (uint16_t)w * h;
+        while (pos < total) {
+            uint8_t  b = pgm_read_byte(p++);
+            uint16_t n = (b & 0x7F) + 1;
+            if (b & 0x80) {
+                uint16_t q = pos, left = n;
+                while (left) {
+                    uint8_t  row = q / w, c = q % w;
+                    uint16_t len = min(left, (uint16_t)(w - c));
+                    int16_t x0 = x + (int32_t)(sx + c) * num / den, x1 = x + (int32_t)(sx + c + len) * num / den;
+                    int16_t y0 = y + (int32_t)row * num / den,      y1 = y + (int32_t)(row + 1) * num / den;
+                    if (x1 > x0 && y1 > y0) tft.fillRect(x0, y0, x1 - x0, y1 - y0, col);
+                    q += len; left -= len;
+                }
+            }
+            pos += n;
+        }
+        sx += w;
+        pollRS485();
+    }
+}
+
+// Same idea for GFX free fonts; (x, y) maps to source (0, -ascent) so all source coords stay non-negative
+static void drawGfxScaled(const GFXfont* fp, const char* s, int16_t x, int16_t y, int8_t ascent,
+                          uint16_t num, uint16_t den, uint16_t col) {
+    GFXfont f; memcpy_P(&f, fp, sizeof(f));
+    int16_t sx = 0;
+    for (; *s; s++) {
+        GFXglyph g; memcpy_P(&g, &f.glyph[(uint8_t)*s - f.first], sizeof(g));
+        const uint8_t* bm = f.bitmap + g.bitmapOffset;
+        uint16_t bit = 0;
+        for (uint8_t r = 0; r < g.height; r++) {
+            int16_t y0 = y + (int32_t)(g.yOffset + r + ascent) * num / den;
+            int16_t y1 = y + (int32_t)(g.yOffset + r + 1 + ascent) * num / den;
+            int16_t runStart = -1;
+            for (uint8_t c = 0; c <= g.width; c++, bit++) {
+                bool on = c < g.width && (pgm_read_byte(bm + (bit >> 3)) & (0x80 >> (bit & 7)));
+                if (on && runStart < 0) runStart = c;
+                if (!on && runStart >= 0) {
+                    int16_t x0 = x + (int32_t)(sx + g.xOffset + runStart) * num / den;
+                    int16_t x1 = x + (int32_t)(sx + g.xOffset + c)        * num / den;
+                    if (x1 > x0 && y1 > y0) tft.fillRect(x0, y0, x1 - x0, y1 - y0, col);
+                    runStart = -1;
+                }
+            }
+            bit--;  // the c == width sentinel step isn't a real bitmap bit
+        }
+        sx += g.xAdvance;
+        pollRS485();
+    }
+}
+
+static void gfxInkBounds(const GFXfont* fp, const char* s, int16_t& l, int16_t& r, int16_t& t, int16_t& b) {
+    GFXfont f; memcpy_P(&f, fp, sizeof(f));
+    int16_t sx = 0;
+    l = t = INT16_MAX; r = b = INT16_MIN;
+    for (; *s; s++) {
+        GFXglyph g; memcpy_P(&g, &f.glyph[(uint8_t)*s - f.first], sizeof(g));
+        if (g.width) {
+            l = min(l, (int16_t)(sx + g.xOffset)); r = max(r, (int16_t)(sx + g.xOffset + g.width));
+            t = min(t, (int16_t)g.yOffset);        b = max(b, (int16_t)(g.yOffset + g.height));
+        }
+        sx += g.xAdvance;
+    }
+}
+
+static void drawWashMsg() {
+    const char* lines[2] = { "You can put the", "wash on love :)" };
+    const int16_t TARGET_W = 410, LINE_GAP = 18;
+    int16_t l[2], r[2], t[2], b[2];
+    for (uint8_t i = 0; i < 2; i++) gfxInkBounds(&FreeSans24pt7b, lines[i], l[i], r[i], t[i], b[i]);
+    int16_t top = min(t[0], t[1]), bot = max(b[0], b[1]);
+    uint16_t den = max(r[0] - l[0], r[1] - l[1]);
+    int16_t lineH = (int32_t)(bot - top) * TARGET_W / den;
+    int16_t y = 20 + (280 - 2 * lineH - LINE_GAP) / 2;
+    for (uint8_t i = 0; i < 2; i++) {
+        int16_t w = (int32_t)(r[i] - l[i]) * TARGET_W / den;
+        drawGfxScaled(&FreeSans24pt7b, lines[i], (480 - w) / 2 - (int32_t)l[i] * TARGET_W / den, y,
+                      -top, TARGET_W, den, C_GREEN);
+        pollRS485(); updateHPump();
+        y += lineH + LINE_GAP;
+    }
+}
+
+void drawPage6() {
+    static int16_t prevSoc = -1;
+    static bool    prevLow = false, prevWash = false;
+    static unsigned long lastDrawMs = 0;
+    bool    gv  = hasWPkt && lastWPkt.growattValid;
+    int16_t soc = gv ? lastWPkt.battSocPct : -2;
+    bool    low = gv && soc < SOC_LOW_PCT;
+    if (!page6Dirty && soc == prevSoc && low == prevLow && washMsg == prevWash && millis() - lastDrawMs < 60000UL) return;
+    page6Dirty = false; prevSoc = soc; prevLow = low; prevWash = washMsg; lastDrawMs = millis();
+
+    const int16_t AREA_Y = 20, AREA_H = 280;
+    if (washMsg) {
+        tft.fillRect(0, AREA_Y, 480, AREA_H, C_BLACK);
+        pollRS485(); updateHPump();
+        drawWashMsg();
+        return;
+    }
+    // Font 8 digits: 55px advance, ink rows 4..73; '1' has wider side bearings than other digits.
+    // Font 8 has no '%', so the sign is drawn with AA primitives sized to match the digit ink.
+    const uint16_t SOC_NUM = 12, SOC_DEN = 7;
+    const int16_t  INK_H   = 70 * SOC_NUM / SOC_DEN;
+    const int16_t  PCT_GAP = 14, PCT_W = 86, PCT_R = 24, PCT_IR = 12, PCT_STROKE = 12;
+    // "Battery Low" in FreeSansBold24pt: ink x 4..270, y -33..12 from baseline; scaled so the ink spans
+    // 460px — close to the digit scale, so both lines look equally smooth
+    const char*    msg     = "Battery Low";
+    const uint16_t LOW_NUM = 460, LOW_DEN = 266;
+    const int8_t   LOW_ASC = 33;
+    const int16_t  LOW_H   = 45 * LOW_NUM / LOW_DEN;
+    uint16_t col = low ? C_RED : (gv ? C_GREEN : C_DKGRAY);
+
+    // Free space split 1:2:2 (top:middle:bottom) so the SOC sits higher than an even split
+    int16_t freeH = AREA_H - INK_H - (low ? LOW_H : 0);
+    int16_t unit  = freeH / (low ? 5 : 3);
+    int16_t inkY  = AREA_Y + unit;
+
+    tft.fillRect(0, AREA_Y, 480, AREA_H, C_BLACK);
+    pollRS485(); updateHPump();
+
+    if (gv) {
+        char buf[4];
+        snprintf(buf, sizeof(buf), "%u", (uint8_t)soc);
+        int16_t n  = (int16_t)strlen(buf);
+        int16_t lb = (buf[0]     == '1' ? 10 : 4);
+        int16_t rb = (buf[n - 1] == '1' ? 20 : 7);
+        int16_t digInkW = (n * 55 - lb - rb) * SOC_NUM / SOC_DEN;
+        int16_t x0 = (480 - (digInkW + PCT_GAP + PCT_W)) / 2;
+        drawRleScaled(buf, x0 - lb * SOC_NUM / SOC_DEN, inkY - 4 * SOC_NUM / SOC_DEN, 8, SOC_NUM, SOC_DEN, col);
+        pollRS485(); updateHPump();
+
+        int16_t px = x0 + digInkW + PCT_GAP;
+        tft.drawSmoothArc(px + PCT_R,         inkY + PCT_R,         PCT_R, PCT_IR, 0, 360, col, C_BLACK);
+        tft.drawSmoothArc(px + PCT_W - PCT_R, inkY + INK_H - PCT_R, PCT_R, PCT_IR, 0, 360, col, C_BLACK);
+        pollRS485(); updateHPump();
+        tft.drawWideLine(px + PCT_W - 12, inkY + 2, px + 12, inkY + INK_H - 2, PCT_STROKE, col, C_BLACK);
+    } else {
+        drawRleScaled("--", (480 - 58 * SOC_NUM / SOC_DEN) / 2, inkY - 4 * SOC_NUM / SOC_DEN, 8, SOC_NUM, SOC_DEN, col);
+    }
+    pollRS485(); updateHPump();
+
+    if (low) {
+        drawGfxScaled(&FreeSansBold24pt7b, msg, (480 - 460) / 2 - 4 * LOW_NUM / LOW_DEN, inkY + INK_H + 2 * unit,
+                      LOW_ASC, LOW_NUM, LOW_DEN, C_RED);
+        pollRS485(); updateHPump();
+    }
+}
+
+static bool inSocLowBacklightWindow() {
+    if (!rtcValid) return false;
+    uint16_t m = (uint16_t)rtcHour() * 60 + rtcMinute();
+    return m >= 5 * 60 + 30 && m < 23 * 60;
+}
+
+// Edge-triggered so the user can page away without being dragged back until SOC recovers and drops again
+void updateSocLow() {
+    if (!hasWPkt || !lastWPkt.growattValid) { washMsg = false; return; }
+    uint8_t soc = lastWPkt.battSocPct;
+    if (!socLow && soc < SOC_LOW_PCT) {
+        socLow = true;
+        currentPage = 6; navMode = NAV_PAGE; needFullRedraw = true;
+        if (inSocLowBacklightWindow()) wakeDisplay();
+    } else if (socLow && soc > SOC_LOW_PCT) {
+        socLow = false;
+    }
+
+    uint16_t m = rtcValid ? (uint16_t)rtcHour() * 60 + rtcMinute() : 0;
+    bool wash = rtcValid && m >= 6 * 60 && m < 9 * 60 && soc > SOC_LOW_PCT;
+    if (wash && !washMsg) {
+        currentPage = 6; navMode = NAV_PAGE; needFullRedraw = true;
+        wakeDisplay();
+    }
+    washMsg = wash;
+}
+
 // ── Full page dispatch ────────────────────────────────────
 
 void drawFullPage() {
@@ -2400,6 +2593,7 @@ void drawFullPage() {
         case 3: drawPage3(); break;
         case 4: drawPage4(); break;
         case 5: drawPage5(); break;
+        case 6: page6Dirty = true; drawPage6(); break;
     }
     updateHPump();
     drawFaultBar(lastWPkt.wFaultFlags, hFaultFlags);
@@ -2435,8 +2629,8 @@ void handleButtons() {
 
     switch (navMode) {
         case NAV_PAGE:
-            if (upCnt) { currentPage = (uint8_t)(((int)currentPage - 1 + 5 - upCnt % 5) % 5 + 1); needFullRedraw = true; }
-            if (dnCnt) { currentPage = (uint8_t)(((int)currentPage - 1 + dnCnt)          % 5 + 1); needFullRedraw = true; }
+            if (upCnt) { currentPage = (uint8_t)(((int)currentPage - 1 + NUM_PAGES - upCnt % NUM_PAGES) % NUM_PAGES + 1); needFullRedraw = true; }
+            if (dnCnt) { currentPage = (uint8_t)(((int)currentPage - 1 + dnCnt)                        % NUM_PAGES + 1); needFullRedraw = true; }
             if (selP && (currentPage == 4 || currentPage == 5)) { navMode = NAV_ITEM; selectedItem = 0; needPageRedraw = true; }
             break;
 
@@ -3410,7 +3604,7 @@ static void handleDebugCommand(char* buf) {
     else if (!strcmp_P(cmd, PSTR("rtc")))      dbgRTC();
     else if (!strcmp_P(cmd, PSTR("page")))     {
         uint8_t pg = (uint8_t)atoi(arg1);
-        if (pg >= 1 && pg <= 5) { currentPage = pg; needFullRedraw = true; wakeDisplay(); Serial.println(F("ok")); }
+        if (pg >= 1 && pg <= NUM_PAGES) { currentPage = pg; needFullRedraw = true; wakeDisplay(); Serial.println(F("ok")); }
         else Serial.println(F("usage: page <1-5>"));
     }
     else if (!strcmp_P(cmd, PSTR("scan")))     dbgScan();
@@ -3759,17 +3953,20 @@ void loop() {
     }
 
     // Display refresh
+    updateSocLow();
+    bool socHoldOn = (socLow && inSocLowBacklightWindow()) || washMsg;
     if (!displayOn) {
         // Wake only on NEW faults that appeared after the display went to sleep
         uint32_t curFaults = hFaultFlags | (hasWPkt ? lastWPkt.wFaultFlags : 0);
         if (curFaults & ~faultFlagsAtSleep) wakeDisplay();
+        else if (socHoldOn)                 wakeDisplay();
     } else {
         unsigned long msSinceBtn = millis() - lastButtonMs;
-        if (msSinceBtn >= BACKLIGHT_SLEEP_MS) {
+        if (msSinceBtn >= BACKLIGHT_SLEEP_MS && !socHoldOn) {
             displayOn      = false;
             setBacklight(0);
             faultFlagsAtSleep = hFaultFlags | (hasWPkt ? lastWPkt.wFaultFlags : 0);
-            currentPage    = 1;
+            currentPage    = socLow ? 6 : 1;
             navMode        = NAV_PAGE;
             needFullRedraw = true;
         }
@@ -3799,6 +3996,7 @@ void loop() {
                 case 3: /* fault history: redraw on fault change only */ break;
                 case 4: drawPage4(); break;
                 case 5: drawPage5(); break;
+                case 6: drawPage6(); break;
             }
             updateHPump();
             if (manualOverrideActive || manualHeaterMode != MHM_OFF) {

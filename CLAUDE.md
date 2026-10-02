@@ -51,7 +51,7 @@ Both controllers have `#define DEBUG_SERIAL` at the top. Remove to strip all deb
 `monitor_filters = log2file` is active on `controller_h` — serial output is automatically saved to a file under `.pio/` during `pio device monitor` sessions.
 
 ### H controller commands
-`temps` `valves` `faults` `mode` `status` `heater` `bus` `rtc` `page <1-5>` `scan` `set <sensor> <val>`
+`temps` `valves` `faults` `mode` `status` `heater` `bus` `rtc` `page <1-6>` `scan` `set <sensor> <val>`
 `cal_pump` — start H-pump calibration sequence (requires `HEATER_ENABLED = true`)
 `cal_abort` — abort calibration, restore normal control
 `pump_test` — sweep heater through 28 power levels and log pump/temp data
