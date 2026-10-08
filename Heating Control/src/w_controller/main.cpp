@@ -1491,7 +1491,7 @@ void updateSummerSolar() {
     // our solar cold valve already open, which would otherwise deadlock (neither
     // side ever makes the first move).
     bool tankTopFault = (lastH.tempTankTop == TEMP_FAULT);
-    float tankTopC    = tankTopFault ? 60.0f : (float)lastH.tempTankTop / 10.0f;
+    float tankTopC    = tankTopFault ? 85.0f : (float)lastH.tempTankTop / 10.0f;
     bool hotPipeFault = (lastH.tempHotPipe == TEMP_FAULT);
     float hotPipeC    = hotPipeFault ? 0.0f : (float)lastH.tempHotPipe / 10.0f;
     SolarTargetMode tgtMode = hasHPacket ? (SolarTargetMode)lastH.solarTargetMode : SOLAR_TANK_PLUS8;
@@ -1543,8 +1543,8 @@ void updateSummerSolar() {
         summerSeqDone = true;
     }
 
-    // Determine pump target: solar hot vs target (tank+13 or MAX 87 from H data)
-    float solarTarget  = (tgtMode == SOLAR_MAX) ? 87.0f : min(tankTopC + 13.0f, 87.0f);
+    // Determine pump target: solar hot vs target (tank top or MAX 85 from H data)
+    float solarTarget  = (tgtMode == SOLAR_MAX) ? 85.0f : tankTopC;
 
     // Cal override: H sets calPumpActive=1 and drives solarTarget remotely.
     // calSolarTargetC==0 during PRE_RAMP: stop pump so heater can heat up unimpeded.

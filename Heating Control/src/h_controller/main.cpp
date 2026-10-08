@@ -261,6 +261,7 @@ static const HeaterLevel kHeaterLevels[HEATER_LEVEL_COUNT] PROGMEM = {
 volatile unsigned long lastZCMicros  = 0;
 volatile uint8_t  heaterLevelIdx  = 0;    // 0=off, 1–16=active level index
 volatile uint8_t  heaterLevelCap  = HEATER_LEVEL_COUNT;   // ISR-level cap (0–16; 16=no cap)
+volatile bool     solarSurgeHold  = false;  // heater gated off + H pump 100% — see updateSolarSurgeHold()
 volatile uint8_t  heaterPhaseHc   = 0;    // half-cycle count within current phase
 volatile bool     heaterPhaseOn   = true; // true=ON phase, false=OFF phase
 volatile uint32_t zcFireCount     = 0;
@@ -326,7 +327,7 @@ void zeroCrossISR() {
         && (lastWPkt.valveStates & VSTATE_SOLAR_COLD_OPEN)
         && ((logBurnerCold.isOpen && logBurnerCold.phase == HBP_IDLE) ||
             (botTankValve.isOpen  && botTankValve.phase  == HBP_IDLE))
-        && !heaterHardLockout) {
+        && !heaterHardLockout && !solarSurgeHold) {
         uint8_t on_hc  = pgm_read_byte(&kHeaterLevels[lvl - 1].on_hc);
         uint8_t off_hc = pgm_read_byte(&kHeaterLevels[lvl - 1].off_hc);
         if (heaterPhaseOn) {
@@ -361,6 +362,15 @@ static uint8_t pctToLevel(uint8_t pct) {
 static uint8_t heaterLevelPct() {
     if (heaterLevelIdx == 0) return 0;
     return (uint8_t)((pgm_read_word(&kHeaterLevels[heaterLevelIdx - 1].pct10) + 5) / 10);
+}
+
+// Level the ISR actually fires: heaterLevelIdx is only the request, the 90–92°C
+// outlet cap and hard lockout are applied on top of it.
+static uint8_t heaterFiredPct() {
+    if (!heaterRunning || heaterHardLockout || solarSurgeHold) return 0;
+    uint8_t lvl = min(heaterLevelIdx, heaterLevelCap);
+    if (lvl == 0) return 0;
+    return (uint8_t)((pgm_read_word(&kHeaterLevels[lvl - 1].pct10) + 5) / 10);
 }
 
 // Duty × 10 of current level (e.g. 143 = 14.3%), or 0 if off.
@@ -446,10 +456,12 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
     bool     growattOk     = lastWPkt.growattValid;
     int32_t  heaterCurrentW = (int32_t)heaterLevelPct10() * 3;
     int16_t  rawPct;
+    int32_t  availableW;
 
     static bool          lastHighSoc    = false;
     static unsigned long surplusStartMs = 0;
     static uint8_t       zeroCount      = 0;
+    static uint8_t       startCount     = 0;
     static uint8_t        rawPctBuf[12] = {0}; // rolling window of last (up to) 12 samples
     static uint8_t        rawPctBufIdx  = 0;
     static uint8_t        rawPctBufCount = 0;
@@ -466,8 +478,8 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
         // non-heater draw, then subtract from budget.
         int16_t battChgW       = lastWPkt.battChargeW;
         int32_t battDischargeW = battChgW < 0 ? (int32_t)(-battChgW) : 0L;
-        int32_t available      = 4000L - ((int32_t)gridImportW + battDischargeW - heaterCurrentW);
-        rawPct = (int16_t)constrain(available * 100L / 3000L, 0L, 100L);
+        availableW = 4000L - ((int32_t)gridImportW + battDischargeW - heaterCurrentW);
+        rawPct = (int16_t)constrain(availableW * 100L / 3000L, 0L, 100L);
     } else if (manualMode == MHM_SOC_LIM) {
         // SOC mode but below threshold — heater off
         heaterRunning = false; heaterLevelIdx = 0; return;
@@ -497,9 +509,14 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
         } else {                                // 14:00:00 onward
             reservationW = 3000L;
         }
-        int32_t available = (int32_t)pvExportW - gridImportW + (int32_t)battChgW + heaterCurrentW - reservationW;
-        rawPct = (int16_t)constrain(available * 100L / 3000L, 0L, 100L);
+        availableW = (int32_t)pvExportW - gridImportW + (int32_t)battChgW + heaterCurrentW - reservationW;
+        rawPct = (int16_t)constrain(availableW * 100L / 3000L, 0L, 100L);
     }
+
+    // Below 90% SOC with the W solar pump idle, a marginal surplus is better left
+    // charging the battery: demand 1500W to start, then hold on down to 300W so
+    // the heater doesn't chatter around the start point.
+    bool lowSocIdle = !highSoc && soc < 90 && lastWPkt.solarPumpDutyPct < 6;
 
     if (highSoc != lastHighSoc) {
         heaterRunning = false; heaterLevelIdx = 0;
@@ -511,8 +528,13 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
     if (!heaterRunning) {
         zeroCount = 0;
         rawPctBufIdx = 0; rawPctBufCount = 0; rawPctSum = 0;
-        if (rawPct == 0) return;
-        if (!highSoc) {
+        if (rawPct == 0) { startCount = 0; return; }
+        if (lowSocIdle) {
+            surplusStartMs = 0;
+            if (availableW < 1500L) { startCount = 0; return; }
+            if (++startCount < 5) return;
+        } else if (!highSoc) {
+            startCount = 0;
             // 500W threshold when solar is off; 150W (5%) when solar is already running
             uint8_t startThreshPct = lastWPkt.solarPumpActive ? 5 : 17;
             if (rawPct < startThreshPct) { surplusStartMs = 0; return; }
@@ -521,6 +543,7 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
         }
         heaterRunning  = true;
         surplusStartMs = 0;
+        startCount     = 0;
     }
 
     // Heater wants to run: call for the flow-path valves to move into position.
@@ -529,7 +552,7 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
     botTankValve.request(true);
     twoPortValve.request(true);
 
-    if (rawPct == 0) {
+    if (rawPct == 0 || (lowSocIdle && availableW < 300L)) {
         if (++zeroCount >= 5) {
             heaterRunning = false; heaterLevelIdx = 0;
             zeroCount = 0;
@@ -625,7 +648,8 @@ void checkHeaterImportTrip(int16_t gridImportW, uint8_t soc, int16_t battChargeW
     if (!growattValid) return;
 
     int32_t battDischargeW = battChargeW < 0 ? (int32_t)(-battChargeW) : 0L;
-    bool    importHigh = soc > 15 && battDischargeW < 3900L && gridImportW > 100;
+    int32_t pvTotalW   = (int32_t)pv1W + pv2W;
+    bool    importHigh = soc > 15 && battDischargeW < 3900L && pvTotalW + battDischargeW < 6000L && gridImportW > 100;
 
     if (!importTripActive) {
         if (importHigh) {
@@ -911,6 +935,48 @@ static float getHotPipeRise10sC() {
     return sTemp[H_SENSOR_HOT_PIPE] - hpRiseBuf[hpRiseBufIdx];
 }
 
+// Solar-surge pre-emptive cut: W's solar hot >80°C within the last 6 min, then hot_pipe
+// rising >=1°C/10s with the hottest heater outlet >85°C. In the SD log this preceded 5 of 6
+// overheat trips by 25–50s while the heater was still firing at 30–100% — the then 91–93°C cap
+// only engaged in the last 5–15s, too late to stop the residual-heat overshoot past 94°C.
+// Hold is rolling: releases 60s after the criteria was last true.
+void updateSolarSurgeHold() {
+    static unsigned long solarHotSeenMs = 0;
+    static bool          solarHotSeen   = false;
+    static unsigned long holdStartMs    = 0;
+    unsigned long now = millis();
+
+    if (hasWPkt && lastWPkt.tempSolarHot != TEMP_FAULT && lastWPkt.tempSolarHot > 800) {
+        solarHotSeenMs = now;
+        solarHotSeen   = true;
+    }
+    bool solarRecent = solarHotSeen && now - solarHotSeenMs <= 360000UL;
+
+    bool crit = false;
+    if (solarRecent) {
+        float hOut = getHeaterOutC();
+        float rise = getHotPipeRise10sC();
+        crit = !isnan(hOut) && hOut > 85.0f && !isnan(rise) && rise >= 1.0f;
+    }
+
+    if (crit) {
+#ifdef DEBUG_SERIAL
+        if (!solarSurgeHold) {
+            Serial.print(F("SURGE HOLD: htr_out="));  Serial.print(getHeaterOutC(), 1);
+            Serial.print(F(" hp_rise10s="));          Serial.print(getHotPipeRise10sC(), 2);
+            Serial.print(F(" solar_hot="));           Serial.println(lastWPkt.tempSolarHot / 10.0f, 1);
+        }
+#endif
+        holdStartMs    = now;
+        solarSurgeHold = true;
+    } else if (solarSurgeHold && now - holdStartMs >= 60000UL) {
+        solarSurgeHold = false;
+#ifdef DEBUG_SERIAL
+        Serial.println(F("SURGE HOLD: released"));
+#endif
+    }
+}
+
 // ============================================================
 //  HEATER FAULT CHECKS  (called from main loop)
 // ============================================================
@@ -929,6 +995,22 @@ void checkHeaterFaults() {
     if (f2) { if (!htrOut2FaultMs) htrOut2FaultMs = millis(); }
     else    { htrOut2FaultMs = 0; clearFaultH(FAULT_H_SENSOR_HEATER_OUT_2); }
     if (!(f1 && f2)) htrBothFaultMs = 0;
+
+    // 95°C latch must be checked every call, not only in the >=94°C branch below: the 94°C
+    // trip zeroes heaterLevelIdx, so that branch is skipped by the !heaterRunning early
+    // return while the outlet keeps climbing on residual heat (log: 96-98°C after trips).
+    if (!heaterManualLockout) {
+        float hOutNow = getHeaterOutC();
+        if (!isnan(hOutNow) && hOutNow >= 95.0f) {
+            heaterManualLockout = true;
+            heaterHardLockout   = true;
+            heaterLevelCap      = 0;
+            heaterLevelIdx      = 0;
+            PORTA &= ~(1 << PA5);
+            setFaultH(FAULT_H_HEATER_OVERHEAT_SHUT);
+            setFaultH(FAULT_H_HEATER_MANUAL_LOCKOUT);
+        }
+    }
 
     // Hard lockout clears when effective temp < 88°C and at least one sensor is live.
     // heaterManualLockout (95°C latch) is excluded — that one only clears via page 4 "Alrt Reset".
@@ -994,20 +1076,13 @@ void checkHeaterFaults() {
         heaterHardLockout = true;
         PORTA &= ~(1 << PA5);
         setFaultH(FAULT_H_HEATER_OVERHEAT_SHUT);
-        // 95°C: latch off until a manual "Alrt Reset" on page 4 — doesn't auto-clear at
-        // 88°C like the plain 94°C hard lockout above. Once latched it stays latched even
-        // as hOut falls back out of this >=94°C branch (see the guarded auto-clear above).
-        if (hOut >= 95.0f && !heaterManualLockout) {
-            heaterManualLockout = true;
-            setFaultH(FAULT_H_HEATER_MANUAL_LOCKOUT);
-        }
-    } else if (hOut > 91.0f) {
+    } else if (hOut > 90.0f) {
         if (!ovhtValvesRequested) {
             twoPortValve.request(true);
             botTankValve.request(true);
             ovhtValvesRequested = true;
         }
-        float t   = fminf(1.0f, (hOut - 91.0f) / 2.0f);  // 0 at 91°C, 1 at 93°C
+        float t   = fminf(1.0f, (hOut - 90.0f) / 2.0f);  // 0 at 90°C, 1 at 92°C
         float cap = (float)heaterLevelPct() * (1.0f - t);
         heaterLevelCap = (cap < 1.0f) ? 0 : pctToLevel((uint8_t)roundf(cap));
     } else {
@@ -1581,7 +1656,7 @@ void logDataRow() {
     }
     // State
     logFile.print(lastWPkt.solarPumpDutyPct); logFile.print(',');
-    logFile.print(heaterRunning ? heaterLevelPct() : 0); logFile.print(',');
+    logFile.print(heaterFiredPct()); logFile.print(',');
     logFile.print(lastWPkt.pvExportW); logFile.print(',');
     logFile.print(lastWPkt.gridImportW); logFile.print(',');
     logFile.print(busVoltageV, 2); logFile.print(',');
@@ -1711,10 +1786,22 @@ void faultLogUpdate(uint32_t curW, uint32_t curH) {
 
 uint8_t      currentPage      = 1;
 #define      NUM_PAGES          6
-#define      SOC_LOW_PCT        25
-bool         socLow           = false;  // latched below SOC_LOW_PCT; re-arms only once SOC rises above it
+bool         socLow           = false;  // latched below socLowThreshold(); re-arms only once SOC reaches it
 bool         page6Dirty       = true;
-bool         washMsg          = false;  // 06:00–09:00 with SOC above SOC_LOW_PCT: page 6 shows the wash message
+bool         washMsg          = false;  // 06:30–09:30 with SOC at/above the wash threshold: page 6 shows the wash message
+
+static bool inWashWindow() {
+    if (!rtcValid) return false;
+    uint16_t m = (uint16_t)rtcHour() * 60 + rtcMinute();
+    return m >= 6 * 60 + 30 && m < 9 * 60 + 30;
+}
+
+// 0 outside the wash window so page 6 shows the bare SOC; Mon/Sat run the washing machine harder so need more reserve
+static uint8_t socLowThreshold() {
+    if (!inWashWindow()) return 0;
+    uint8_t dow = rtcNow.dayOfTheWeek();
+    return (dow == 1 || dow == 6) ? 20 : 15;
+}
 enum NavMode { NAV_PAGE, NAV_ITEM, NAV_OPTION };
 NavMode      navMode          = NAV_PAGE;
 uint8_t      selectedItem     = 0;
@@ -2493,7 +2580,7 @@ void drawPage6() {
     static unsigned long lastDrawMs = 0;
     bool    gv  = hasWPkt && lastWPkt.growattValid;
     int16_t soc = gv ? lastWPkt.battSocPct : -2;
-    bool    low = gv && soc < SOC_LOW_PCT;
+    bool    low = gv && soc < socLowThreshold();
     if (!page6Dirty && soc == prevSoc && low == prevLow && washMsg == prevWash && millis() - lastDrawMs < 60000UL) return;
     page6Dirty = false; prevSoc = soc; prevLow = low; prevWash = washMsg; lastDrawMs = millis();
 
@@ -2563,16 +2650,16 @@ static bool inSocLowBacklightWindow() {
 void updateSocLow() {
     if (!hasWPkt || !lastWPkt.growattValid) { washMsg = false; return; }
     uint8_t soc = lastWPkt.battSocPct;
-    if (!socLow && soc < SOC_LOW_PCT) {
+    uint8_t thr = socLowThreshold();
+    if (!socLow && soc < thr) {
         socLow = true;
         currentPage = 6; navMode = NAV_PAGE; needFullRedraw = true;
         if (inSocLowBacklightWindow()) wakeDisplay();
-    } else if (socLow && soc > SOC_LOW_PCT) {
+    } else if (socLow && soc >= thr) {
         socLow = false;
     }
 
-    uint16_t m = rtcValid ? (uint16_t)rtcHour() * 60 + rtcMinute() : 0;
-    bool wash = rtcValid && m >= 6 * 60 && m < 9 * 60 && soc > SOC_LOW_PCT;
+    bool wash = inWashWindow() && soc >= thr;
     if (wash && !washMsg) {
         currentPage = 6; navMode = NAV_PAGE; needFullRedraw = true;
         wakeDisplay();
@@ -2746,6 +2833,7 @@ static float calcPred(uint8_t heaterPct, float hotPipeC) {
 
 static float calcHPumpDuty() {
     if (heaterHardLockout)                                               return 100.0f;
+    if (solarSurgeHold)                                                  return 100.0f;
     if (!heaterRunning || heaterLevelIdx == 0)                           return 0.0f;
     if ((sFault[H_SENSOR_HEATER_OUT] && sFault[H_SENSOR_HEATER_OUT_2])
         || sFault[H_SENSOR_HOT_PIPE])                                    return 0.0f;
@@ -2798,27 +2886,24 @@ static float calcHPumpDuty() {
 
     bool  normalMode = solarTargetMode == SOLAR_TANK_PLUS8 && !sFault[H_SENSOR_TANK_TOP]
                                                             && sTemp[H_SENSOR_TANK_TOP] <= 75.0f;
-    float effTarget  = normalMode ? fminf(sTemp[H_SENSOR_TANK_TOP] + 8.0f, 87.0f) : 85.0f;
+    float effTarget  = normalMode ? sTemp[H_SENSOR_TANK_TOP] : 85.0f;
     float pred = calcPred(heaterLevelPct(), hotPipeC + fmaxf(0.0f, 85.0f - effTarget));
     float duty;
 
-    // Upper pump ceiling at 90°C — scales with hot pipe because that's where the
+    // Upper pump ceiling at 89°C — scales with hot pipe because that's where the
     // pred formula under-predicts most. 1.3x at cold pipe, up to ~1.54x at 60°C.
     float upperMult = 1.3f + 0.008f * fmaxf(0.0f, hotPipeC - 30.0f);
     float upper     = fminf(pred * upperMult, 100.0f);
 
     if (normalMode) {
-        // Normal mode: target tracks tank top + 8°C, capped at 87°C.
-        // Above target: ramp pred→upper over target→90°C, then spike to 100% at 91°C.
+        // Normal mode: target tracks tank top.
+        // Above target: linear ramp from pred at target to 100% at 89°C.
         float target    = effTarget;
-        float dutyAt90  = upper;
-        if (heaterOutC >= 91.0f) {
+        if (heaterOutC >= 89.0f) {
             duty = 100.0f;
-        } else if (heaterOutC >= 90.0f) {
-            float t = heaterOutC - 90.0f;
-            duty = dutyAt90 + t * (100.0f - dutyAt90);
         } else if (heaterOutC >= target) {
-            duty = pred + (heaterOutC - target) * 0.2f;
+            float t = (heaterOutC - target) / (89.0f - target);
+            duty = pred + t * (100.0f - pred);
         } else if (heaterOutC >= target - 5.0f) {
             duty = pred;
         } else if (heaterOutC >= target - 55.0f) {
@@ -2829,13 +2914,13 @@ static float calcHPumpDuty() {
         }
     } else {
         // MAX mode (or tank top fault): fixed 85°C target with pred→upper ramp.
-        if (heaterOutC >= 91.0f) {
+        if (heaterOutC >= 90.0f) {
             duty = 100.0f;
-        } else if (heaterOutC >= 90.0f) {
-            float t = heaterOutC - 90.0f;
+        } else if (heaterOutC >= 89.0f) {
+            float t = heaterOutC - 89.0f;
             duty = upper + t * (100.0f - upper);
         } else if (heaterOutC >= 85.0f) {
-            float t = (heaterOutC - 85.0f) / 5.0f;
+            float t = (heaterOutC - 85.0f) / 4.0f;
             duty = pred + t * (upper - pred);
         } else if (heaterOutC >= 80.0f) {
             duty = pred;
@@ -2964,7 +3049,7 @@ void sendHToWPacket(bool timeSyncReq) {
     { float effT = getHeaterOutC(); pkt.tempHeaterOut = isnan(effT) ? TEMP_FAULT : (int16_t)(effT * 10.0f); }
 
     pkt.heaterPowerPct    = (heaterRunning && heaterLevelIdx > 0) ? max(heaterLevelPct(), (uint8_t)1) : 0;
-    pkt.heaterRestricted  = (heaterLevelCap < HEATER_LEVEL_COUNT) ? 1 : 0;
+    pkt.heaterRestricted  = (heaterLevelCap < HEATER_LEVEL_COUNT || solarSurgeHold) ? 1 : 0;
     pkt.heaterWantsPower  = heaterRunning ? 1 : 0;
     pkt.twoPortHeaterSide = twoPortValve.isOpen ? 1 : 0;
     pkt.botTankOpen       = botTankValve.isOpen ? 1 : 0;
@@ -3194,6 +3279,7 @@ static void dbgMode() {
     Serial.print(heaterLevelPct()); Serial.println(F("%"));
     Serial.print(F("  htr_lockout:  ")); Serial.println(heaterHardLockout  ? F("YES")    : F("no"));
     Serial.print(F("  htr_manual_lockout (95C, needs Alrt Reset): ")); Serial.println(heaterManualLockout ? F("YES") : F("no"));
+    Serial.print(F("  solar_surge_hold: ")); Serial.println(solarSurgeHold ? F("YES") : F("no"));
     Serial.print(F("  rs485:        ")); Serial.println(rs485Fault         ? F("FAULT")  : F("ok"));
     Serial.print(F("  rtc_valid:    ")); Serial.println(rtcValid            ? F("yes")    : F("no"));
     Serial.print(F("  sd:           ")); Serial.println(sdAvailable         ? F("ok")     : F("no"));
@@ -3832,6 +3918,7 @@ void loop() {
     twoPortValve.update();
 
     // Heater fault checks
+    updateSolarSurgeHold();
     checkHeaterFaults();
 
     // H-side solar pump direct drive

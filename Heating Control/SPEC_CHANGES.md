@@ -954,3 +954,50 @@ The dawn-hold guard around it was rebuilt after a fault still tripped at first l
 **Wash-message behaviour:** while the 06:00–09:00 / SOC > 25% condition holds, the backlight is held on, and on the condition first becoming true the display jumps to page 6 once (same edge-triggered rule — paging away isn't overridden). Clears at 09:00, if SOC falls to 25% or below, or if Growatt data goes invalid.
 
 Flash for `controller_h` rose ~42% → ~58% (font 8 + FreeSansBold24pt + FreeSans24pt).
+
+## H Controller — solar-surge heater hold (`updateSolarSurgeHold`)
+
+Analysis of the six `HEATER_OVERHEAT_SHUT` trips (24 Aug – 6 Oct 2026, `F:/LOG.CSV`): in 5 of 6, W solar hot had peaked above 80°C in the preceding ~6 min, then hot_pipe started climbing ≥1°C/10s with the heater outlet past 85°C. From that point the heater kept firing at its requested 30–100% for 15–30s; the 91–93°C outlet cap only cut it in the last 5–15s, and residual heat carried the outlet through 94°C (peaks to 98.3°C). The H pump was already at 100% in every case, so pump response alone had no headroom left.
+
+**Rule:** W `tempSolarHot` > 80.0°C at any point in the last 6 min AND hot_pipe rise ≥ 1.0°C over the trailing 10s (`getHotPipeRise10sC()`) AND hottest heater outlet (`getHeaterOutC()`) > 85°C → `solarSurgeHold`:
+- Heater gated off in the zero-cross ISR (`!solarSurgeHold`), independent of `heaterLevelIdx`/`heaterLevelCap` so duty control keeps its own state and resumes normally afterwards.
+- `calcHPumpDuty()` returns 100%.
+- Rolling 60s hold: re-extends every loop the criteria is still true, releases 60s after it was last seen.
+- Logged `htr_pct` (`heaterFiredPct()`) reads 0 during the hold; `pkt.heaterRestricted` is set; `status` shows `solar_surge_hold`; DEBUG_SERIAL prints `SURGE HOLD:` on engage/release.
+
+Replayed against the log (5–6s row resolution): fires before 5 of 6 trips (not 1 Oct — solar hot peaked at 78.5°C) and in ~11 non-trip episodes over ~6 weeks, mostly 09:30–12:00 morning surges. Existing 86°C fast-rise pump override, 91–93°C cap, 94°C trip and 95°C latch are unchanged.
+
+## H Controller — heater-outlet power cap moved 91–93°C → 90–92°C
+
+`checkHeaterFaults()` proportional cap now starts at 90°C and reaches 0 at 92°C (`cap = requested × (1 − (hOut − 90)/2)`), 1°C earlier than before, giving a 2°C margin to the 94°C trip instead of 1°C. In all six logged overheat trips the outlet was rising 1–1.5°C per 5s row through the old band, so the cap only engaged in the last 5–15s. The overheat valve request (two-port + bottom tank) still fires at > 91°C; the request latch now resets at ≤ 90°C rather than ≤ 91°C.
+
+## H Controller — pump 100% spike and overheat valves moved 91°C → 90°C
+
+Follows the 90–92°C power cap change so the three outlet responses line up:
+- `calcHPumpDuty()` (normal and MAX mode): pump reaches 100% at heater outlet ≥ 90°C (was 91°C), with the 1°C linear ramp from `upper` to 100% now over 89–90°C (was 90–91°C). MAX mode's pred→upper ramp now spans 85–89°C (was 85–90°C). Calibration-mode (`calHtrOverride`) curves and the `cal_pump` 91°C cooling threshold are unchanged.
+- `checkHeaterFaults()`: two-port + bottom-tank overheat valve request fires at > 90°C (was > 91°C), on entering the same branch as the power cap; request latch resets at ≤ 90°C.
+
+## H Controller — heater 1500W start / 300W stop when SOC < 90% and W pump idle
+
+`updateHeaterDuty()` normal auto mode (not FORCE_ON, not SOC_LIM), in both Tank+ and Max solar target modes: while SOC < 90% and W `solarPumpDutyPct` < 6%, the heater needs more surplus to start and stops earlier, so a marginal surplus goes to the battery instead.
+
+- **Start:** with the heater off, power available for the heater (after the SOC/time-of-day reservation) must be ≥ 1500W for 5 consecutive packets (~1.25s) before it starts; any packet below 1500W resets the count. When the condition is not met the existing 5%/17% threshold and 5s sustain apply instead.
+- **Stop:** once running, it carries on until available power is < 300W for 5 consecutive packets (same counter as the existing zero-surplus stop). Outside the condition the stop remains at 0W.
+- The condition is evaluated every packet, so if SOC reaches 90% or the W pump reaches 6% while the heater is running, the 300W stop no longer applies.
+
+## W Controller — solar pump target lowered in both modes
+
+`solarTarget` (solar hot, fed to `calcPumpDuty()` and the pump speed overrides):
+- **Tank+:** tank top + 0°C, no cap (was tank top + 13°C capped at 87°C). Pump is at 50% when solar hot equals tank top and 100% at tank top + 2°C.
+- **Max:** 85°C (was 87°C).
+
+Start thresholds (Tank+ `min(tankTop, 80)`, Max 80°C) and the H pump targets are unchanged. Tank-top sensor fault now substitutes 85°C (was 60°C), so a faulted sensor makes Tank+ behave as Max: 80°C start, 85°C target.
+
+## H Controller — Tank+ H pump target lowered to tank top, new above-target ramp
+
+`calcHPumpDuty()` normal (Tank+) mode, tank top ≤ 75°C and sensor healthy:
+- **Target:** heater outlet target is tank top + 0°C (was tank top + 8°C capped at 87°C). `pred` is evaluated for that target (`calcPred()` with hot pipe shifted by 85 − target, i.e. `k / (tankTop − hotPipe)^alpha`, temperature difference floored at 5°C), so it is higher than before for the same heater % and hot pipe.
+- **Above target:** linear ramp from `pred` at tank top to 100% at 89°C (was +0.2% per °C, step to the `upper` ceiling at 89°C, 100% at 90°C).
+- **Below target:** unchanged shape relative to the target — `pred` within 5°C below, tapering to 0.8 × `pred` at 55°C below.
+
+MAX mode (and the Tank+ fallback when tank top > 75°C or faulted) is unchanged.
