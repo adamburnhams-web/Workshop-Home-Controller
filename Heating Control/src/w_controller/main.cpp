@@ -115,7 +115,7 @@ static const float SOLAR_PUMP_MAX_CURRENT_A = 1.00f;
 // PC fan minimum duty before stall. Calibrate on-site.
 static const uint8_t FAN_MIN_DUTY_PCT = 20; // TODO: calibrate
 
-// UFH/solar cold valve 30-second power-up wait (conservative; verify during commissioning)
+// UFH/solar cold valve 30-second power-up wait (deliberately conservative; final)
 static const uint16_t VALVE_POWERUP_WAIT_MS = 30000;
 
 
@@ -124,7 +124,9 @@ static const uint16_t VALVE_POWERUP_WAIT_MS = 30000;
 // ============================================================
 
 #define TEMP_SCALE          10    // temps stored as int16 = °C × 10
-#define SOLAR_HOT_MIN_C    180    // 18.0°C — winter solar trigger
+#define SOLAR_HOT_MIN_C    210    // 21.0°C — winter solar trigger (hot or cold side)
+#define WINTER_STOP_HOLD_MS 1800000UL // 30 min — end-of-day stop and cold+2 cutoff ignored after winter solar starts
+#define WINTER_FULL_SPEED_C 260       // 26.0°C — winter pump 100% at/above this hot-side temp
 #define SOLAR_DIFF_STOP_C   20    // 2.0°C — stop when hot-cold < this
 #define WINTER_UFH_TARGET_C 200   // 20.0°C — winter solar hot-side target
 #define FROST_THRESH_C       20   // 2.0°C — frost protection trigger
@@ -152,6 +154,7 @@ static const uint16_t VALVE_POWERUP_WAIT_MS = 30000;
 #define FAN_FLAP_OPEN_MS   30000UL   // motorized damper travel time; calibrate on-site
 #define TIME_SYNC_INTERVAL_MS 3600000UL // 1 hour
 #define EEPROM_FAN_BASE_ADDR 0       // EEPROM address for fan base speed
+#define EEPROM_LOCK_STATE_ADDR 1     // 0 = unlocked; anything else (incl. blank 0xFF) = locked
 
 // ============================================================
 //  GLOBAL OBJECTS
@@ -433,6 +436,13 @@ bool          vacFullThisSession = false;
 // ============================================================
 
 bool         workshopLocked      = true;
+
+// Persisted so a reboot (flash, power cut, WDT) restores the last state rather than
+// forcing a lock or an unlock.
+void setWorkshopLocked(bool locked) {
+    workshopLocked = locked;
+    EEPROM.update(EEPROM_LOCK_STATE_ADDR, locked ? 1 : 0);
+}
 unsigned long relockTimerStartMs  = 0;
 bool          relockTimerActive   = false;
 bool          alarmActive         = false;
@@ -502,6 +512,8 @@ bool solarActiveEver  = false; // for vacuum system "heating active" check
 bool solarDumpUFHOn   = false; // UFH pump running for emergency solar dump; sent to H
 bool frostProtActive = false;
 bool frostProtUFHOpen = false;
+unsigned long winterSolarStartMs = 0;
+bool winterUFHBoost  = false; // winter: UFH pump on while solar hot > 38°C, off below 37°C
 
 // ============================================================
 //  MID-POINT LED
@@ -522,6 +534,7 @@ bool       rs485CommsFault     = false;
 unsigned long lastRxMs         = 0;
 unsigned long lastTxMs         = 0;
 
+uint8_t    solarPumpReason     = SPR_NOT_STARTED;
 uint16_t   rs485RxGood         = 0;  // total valid H packets received
 uint16_t   rs485RxMiss         = 0;  // total timeout misses
 uint16_t   rs485RxBadFrame     = 0;  // decoded frames with wrong dir/len
@@ -924,7 +937,6 @@ void updateSolarPump() {
 }
 
 // Pump duty % given solar hot-side temperature vs target.
-// TEMPORARY calibration curve — replace with data-derived curve after cal_pump run
 static uint8_t calcPumpDuty(float hot, float targetC) {
     if (hot >= targetC + 2.0f) return 100;
     if (hot >= targetC) {
@@ -1209,6 +1221,7 @@ void updateWinterSolar(float tankBottomC) {
         solarColdValve.setOpen();
         resetSolarPumpOverrides();
         setSolarPumpDuty(100);
+        solarPumpReason = SPR_SENSOR_DUMP;
         setFault(FAULT_W_SOLAR_PUMP); // covered by sensor fault logic
         solarPumpActive = false;
         return;
@@ -1220,6 +1233,7 @@ void updateWinterSolar(float tankBottomC) {
     // Frost protection takes priority
     bool frostNeeded = (hot < 2.0f || cold < 2.0f);
     if (frostNeeded) {
+        solarPumpReason = SPR_FROST;
         if (!frostProtActive) {
             frostProtActive   = true;
             frostFaultStartMs = millis();
@@ -1243,18 +1257,25 @@ void updateWinterSolar(float tankBottomC) {
         clearFault(FAULT_W_FROST_NOT_RECOVERING);
     }
 
-    // Solar trigger: hot >= 18°C
-    bool triggerMet = (hot >= 18.0f);
+    // Either side can be the one in the sun while the loop is stagnant (cold often reads
+    // hotter before the pump runs), so trigger on whichever is warmer.
+    float trigC     = (float)SOLAR_HOT_MIN_C / 10.0f;
+    bool triggerMet = (hot >= trigC || cold >= trigC);
     bool pvLow      = !growatt.valid || (growatt.pv1W + growatt.pv2W) < 350;
+    // hot-cold is meaningless until the loop has mixed; without the hold a cold-side
+    // trigger starts and stops the pump in the same call.
+    bool startHold  = solarPumpActive && millis() - winterSolarStartMs < WINTER_STOP_HOLD_MS;
 
     if (!triggerMet) {
-        if (solarPumpActive) {
+        if (!solarPumpActive) solarPumpReason = SPR_WINTER_IDLE;
+        if (solarPumpActive && !startHold) {
             // Stop on end-of-day: low diff + low PV
             if ((hot - cold) <= 2.0f && pvLow) {
                 solarColdValve.setClose();
                 resetSolarPumpOverrides();
                 setSolarPumpDuty(0);
                 solarPumpActive = false;
+                solarPumpReason = SPR_WINTER_IDLE;
             }
         }
         return;
@@ -1266,32 +1287,47 @@ void updateWinterSolar(float tankBottomC) {
         setSolarPumpDuty(0); // starts at clocking minimum in updateSolarPump
         solarPumpActive  = true;
         solarActiveEver  = true;
+        winterSolarStartMs = millis();
+        startHold        = true;
     }
 
-    // Speed ramp: hot side targets 20°C
+    // Speed ramp floor tracks workshop air: below air+2 the loop would only cool the slab.
+    // On an air sensor fault, hold the last good reading rather than guess.
+    static float lastWAir = 10.0f; // until first good read: floor 12°C, the old curve's 4% point
+    if (!sFault[SENSOR_WORKSHOP_AIR] && !isnan(sTemp[SENSOR_WORKSHOP_AIR])) lastWAir = sTemp[SENSOR_WORKSHOP_AIR];
+    float   lowC      = lastWAir + 2.0f;
+    float   fullC     = (float)WINTER_FULL_SPEED_C / 10.0f;
+    uint8_t duty;
+    if (hot < lowC || (!startHold && hot < cold + 2.0f)) duty = 0;
+    else if (hot >= fullC)                               duty = 100;
+    else duty = (uint8_t)(4.0f + (hot - lowC) / (fullC - lowC) * 96.0f);
     float   wTarget   = (float)WINTER_UFH_TARGET_C / 10.0f;
-    uint8_t duty      = calcPumpDuty(hot, wTarget);
-    uint8_t finalDuty = applyPumpSpeedOverrides(duty, hot, cold, wTarget);
-    if (hasHPacket && lastH.heaterPowerPct > 0 && lastH.hPumpDutyPct >= finalDuty && hot < wTarget)
+    uint8_t finalDuty = duty; // summer speed overrides deliberately not applied in winter
+    solarPumpReason = duty ? SPR_RUNNING : SPR_WINTER_LOW;
+    if (hasHPacket && lastH.heaterPowerPct > 0 && lastH.hPumpDutyPct >= finalDuty && hot < wTarget) {
         finalDuty = 0;
+        solarPumpReason = SPR_HEATER_PRIO;
+    }
     setSolarPumpDuty(finalDuty);
 
 
     // Stop condition: end of day (low diff + low PV)
-    if ((hot - cold) <= 2.0f && pvLow) {
+    if (!startHold && (hot - cold) <= 2.0f && pvLow) {
         solarColdValve.setClose();
         resetSolarPumpOverrides();
         setSolarPumpDuty(0);
         solarPumpActive = false;
+        solarPumpReason = SPR_WINTER_IDLE;
     }
 }
 
 
 // ============================================================
-//  SUNSET TABLE  (UK, Alton — used for summer solar end-of-day cutoff)
+//  SUN TABLES  (UK, Alton — solar end-of-day cutoff, external lights)
 // ============================================================
 
-// Sunset time, minutes since midnight UTC, indexed by day-of-year 1-365 (non-leap
+// Time the sun drops to 10° altitude (not true sunset — solar gain is negligible
+// below that), minutes since midnight UTC, indexed by day-of-year 1-365 (non-leap
 // reference year). On a leap year, Feb 29 reuses the Feb 28 entry (day 59) rather than
 // shifting the table — see dayOfYearForSunset() below.
 static const uint16_t kSunsetUtcMin[365] PROGMEM = {
@@ -1352,6 +1388,124 @@ static const uint16_t kSunsetUtcMin[365] PROGMEM = {
      864,
 };
 
+// True sunrise (-0.833° altitude), minutes since midnight UTC, same indexing.
+static const uint16_t kRealSunriseUtcMin[365] PROGMEM = {
+    // Jan (1-31)
+     488, 488, 487, 487, 487, 487, 486, 486, 485, 485,
+     484, 484, 483, 482, 482, 481, 480, 479, 478, 477,
+     476, 475, 474, 473, 472, 470, 469, 468, 467, 465,
+     464,
+    // Feb (32-59)
+     462, 461, 459, 458, 456, 455, 453, 451, 450, 448,
+     446, 444, 443, 441, 439, 437, 435, 433, 431, 429,
+     427, 425, 423, 421, 419, 417, 415, 413,
+    // Mar (60-90)
+     411, 409, 407, 405, 402, 400, 398, 396, 394, 391,
+     389, 387, 385, 383, 380, 378, 376, 374, 371, 369,
+     367, 364, 362, 360, 358, 355, 353, 351, 349, 346,
+     344,
+    // Apr (91-120)
+     342, 340, 337, 335, 333, 331, 328, 326, 324, 322,
+     319, 317, 315, 313, 311, 309, 306, 304, 302, 300,
+     298, 296, 294, 292, 290, 288, 286, 284, 282, 280,
+    // May (121-151)
+     278, 276, 275, 273, 271, 269, 267, 266, 264, 262,
+     261, 259, 258, 256, 255, 253, 252, 250, 249, 247,
+     246, 245, 244, 243, 241, 240, 239, 238, 237, 236,
+     235,
+    // Jun (152-181)
+     235, 234, 233, 232, 232, 231, 231, 230, 230, 229,
+     229, 228, 228, 228, 228, 228, 228, 228, 228, 228,
+     228, 228, 228, 229, 229, 229, 230, 230, 231, 231,
+    // Jul (182-212)
+     232, 233, 233, 234, 235, 236, 237, 238, 238, 239,
+     240, 242, 243, 244, 245, 246, 247, 248, 250, 251,
+     252, 254, 255, 256, 258, 259, 260, 262, 263, 265,
+     266,
+    // Aug (213-243)
+     268, 269, 271, 272, 274, 275, 277, 278, 280, 281,
+     283, 285, 286, 288, 289, 291, 292, 294, 295, 297,
+     299, 300, 302, 303, 305, 306, 308, 309, 311, 313,
+     314,
+    // Sep (244-273)
+     316, 317, 319, 320, 322, 323, 325, 326, 328, 330,
+     331, 333, 334, 336, 337, 339, 340, 342, 343, 345,
+     347, 348, 350, 351, 353, 354, 356, 358, 359, 361,
+    // Oct (274-304)
+     362, 364, 366, 367, 369, 370, 372, 374, 375, 377,
+     379, 380, 382, 384, 385, 387, 389, 390, 392, 394,
+     396, 397, 399, 401, 403, 404, 406, 408, 410, 411,
+     413,
+    // Nov (305-334)
+     415, 417, 419, 420, 422, 424, 426, 427, 429, 431,
+     433, 434, 436, 438, 440, 441, 443, 445, 446, 448,
+     450, 451, 453, 455, 456, 458, 459, 461, 462, 464,
+    // Dec (335-365)
+     465, 466, 468, 469, 470, 472, 473, 474, 475, 476,
+     477, 478, 479, 480, 481, 482, 482, 483, 484, 484,
+     485, 486, 486, 486, 487, 487, 487, 487, 488, 488,
+     488,
+};
+
+// True sunset (-0.833° altitude), minutes since midnight UTC, same indexing.
+static const uint16_t kRealSunsetUtcMin[365] PROGMEM = {
+    // Jan (1-31)
+     966, 967, 968, 969, 970, 971, 972, 974, 975, 976,
+     978, 979, 980, 982, 983, 985, 986, 988, 990, 991,
+     993, 994, 996, 998,1000,1001,1003,1005,1007,1008,
+    1010,
+    // Feb (32-59)
+    1012,1014,1015,1017,1019,1021,1023,1025,1026,1028,
+    1030,1032,1034,1036,1037,1039,1041,1043,1045,1047,
+    1048,1050,1052,1054,1056,1057,1059,1061,
+    // Mar (60-90)
+    1063,1064,1066,1068,1070,1071,1073,1075,1077,1078,
+    1080,1082,1083,1085,1087,1088,1090,1092,1093,1095,
+    1097,1098,1100,1102,1103,1105,1107,1108,1110,1112,
+    1113,
+    // Apr (91-120)
+    1115,1116,1118,1120,1121,1123,1125,1126,1128,1129,
+    1131,1133,1134,1136,1138,1139,1141,1142,1144,1146,
+    1147,1149,1151,1152,1154,1155,1157,1159,1160,1162,
+    // May (121-151)
+    1163,1165,1167,1168,1170,1171,1173,1175,1176,1178,
+    1179,1181,1182,1184,1185,1187,1188,1190,1191,1193,
+    1194,1196,1197,1198,1200,1201,1202,1203,1205,1206,
+    1207,
+    // Jun (152-181)
+    1208,1209,1210,1211,1212,1213,1214,1215,1216,1217,
+    1217,1218,1219,1219,1220,1221,1221,1221,1222,1222,
+    1223,1223,1223,1223,1223,1223,1223,1223,1223,1223,
+    // Jul (182-212)
+    1223,1222,1222,1222,1221,1221,1220,1220,1219,1218,
+    1218,1217,1216,1215,1214,1214,1213,1212,1210,1209,
+    1208,1207,1206,1205,1203,1202,1200,1199,1198,1196,
+    1195,
+    // Aug (213-243)
+    1193,1191,1190,1188,1187,1185,1183,1181,1180,1178,
+    1176,1174,1172,1170,1168,1166,1164,1162,1160,1158,
+    1156,1154,1152,1150,1148,1146,1144,1142,1139,1137,
+    1135,
+    // Sep (244-273)
+    1133,1131,1128,1126,1124,1122,1119,1117,1115,1113,
+    1110,1108,1106,1104,1101,1099,1097,1094,1092,1090,
+    1087,1085,1083,1081,1078,1076,1074,1071,1069,1067,
+    // Oct (274-304)
+    1064,1062,1060,1058,1055,1053,1051,1049,1047,1044,
+    1042,1040,1038,1036,1034,1032,1029,1027,1025,1023,
+    1021,1019,1017,1015,1013,1011,1009,1007,1006,1004,
+    1002,
+    // Nov (305-334)
+    1000, 998, 997, 995, 993, 991, 990, 988, 987, 985,
+     984, 982, 981, 979, 978, 977, 975, 974, 973, 972,
+     970, 969, 968, 967, 966, 965, 964, 964, 963, 962,
+    // Dec (335-365)
+     961, 961, 960, 960, 959, 959, 958, 958, 958, 957,
+     957, 957, 957, 957, 957, 957, 957, 957, 958, 958,
+     958, 959, 959, 960, 960, 961, 962, 962, 963, 964,
+     965,
+};
+
 // Non-leap cumulative days before each month (Jan=index0).
 static const uint16_t kCumDaysBeforeMonth[12] PROGMEM = {
     0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334
@@ -1394,16 +1548,20 @@ static bool isBST(uint16_t y, uint8_t m, uint8_t d) {
     return d < lastSundayOfMonth(y, 10);
 }
 
-// Today's sunset, minutes since midnight in UK local (civil) time — matches the
-// RTC's wall-clock convention (BST-aware, set by hand from a clock on the wall).
-static uint16_t sunsetLocalMinutes() {
+// Minutes since midnight in UK local (civil) time — matches the RTC's wall-clock
+// convention (BST-aware, set by hand from a clock on the wall).
+static uint16_t sunTableLocalMinutes(const uint16_t *table) {
     uint16_t doy = dayOfYearForSunset(curMonth, curDay);
     if (doy < 1) doy = 1;
     if (doy > 365) doy = 365;
-    uint16_t sunsetUtc = pgm_read_word(&kSunsetUtcMin[doy - 1]);
-    uint16_t fullYear  = 2000 + curYear;
-    return sunsetUtc + (isBST(fullYear, curMonth, curDay) ? 60 : 0);
+    uint16_t utc      = pgm_read_word(&table[doy - 1]);
+    uint16_t fullYear = 2000 + curYear;
+    return utc + (isBST(fullYear, curMonth, curDay) ? 60 : 0);
 }
+
+static uint16_t sunsetLocalMinutes()     { return sunTableLocalMinutes(kSunsetUtcMin); }
+static uint16_t realSunsetLocalMinutes()  { return sunTableLocalMinutes(kRealSunsetUtcMin); }
+static uint16_t realSunriseLocalMinutes() { return sunTableLocalMinutes(kRealSunriseUtcMin); }
 
 // ============================================================
 //  SUMMER SOLAR  (simplified — full sequence coordinated with H)
@@ -1428,6 +1586,7 @@ void updateSummerSolar() {
         resetSolarPumpOverrides();
         setSolarPumpDuty(100);
         solarPumpActive = false;
+        solarPumpReason = SPR_SENSOR_DUMP;
         return;
     }
 
@@ -1455,12 +1614,13 @@ void updateSummerSolar() {
         resetSolarPumpOverrides();
         setSolarPumpDuty(0);
         solarPumpActive = false;
+        solarPumpReason = SPR_OVERHEAT_95;
         setFault(FAULT_W_SOLAR_OVERHEAT_HOT);
         return;
     }
 
-    // End-of-day cutoff: past today's actual sunset (kSunsetUtcMin, BST-adjusted —
-    // see sunsetLocalMinutes() above), there's no more solar gain physically possible.
+    // End-of-day cutoff: once the sun is below 10° (kSunsetUtcMin, BST-adjusted —
+    // see sunsetLocalMinutes() above), there's no useful solar gain left.
     // Must gate (and return before) the start-trigger logic below, not just tear down
     // after it runs — otherwise a start condition true at the same time as pastSunset
     // would open the valve/start the pump, then immediately be undone by a teardown
@@ -1471,7 +1631,21 @@ void updateSummerSolar() {
     uint16_t nowMinutes = (uint16_t)eodH * 60 + eodM;
     bool pastSunset = nowMinutes >= sunsetLocalMinutes();
 
-    if (pastSunset) {
+    // Past the cutoff, a pump that's already running keeps going while solar hot is
+    // still >8°C above tank bottom (useful heat left in the loop). Latched once it
+    // drops out so a late warm blip can't restart it; re-arms when the clock wraps.
+    static bool eodLatched = false;
+    if (!pastSunset) {
+        eodLatched = false;
+    } else if (!eodLatched) {
+        bool botOk = hasHPacket && millis() - lastRxMs <= 10000UL
+                     && lastH.tempTankBot != TEMP_FAULT;
+        bool stillGaining = solarPumpActive && botOk
+                            && hot > (float)lastH.tempTankBot / 10.0f + 8.0f;
+        if (!stillGaining) eodLatched = true;
+    }
+
+    if (eodLatched) {
         if (solarPumpActive || summerPhase != SUMPH_IDLE) {
             solarColdValve.setClose();
             ufhColdValve.setClose();
@@ -1481,11 +1655,12 @@ void updateSummerSolar() {
             summerSeqDone   = false;
         }
         setSolarPumpDuty(0);
+        solarPumpReason = SPR_PAST_SUNSET;
         return;
     }
 
-    // Solar starts at 80°C flat in MAX mode; in tank+ mode at tank_top or 80°C,
-    // whichever is reached first. Heater wanting to run also forces a start
+    // Solar starts at 80°C flat in MAX mode; in tank+ mode at tank_mid or 80°C,
+    // whichever is reached first (tank_top stands in if the mid sensor is faulted). Heater wanting to run also forces a start
     // regardless of mode — must key off heaterWantsPower (pre-flow-path intent),
     // not heaterPowerPct: heaterPowerPct stays 0 until H's heaterFlowPathOk() sees
     // our solar cold valve already open, which would otherwise deadlock (neither
@@ -1496,7 +1671,8 @@ void updateSummerSolar() {
     float hotPipeC    = hotPipeFault ? 0.0f : (float)lastH.tempHotPipe / 10.0f;
     SolarTargetMode tgtMode = hasHPacket ? (SolarTargetMode)lastH.solarTargetMode : SOLAR_TANK_PLUS8;
 
-    float startThreshold = (tgtMode == SOLAR_MAX) ? 80.0f : min(tankTopC, 80.0f);
+    float tankMidC = (lastH.tempTankMid == TEMP_FAULT) ? tankTopC : (float)lastH.tempTankMid / 10.0f;
+    float startThreshold = (tgtMode == SOLAR_MAX) ? 80.0f : min(tankMidC, 80.0f);
     bool startTriggerRaw = hot >= startThreshold || cold >= startThreshold
                          || (hasHPacket && lastH.heaterWantsPower);
 
@@ -1516,10 +1692,13 @@ void updateSummerSolar() {
         // sensor-fault dump) without going through solarPumpActive=true, so
         // there's no active->inactive transition to zero it on. Force it here.
         setSolarPumpDuty(0);
+        solarPumpReason = SPR_NOT_STARTED;
         return;
     }
 
+    static unsigned long firstStartMs = 0;
     if (startTrigger && !summerSeqDone && summerPhase == SUMPH_IDLE) {
+        firstStartMs = millis();
         summerPhase = SUMPH_CIRCULATE_TOP;
         solarColdValve.setOpen();
         ufhColdValve.setClose(); // UFH cold stays closed in summer; opens only for fault dump
@@ -1543,8 +1722,21 @@ void updateSummerSolar() {
         summerSeqDone = true;
     }
 
-    // Determine pump target: solar hot vs target (tank top or MAX 85 from H data)
-    float solarTarget  = (tgtMode == SOLAR_MAX) ? 85.0f : tankTopC;
+    // Tank+ reference is the highest of tank top, bottom+40, mid+20, so a cold lower
+    // tank still gets a usefully hot target instead of chasing a lukewarm top.
+    float tankRefC = tankTopC;
+    if (lastH.tempTankBot != TEMP_FAULT) tankRefC = max(tankRefC, (float)lastH.tempTankBot / 10.0f + 40.0f);
+    if (lastH.tempTankMid != TEMP_FAULT) tankRefC = max(tankRefC, (float)lastH.tempTankMid / 10.0f + 20.0f);
+
+    // Determine pump target: solar hot vs target (tank reference, 50-85, or MAX 85 from H data)
+    float solarTarget  = (tgtMode == SOLAR_MAX) ? 85.0f : constrain(tankRefC, 50.0f, 85.0f);
+
+    // First 60min after the day's first start: Tank+ chases tank top - 2°C (no 50°C
+    // floor) so the pump moves heat early instead of holding back for the full target.
+    bool firstHour = firstStartMs != 0 && millis() - firstStartMs < 3600000UL;
+    if (!firstHour) firstStartMs = 0;
+    if (tgtMode != SOLAR_MAX && firstHour && !tankTopFault)
+        solarTarget = min(tankTopC - 2.0f, 85.0f);
 
     // Cal override: H sets calPumpActive=1 and drives solarTarget remotely.
     // calSolarTargetC==0 during PRE_RAMP: stop pump so heater can heat up unimpeded.
@@ -1552,6 +1744,7 @@ void updateSummerSolar() {
         if (lastH.calSolarTargetC == 0) {
             setSolarPumpDuty(0);
             solarPumpActive = false;
+            solarPumpReason = SPR_CAL_STOP;
             return;
         }
         solarTarget  = (float)lastH.calSolarTargetC / 10.0f;
@@ -1594,14 +1787,64 @@ void updateSummerSolar() {
 #else
         uint8_t finalDuty = applyPumpSpeedOverrides(duty, hot, cold, solarTarget);
 #endif
-        if (hasHPacket && lastH.heaterPowerPct > 0 && lastH.hPumpDutyPct >= finalDuty && hot < solarTarget)
+        solarPumpReason = (finalDuty == 100 && duty < 100) ? SPR_BOOST_100
+                        : (finalDuty == 0 && duty > 0)     ? SPR_OVERSHOOT_WAIT : SPR_RUNNING;
+        if (hasHPacket && lastH.heaterPowerPct > 0 && lastH.hPumpDutyPct >= finalDuty && hot < solarTarget) {
             finalDuty = 0;
+            solarPumpReason = SPR_HEATER_PRIO;
+        }
+
+        static unsigned long lowDeltaSinceMs = 0;
+        static bool lowDeltaWasForced = false;
+
+        // Tank+ mid-tank gain: once the heater has been off for 10min, a collector at or
+        // above mid-tank is worth circulating even though it's below tank top — H moves
+        // the 2-port to mid-tank once the pump runs, so the water goes in below the hot
+        // layer. Latched, because starting flow drags the cold sensor down at once and
+        // the hot sensor only sees collector water after the transit time; 3min with
+        // both below mid-tank means the collector really can't deliver and ends it.
+        static unsigned long lastHeaterOnMs  = 0;
+        static unsigned long belowMidSinceMs = 0;
+        static bool          midGainActive   = false;
+        if (hasHPacket && lastH.heaterPowerPct > 0) lastHeaterOnMs = millis();
+        bool heaterIdle10 = millis() - lastHeaterOnMs >= 600000UL;
+        bool tankPlus     = tgtMode != SOLAR_MAX;
+        if (!tankPlus || !heaterIdle10) {
+            midGainActive   = false;
+            belowMidSinceMs = 0;
+        } else if (hot >= tankMidC || cold >= tankMidC) {
+            // Stagnant pipes read cold >= hot, which the low-differential rule below
+            // would count as no gain; give fresh flow its full 5min to prove otherwise.
+            if (!midGainActive) lowDeltaSinceMs = 0;
+            midGainActive   = true;
+            belowMidSinceMs = 0;
+        } else if (midGainActive) {
+            if (belowMidSinceMs == 0) belowMidSinceMs = millis();
+            if (millis() - belowMidSinceMs >= 180000UL) {
+                midGainActive   = false;
+                belowMidSinceMs = 0;
+            }
+        }
+
         if (hasHPacket && lastH.twoPortHeaterSide && lastH.botTankOpen && lastH.summerStartupPhase >= 3
+            && !midGainActive
             && hot < solarTarget && cold < solarTarget
             && hot < 80.0f && cold < 80.0f
             && (tankTopFault || (hot <= tankTopC && cold <= tankTopC))
-            && !hotPipeFault && hotPipeC < tankTopC)
+            && !hotPipeFault && hotPipeC < tankTopC) {
             finalDuty = 0;
+            solarPumpReason = SPR_BELOW_TANK;
+        }
+        // Collector colder than the coldest water in the tank can only take heat out.
+        // Last-known tank bottom is used even if the link is momentarily stale — it
+        // moves slowly, and dropping the rule on every RS485 gap would pulse the pump.
+        if (hasHPacket && lastH.tempTankBot != TEMP_FAULT) {
+            float botC = (float)lastH.tempTankBot / 10.0f;
+            if (hot < botC && cold < botC) {
+                finalDuty = 0;
+                solarPumpReason = SPR_BELOW_BOT;
+            }
+        }
 
         // Low differential: hot/cold within 0.5°C for 5min continuous means the pump is
         // circulating with no useful solar gain. Same force-0 style as above, gated by
@@ -1611,8 +1854,6 @@ void updateSummerSolar() {
         // fresh 5min rather than re-firing the instant the gate condition returns —
         // but the timer is left alone tick-to-tick while continuously suppressed, so
         // suppression itself doesn't self-interrupt every 5min.
-        static unsigned long lowDeltaSinceMs = 0;
-        static bool lowDeltaWasForced = false;
         bool lowDeltaNow = !sFault[SENSOR_SOLAR_HOT] && !sFault[SENSOR_SOLAR_COLD]
                             && (hot - cold) < 0.5f;
         if (lowDeltaNow) {
@@ -1626,6 +1867,7 @@ void updateSummerSolar() {
                                 && (tankTopFault || (hot <= tankTopC && cold <= tankTopC));
         if (lowDeltaSustained && lowDeltaGatesOk) {
             finalDuty = 0;
+            solarPumpReason = SPR_NO_GAIN;
             lowDeltaWasForced = true;
         } else {
             if (lowDeltaWasForced) lowDeltaSinceMs = 0;
@@ -1677,11 +1919,12 @@ void updateUFHHeating() {
     // UFH overheat: post-TMV > 45°C while pump running → hard lockout
     if (!sFault[SENSOR_UFH_POST_TMV] && !ufhHardLockout) {
         float postTMV = sTemp[SENSOR_UFH_POST_TMV];
-        if (ufhState != WUFH_IDLE && postTMV > 45.0f) {
+        if ((ufhState != WUFH_IDLE || winterUFHBoost) && postTMV > 45.0f) {
             setSolarPumpDuty(0);
             digitalWrite(PIN_UFH_PUMP, RELAY_OFF);
             ufhColdValve.setClose();
             ufhHardLockout = true;
+            winterUFHBoost = false;
             setFault(FAULT_W_UFH_OVERHEAT);
         }
     }
@@ -1703,8 +1946,10 @@ void updateUFHHeating() {
 
     if (!morningActive) {
         if (ufhState == WUFH_ACTIVE || ufhState == WUFH_COOLING) {
-            digitalWrite(PIN_UFH_PUMP, RELAY_OFF);
-            if (ufhState == WUFH_ACTIVE) ufhColdValve.setClose();
+            if (!winterUFHBoost) {
+                digitalWrite(PIN_UFH_PUMP, RELAY_OFF);
+                if (ufhState == WUFH_ACTIVE) ufhColdValve.setClose();
+            }
             ufhState = WUFH_IDLE;
         }
         return;
@@ -1734,8 +1979,10 @@ void updateUFHHeating() {
         case WUFH_COOLING:
             // Keep pump running until UFH supply (return) drops below 28°C
             if (!sFault[SENSOR_UFH_SUPPLY] && ufhSupply < 28.0f) {
-                digitalWrite(PIN_UFH_PUMP, RELAY_OFF);
-                ufhColdValve.setClose();
+                if (!winterUFHBoost) {
+                    digitalWrite(PIN_UFH_PUMP, RELAY_OFF);
+                    ufhColdValve.setClose();
+                }
                 ufhState = WUFH_LOCKED;
             }
             break;
@@ -1744,6 +1991,23 @@ void updateUFHHeating() {
             // Session locked — wait for next morningActive transition
             break;
     }
+}
+
+// Runs before updateUFHHeating() so the post-TMV overheat lockout there covers the boost.
+void updateWinterUFHBoost(bool winterSolarRunning) {
+    float hot  = sTemp[SENSOR_SOLAR_HOT];
+    bool  want = winterUFHBoost ? (hot >= 37.0f) : (hot > 38.0f);
+    if (!winterSolarRunning || sFault[SENSOR_SOLAR_HOT] || ufhHardLockout) want = false;
+
+    if (want) {
+        ufhColdValve.setOpen();
+        digitalWrite(PIN_UFH_PUMP, RELAY_ON);
+    } else if (winterUFHBoost && !solarDumpUFHOn
+               && ufhState != WUFH_ACTIVE && ufhState != WUFH_COOLING) {
+        // Leave the pump to a morning session or dump that also wants it
+        digitalWrite(PIN_UFH_PUMP, RELAY_OFF);
+    }
+    winterUFHBoost = want;
 }
 
 // ============================================================
@@ -1758,6 +2022,14 @@ void getCurrentTime(uint8_t &h, uint8_t &m) {
     totalSec %= 86400UL;
     h = (uint8_t)(totalSec / 3600);
     m = (uint8_t)((totalSec % 3600) / 60);
+}
+
+void updateExtLights() {
+    uint8_t h, m; getCurrentTime(h, m);
+    uint16_t now = (uint16_t)h * 60 + m;
+    bool dark = now >= realSunsetLocalMinutes() || now < realSunriseLocalMinutes();
+    extLightsOn = timeSynced && !workshopLocked && dark;
+    if (!fireAlarmActive) digitalWrite(PIN_EXT_LIGHTS, extLightsOn ? RELAY_ON : RELAY_OFF);
 }
 
 bool isNightHours() {
@@ -1793,7 +2065,7 @@ void updateSecurity() {
     static bool prevUnlockBtn = false;
     if (unlockBtn && !prevUnlockBtn && workshopLocked) {
         doorLock.request(true);
-        workshopLocked = false;
+        setWorkshopLocked(false);
     }
     prevUnlockBtn = unlockBtn;
 
@@ -1801,7 +2073,7 @@ void updateSecurity() {
     static bool prevLockSw = false;
     if (lockSw && !prevLockSw && !workshopLocked) {
         doorLock.request(false);
-        workshopLocked = true;
+        setWorkshopLocked(true);
         relockTimerActive = false;
     }
     prevLockSw = lockSw;
@@ -2033,7 +2305,7 @@ void updateFireAlarm() {
         return;
     }
 
-    // Flash D30 at 250ms while alarm active
+    // Flash D25 at 250ms while alarm active
     bool flashOn = ((now / 250UL) % 2) == 0;
     digitalWrite(PIN_EXT_LIGHTS, flashOn ? RELAY_ON : RELAY_OFF);
 
@@ -2293,6 +2565,7 @@ void sendWToHPacket() {
     pkt.requestTimeSync    = (!timeSynced || millis() - lastTimeSyncReceivedMs >= TIME_SYNC_INTERVAL_MS) ? 1 : 0;
     pkt.rs485RxGood        = rs485RxGood;
     pkt.rs485RxBadFrame    = rs485RxBadFrame;
+    pkt.solarPumpReason    = solarPumpReason;
     {
         uint32_t ageMs = millis() - lastRxMs;
         pkt.rs485RxAgeS = (uint16_t)min(ageMs / 1000UL, 65535UL);
@@ -2568,6 +2841,15 @@ static void dbgFans() {
 
 static void dbgSecurity() {
     Serial.print(F("  locked:     ")); Serial.println(workshopLocked ? F("yes") : F("no"));
+    uint16_t ss = realSunsetLocalMinutes();
+    Serial.print(F("  ext_lights: ")); Serial.print(extLightsOn ? F("ON") : F("off"));
+    uint16_t sr = realSunriseLocalMinutes();
+    Serial.print(F(" (sunrise ")); Serial.print(sr / 60); Serial.print(':');
+    if (sr % 60 < 10) Serial.print('0');
+    Serial.print(sr % 60);
+    Serial.print(F(", sunset ")); Serial.print(ss / 60); Serial.print(':');
+    if (ss % 60 < 10) Serial.print('0');
+    Serial.print(ss % 60); Serial.println(timeSynced ? F(")") : F(", no time sync)"));
     Serial.print(F("  unlock_btn: ")); Serial.println(digitalRead(PIN_UNLOCK_BTN) == HIGH ? F("HIGH") : F("LOW"));
     Serial.print(F("  lock_sw:    ")); Serial.println(digitalRead(PIN_LOCK_SW) == HIGH ? F("ON") : F("off"));
     Serial.print(F("  led_pin:    ")); Serial.println(digitalRead(PIN_MIDPOINT_LED) == RELAY_OFF ? F("OFF(ok)") : F("ON(masked)"));
@@ -2812,14 +3094,15 @@ static void processSerialInput() {
 // ============================================================
 
 void powerUpSafeState() {
-    // Step 1: Door lock — send 1s lock pulse
-    doorLock.request(false); // false = close = lock
+    // Step 1: Door lock — re-drive the last saved state (lock pulse unless saved unlocked)
+    bool locked = EEPROM.read(EEPROM_LOCK_STATE_ADDR) != 0;
+    doorLock.request(!locked); // true = open = unlock
     unsigned long t = millis();
     while (millis() - t < LOCK_PULSE_MS + HBRIDGE_DEAD_MS + 200) {
         doorLock.update();
         wdt_reset();
     }
-    workshopLocked = true;
+    workshopLocked = locked;
 
     // Step 2: All tank valves at H are driven by H controller, not us.
     // W-side valves: vacuum isolation valve → close
@@ -3004,12 +3287,31 @@ void loop() {
 
     // Security
     updateSecurity();
+    updateExtLights();
 
     // INA219 current sampling (during pump ON period)
     sampleSolarPumpCurrent();
 
     // Heating logic (mode comes from H via RS485)
     SystemMode mode = hasHPacket ? (SystemMode)lastH.systemMode : MODE_WINTER;
+
+    // Winter and summer solar each assume they own the solar loop from a clean start;
+    // without this, a mode flip mid-run (PV export override) inherits the other mode's
+    // valves and a stale summerSeqDone, skipping the start sequence that closes UFH cold.
+    static SystemMode prevMode = mode;
+    if (mode != prevMode) {
+        prevMode = mode;
+        if (!solarDumpUFHOn) {
+            if (!(hasHPacket && lastH.morningHeatActive)) ufhColdValve.setClose();
+            solarColdValve.setClose();
+            resetSolarPumpOverrides();
+            setSolarPumpDuty(0);
+            solarPumpActive = false;
+        }
+        summerPhase     = SUMPH_IDLE;
+        summerSeqDone   = false;
+        frostProtActive = false;
+    }
     float tankBotC  = (hasHPacket && lastH.tempTankBot != TEMP_FAULT)
                        ? (float)lastH.tempTankBot / 10.0f : NAN;
 
@@ -3018,6 +3320,7 @@ void loop() {
         if (lastH.calSolarTargetC == 0) {
             setSolarPumpDuty(0);
             solarPumpActive = false;
+            solarPumpReason = SPR_CAL_STOP;
         } else {
             updateSummerSolar();
         }
@@ -3033,6 +3336,14 @@ void loop() {
 #endif
     if (hasHPacket && lastH.heaterPowerPct > 0)
         solarColdValve.setOpen();
+    // H won't fire the heater with UFH cold open; frost protection and the mode
+    // handover can leave it open, so close it whenever H calls for heat. Dumps and a
+    // morning UFH session keep it (H blocks the heater in both anyway).
+    if (hasHPacket && lastH.heaterWantsPower && !lastH.morningHeatActive
+            && !solarDumpUFHOn && !frostProtActive && !winterUFHBoost)
+        ufhColdValve.setClose();
+    updateWinterUFHBoost(mode == MODE_WINTER && solarPumpActive
+                         && !(hasHPacket && lastH.calPumpActive));
     updateUFHHeating();
     // Fault check after solar+UFH so it can override both pump duty and UFH pump pin
     checkSolarPumpFault();

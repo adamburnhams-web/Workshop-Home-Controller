@@ -33,6 +33,26 @@ enum ManualHeaterMode : uint8_t {
     MHM_FORCE_ON = 2
 };
 
+// Why the W solar pump is at its current duty. Logged by H as w_pump_reason, so
+// the values are part of the log format.
+enum SolarPumpReason : uint8_t {
+    SPR_RUNNING        = 0,   // on the pump curve
+    SPR_NOT_STARTED    = 1,   // below start threshold
+    SPR_PAST_SUNSET    = 2,
+    SPR_OVERHEAT_95    = 3,   // either pipe >= 95°C, stopped and valves closed
+    SPR_SENSOR_DUMP    = 4,   // solar sensor fault, 100% dump
+    SPR_HEATER_PRIO    = 5,   // 0%: heater firing and H pump covering the flow
+    SPR_BELOW_TANK     = 6,   // 0%: solar pipes and hot pipe all below tank top
+    SPR_NO_GAIN        = 7,   // 0%: hot/cold within 0.5°C for 5 min
+    SPR_OVERSHOOT_WAIT = 8,   // 0%: 10s pause after an above-target excursion
+    SPR_CAL_STOP       = 9,   // 0%: stopped by H calibration
+    SPR_BOOST_100      = 10,  // 100%: cold-return flush, fast-rise or 60s kick override
+    SPR_BELOW_BOT      = 11,  // 0%: both solar pipes below tank bottom
+    SPR_FROST          = 12,  // winter mode frost protection
+    SPR_WINTER_IDLE    = 13,  // winter mode, trigger not met or end-of-day stop
+    SPR_WINTER_LOW     = 14   // winter 0%: hot below workshop air+2 or solar cold+2
+};
+
 enum WinchState : uint8_t {
     WINCH_STOP  = 0,
     WINCH_OPEN  = 1,
@@ -152,6 +172,8 @@ struct __attribute__((packed)) WToHPacket {
     uint16_t rs485RxGood;       // total valid H->W frames received by W
     uint16_t rs485RxBadFrame;   // total decoded frames with wrong dir/len received by W
     uint16_t rs485RxAgeS;       // seconds since W last received a good H->W packet (saturates at 65535)
+
+    uint8_t solarPumpReason;    // SolarPumpReason enum: why the solar pump is at its current duty (logged by H)
 };
 
 // ============================================================

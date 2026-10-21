@@ -278,6 +278,22 @@ bool heaterManualLockout = false; // set on 95°C overtemp — unlike heaterHard
 bool hotTankProtection = false;
 bool tankBotHeaterBlock = false;  // 80°C on / 79°C off hysteresis, see updateHeaterDuty()
 bool morningHeatActive = false;
+// Why the heater is off or limited, written to log.csv as htr_reason. 0-14 = not
+// running, 20-24 = running, 30+ = manual/test. Values are part of the log format.
+enum HeaterReason : uint8_t {
+    HR_RUN_OK = 0,
+    HR_OFF_DISABLED = 1, HR_OFF_W_SOLAR_FAULT = 2, HR_OFF_LOCKOUT = 3, HR_OFF_IMPORT_TRIP = 4,
+    HR_OFF_HOT_TANK = 5, HR_OFF_MORNING_HEAT = 6, HR_OFF_TANK_BOT_80 = 7, HR_OFF_SOC_LIM_LOW = 8,
+    HR_OFF_NO_PV = 9, HR_OFF_NO_SURPLUS = 10, HR_OFF_NO_SURPLUS_WINTER_RES = 11,
+    HR_OFF_BELOW_1500 = 12, HR_OFF_BELOW_START = 13, HR_OFF_WINTER_MODE = 14,
+    HR_RUN_WAIT_VALVES = 20, HR_RUN_HOT_PIPE_CAP = 21, HR_RUN_OUTLET_CAP = 22,
+    HR_RUN_SURGE_HOLD = 23, HR_RUN_STOPPING = 24,
+    HR_FORCE_ON = 30, HR_TEST = 31
+};
+uint8_t heaterReason   = HR_OFF_NO_PV;
+int16_t heaterAvailW   = 0;       // power available for the heater after the reservation, as last evaluated (0 if not evaluated)
+int16_t heaterReserveW = 0;       // battery/export reservation in force, as last evaluated
+bool winterLowSocReserve = false; // SOC <80% and tank bottom <45°C on / 46°C off, winter half-year only, see updateHeaterDuty()
 bool          importTripActive   = false;
 unsigned long importHighStartMs  = 0;
 unsigned long importZeroStartMs  = 0;
@@ -304,10 +320,11 @@ enum ImbalPulseState : uint8_t { IMBAL_IDLE, IMBAL_ON, IMBAL_OFF };
 ImbalPulseState imbalPulseState = IMBAL_IDLE;
 uint32_t        imbalPulseTimer = 0;
 
-// True when W solar-cold is open, 2-port is fully on the heater side and idle,
-// AND at least one H-side return path is fully open and idle.
+// True when W solar-cold is open and UFH-cold closed, 2-port is fully on the heater
+// side and idle, AND at least one H-side return path is fully open and idle.
 static bool heaterFlowPathOk() {
     if (!(lastWPkt.valveStates & VSTATE_SOLAR_COLD_OPEN)) return false;
+    if (lastWPkt.valveStates & VSTATE_UFH_COLD_OPEN) return false;
     if (twoPortValve.busy() || !twoPortValve.isOpen) return false;
     return (logBurnerCold.isOpen && logBurnerCold.phase == HBP_IDLE)
         || (botTankValve.isOpen  && botTankValve.phase  == HBP_IDLE);
@@ -395,33 +412,35 @@ static inline float getHeaterOutC();  // defined after sensorFaultMaskH
 void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
                        ManualHeaterMode manualMode, bool wSolarFault)
 {
+    heaterAvailW = 0; heaterReserveW = 0;
 #ifdef DEBUG_SERIAL
     if (simHeaterActive) {
         heaterRunning  = simHeaterVal > 0;
         heaterLevelIdx = pctToLevel(simHeaterVal);
+        heaterReason   = HR_TEST;
         return;
     }
-    if (pumpTestHeaterActive) return;  // pump_test/stress_test own heaterRunning
+    if (pumpTestHeaterActive) { heaterReason = HR_TEST; return; }  // pump_test/stress_test own heaterRunning
 #endif
     if (gridOutageFault || !HEATER_ENABLED) {
-        heaterLevelIdx = 0; heaterRunning = false; return;
+        heaterLevelIdx = 0; heaterRunning = false; heaterReason = HR_OFF_DISABLED; return;
     }
     // W solar sensor fault: W is in emergency UFH dump mode; suppress heater
     // to avoid adding heat to a circuit being used to dissipate excess solar heat.
     if (wSolarFault) {
-        heaterLevelIdx = 0; heaterRunning = false; return;
+        heaterLevelIdx = 0; heaterRunning = false; heaterReason = HR_OFF_W_SOLAR_FAULT; return;
     }
     if (heaterHardLockout) {
-        heaterLevelIdx = 0; heaterRunning = false; return;
+        heaterLevelIdx = 0; heaterRunning = false; heaterReason = HR_OFF_LOCKOUT; return;
     }
     if (importTripActive) {
-        heaterLevelIdx = 0; heaterRunning = false; return;
+        heaterLevelIdx = 0; heaterRunning = false; heaterReason = HR_OFF_IMPORT_TRIP; return;
     }
     if (hotTankProtection) {
-        heaterLevelIdx = 0; heaterRunning = false; return;
+        heaterLevelIdx = 0; heaterRunning = false; heaterReason = HR_OFF_HOT_TANK; return;
     }
     if (morningHeatActive) {
-        heaterLevelIdx = 0; heaterRunning = false; return;
+        heaterLevelIdx = 0; heaterRunning = false; heaterReason = HR_OFF_MORNING_HEAT; return;
     }
     if (!sFault[H_SENSOR_TANK_BOT]) {
         float tBot = sTemp[H_SENSOR_TANK_BOT];
@@ -429,7 +448,7 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
         else if (tankBotHeaterBlock && tBot < 79.0f)   tankBotHeaterBlock = false;
     }
     if (tankBotHeaterBlock) {
-        heaterLevelIdx = 0; heaterRunning = false; return;
+        heaterLevelIdx = 0; heaterRunning = false; heaterReason = HR_OFF_TANK_BOT_80; return;
     }
     if (manualMode == MHM_FORCE_ON) {
         // Call for the flow-path valves regardless of position; actual firing stays
@@ -450,6 +469,7 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
             }
         }
         heaterLevelIdx = heaterFlowPathOk() ? pctToLevel(pct) : 0;
+        heaterReason   = HR_FORCE_ON;
         return;
     }
 
@@ -482,11 +502,11 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
         rawPct = (int16_t)constrain(availableW * 100L / 3000L, 0L, 100L);
     } else if (manualMode == MHM_SOC_LIM) {
         // SOC mode but below threshold — heater off
-        heaterRunning = false; heaterLevelIdx = 0; return;
+        heaterRunning = false; heaterLevelIdx = 0; heaterReason = HR_OFF_SOC_LIM_LOW; return;
     } else {
         // Normal auto mode: requires PV generating.
         if (!growattOk || (lastWPkt.pv1W + lastWPkt.pv2W) < 200) {
-            heaterRunning = false; heaterLevelIdx = 0; return;
+            heaterRunning = false; heaterLevelIdx = 0; heaterReason = HR_OFF_NO_PV; return;
         }
         int16_t battChgW   = lastWPkt.battChargeW;
         // SOC > 95%: battery full, no reservation at all.
@@ -509,6 +529,21 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
         } else {                                // 14:00:00 onward
             reservationW = 3000L;
         }
+        // Winter half of the year (autumn equinox 23 Sep to spring equinox 20 Mar): with
+        // the battery below 80% and a cold tank bottom, battery charging and export
+        // take priority over the tiers above.
+        if (rtcValid && !sFault[H_SENSOR_TANK_BOT]) {
+            uint8_t mo = rtcNow.month(), dy = rtcNow.day();
+            bool winterHalf = mo > 9 || (mo == 9 && dy >= 23) || mo < 3 || (mo == 3 && dy < 20);
+            float tBot = sTemp[H_SENSOR_TANK_BOT];
+            if (!winterHalf || soc >= 80)                      winterLowSocReserve = false;
+            else if (!winterLowSocReserve && tBot < 45.0f)     winterLowSocReserve = true;
+            else if (winterLowSocReserve && tBot >= 46.0f)     winterLowSocReserve = false;
+        } else {
+            winterLowSocReserve = false;
+        }
+        if (winterLowSocReserve) reservationW = 3500L;
+        heaterReserveW = (int16_t)reservationW;
         availableW = (int32_t)pvExportW - gridImportW + (int32_t)battChgW + heaterCurrentW - reservationW;
         rawPct = (int16_t)constrain(availableW * 100L / 3000L, 0L, 100L);
     }
@@ -517,6 +552,7 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
     // charging the battery: demand 1500W to start, then hold on down to 300W so
     // the heater doesn't chatter around the start point.
     bool lowSocIdle = !highSoc && soc < 90 && lastWPkt.solarPumpDutyPct < 6;
+    heaterAvailW = (int16_t)constrain(availableW, -32000L, 32000L);
 
     if (highSoc != lastHighSoc) {
         heaterRunning = false; heaterLevelIdx = 0;
@@ -528,18 +564,22 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
     if (!heaterRunning) {
         zeroCount = 0;
         rawPctBufIdx = 0; rawPctBufCount = 0; rawPctSum = 0;
-        if (rawPct == 0) { startCount = 0; return; }
+        if (rawPct == 0) {
+            startCount   = 0;
+            heaterReason = winterLowSocReserve ? HR_OFF_NO_SURPLUS_WINTER_RES : HR_OFF_NO_SURPLUS;
+            return;
+        }
         if (lowSocIdle) {
             surplusStartMs = 0;
-            if (availableW < 1500L) { startCount = 0; return; }
-            if (++startCount < 5) return;
+            if (availableW < 1500L) { startCount = 0; heaterReason = HR_OFF_BELOW_1500; return; }
+            if (++startCount < 5) { heaterReason = HR_OFF_BELOW_START; return; }
         } else if (!highSoc) {
             startCount = 0;
             // 500W threshold when solar is off; 150W (5%) when solar is already running
             uint8_t startThreshPct = lastWPkt.solarPumpActive ? 5 : 17;
-            if (rawPct < startThreshPct) { surplusStartMs = 0; return; }
+            if (rawPct < startThreshPct) { surplusStartMs = 0; heaterReason = HR_OFF_BELOW_START; return; }
             if (surplusStartMs == 0) surplusStartMs = millis();
-            if (millis() - surplusStartMs < 5000UL) return;
+            if (millis() - surplusStartMs < 5000UL) { heaterReason = HR_OFF_BELOW_START; return; }
         }
         heaterRunning  = true;
         surplusStartMs = 0;
@@ -553,10 +593,12 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
     twoPortValve.request(true);
 
     if (rawPct == 0 || (lowSocIdle && availableW < 300L)) {
+        heaterReason = HR_RUN_STOPPING;
         if (++zeroCount >= 5) {
             heaterRunning = false; heaterLevelIdx = 0;
             zeroCount = 0;
             rawPctBufIdx = 0; rawPctBufCount = 0; rawPctSum = 0;
+            heaterReason = winterLowSocReserve ? HR_OFF_NO_SURPLUS_WINTER_RES : HR_OFF_NO_SURPLUS;
         }
         return;
     }
@@ -578,18 +620,21 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
     uint8_t avgPct = (uint8_t)(rawPctSum / rawPctBufCount);
 
     // Hot pipe cap: 100% at 61°C, linear ramp to 0 at 86°C
+    bool hpCapped = false;
     if (!sFault[H_SENSOR_HOT_PIPE]) {
         float hp = sTemp[H_SENSOR_HOT_PIPE];
         if (hp >= 86.0f) {
-            avgPct = 0;
+            avgPct = 0; hpCapped = true;
         } else if (hp > 61.0f) {
             uint8_t cap = (uint8_t)((86.0f - hp) * (100.0f / 25.0f));  // 4.00% per °C over 25°C span
-            if (avgPct > cap) avgPct = cap;
+            if (avgPct > cap) { avgPct = cap; hpCapped = true; }
         }
     }
 
     // Actual power output blocked until the flow-path valves are confirmed in position.
-    heaterLevelIdx = heaterFlowPathOk() ? pctToLevel(avgPct) : 0;
+    bool pathOk = heaterFlowPathOk();
+    heaterLevelIdx = pathOk ? pctToLevel(avgPct) : 0;
+    heaterReason   = !pathOk ? HR_RUN_WAIT_VALVES : hpCapped ? HR_RUN_HOT_PIPE_CAP : HR_RUN_OK;
 }
 
 // ============================================================
@@ -1313,7 +1358,6 @@ void updateHeatSourceSelection() {
     }
 
     // Active heating: heat source selection
-    readLogBurnerModule();
     if (logBurnerHot) {
         logBurnerCold.request(true);
         botTankValve.request(false); // close bottom-of-tank when log burner takes over
@@ -1352,8 +1396,8 @@ void updateHeatSourceSelection() {
 //  open bot-tank. On sensor fault, hold last valve state.
 //
 //  2-port tracked independently: heater-side when heater firing or
-//  within 15s of stopping (heater latch); mid-tank when hot-pipe <
-//  tank-top and pump ≥ 3%. 2-port tracking suspended during cold-start.
+//  within 3min of stopping (heater latch); mid-tank when hot-pipe <
+//  tank-top - 5°C and pump ≥ 3%. 2-port tracking suspended during cold-start.
 //
 //  summerStartupPhase kept as file-scope for the H→W RS485 packet
 //  (W uses summerStartupPhase >= 3 as gate). twoPortValve.isOpen is
@@ -1440,7 +1484,10 @@ void updateSolarValves() {
     // instead of staying stuck until an unrelated edge happens to fire.
     bool pumpRunning = hasWPkt && lastWPkt.solarPumpDutyPct >= 3;
 
-    if (heaterActive) {
+    // heaterRunning, not heaterActive: while the heater waits for its flow path it isn't
+    // firing yet, and tracking would pull the 2-port back to mid-tank against
+    // updateHeaterDuty()'s request — the two reversed the valve every packet (relay chatter).
+    if (heaterRunning) {
         if (!twoPortValve.isOpen) twoPortValve.request(true);
         heaterLatch  = true;
         heaterStopMs = 0;
@@ -1451,10 +1498,12 @@ void updateSolarValves() {
         heaterStopMs = 0;
     } else if (heaterLatch) {
         if (heaterStopMs == 0) heaterStopMs = millis();
-        bool canRelease = (millis() - heaterStopMs >= 15000UL)
+        // 3min hold rides out short clouds; -5°C matches the tracking band so the
+        // release can't land inside the >-1°C return-to-heater threshold.
+        bool canRelease = (millis() - heaterStopMs >= 180000UL)
                           && pumpRunning
                           && !sFault[H_SENSOR_HOT_PIPE] && !sFault[H_SENSOR_TANK_TOP]
-                          && sTemp[H_SENSOR_HOT_PIPE] < sTemp[H_SENSOR_TANK_TOP];
+                          && sTemp[H_SENSOR_HOT_PIPE] < sTemp[H_SENSOR_TANK_TOP] - 5.0f;
         if (canRelease) {
             heaterLatch  = false;
             heaterStopMs = 0;
@@ -1558,10 +1607,11 @@ bool    sdEjected     = false;
 File    logFile;
 unsigned long lastLogMs = 0;
 bool          needTSSinceLastLog = false; // latched: set on any time-sync reply, read+cleared by logDataRow()
+uint8_t       flushSinceLastLog  = 0;     // latched bits: 1 = 80°C+ flush burst started, 2 = 65-80°C imbalance pulse started; read+cleared by logDataRow()
 File    energyLogFile;
 unsigned long lastEnergyLogMs = 0;
 
-static const uint8_t LOG_EXPECTED_COMMAS = 40; // 41 columns = 40 commas
+static const uint8_t LOG_EXPECTED_COMMAS = 53; // 54 columns = 53 commas
 static const uint8_t ENERGY_LOG_EXPECTED_COMMAS = 6; // 7 columns = 6 commas
 
 void initSD() {
@@ -1594,7 +1644,9 @@ void initSD() {
                             "h_pump_pct,pv1_w,pv2_w,batt_w,batt_soc_pct,w_faults,h_faults,"
                             "log_valve,log_burner_hot,bot_valve,two_port_valve,"
                             "ufh_cold_v,solar_cold_v,vac_iso_v,fan_flap_v,"
-                            "w_rx_good,w_rx_badframe,h_needts,w_rx_age_s"));
+                            "w_rx_good,w_rx_badframe,h_needts,w_rx_age_s,solar_mode,flush,"
+                            "htr_reason,avail_w,reserve_w,sys_mode,htr_mode,boost,"
+                            "solar_active,w_pump_reason,ufh_pump,ufh_reached,morning_heat"));
                 f.close();
             }
         }
@@ -1685,8 +1737,29 @@ void logDataRow() {
     logFile.print(lastWPkt.rs485RxGood);     logFile.print(',');
     logFile.print(lastWPkt.rs485RxBadFrame); logFile.print(',');
     logFile.print(needTSSinceLastLog ? 1 : 0); logFile.print(',');
-    logFile.println(lastWPkt.rs485RxAgeS);
+    logFile.print(lastWPkt.rs485RxAgeS); logFile.print(',');
+    logFile.print((uint8_t)solarTargetMode); logFile.print(',');
+    logFile.print(flushSinceLastLog); logFile.print(',');
+    // Outlet cap and surge hold act in the ISR after updateHeaterDuty() has picked a
+    // level, so they're overlaid here to report what is actually limiting the output.
+    uint8_t reason = heaterReason;
+    if (heaterRunning) {
+        if (solarSurgeHold)                       reason = HR_RUN_SURGE_HOLD;
+        else if (heaterLevelCap < heaterLevelIdx) reason = HR_RUN_OUTLET_CAP;
+    }
+    logFile.print(reason);                       logFile.print(',');
+    logFile.print(heaterAvailW);                 logFile.print(',');
+    logFile.print(heaterReserveW);               logFile.print(',');
+    logFile.print((uint8_t)systemMode);          logFile.print(',');
+    logFile.print((uint8_t)manualHeaterMode);    logFile.print(',');
+    logFile.print((uint8_t)boostMode);           logFile.print(',');
+    logFile.print(lastWPkt.solarPumpActive);     logFile.print(',');
+    logFile.print(lastWPkt.solarPumpReason);     logFile.print(',');
+    logFile.print(lastWPkt.ufhPumpRunning);      logFile.print(',');
+    logFile.print(lastWPkt.ufhTargetReached);    logFile.print(',');
+    logFile.println(morningHeatActive ? 1 : 0);
     needTSSinceLastLog = false;
+    flushSinceLastLog  = 0;
     logFile.flush();
 }
 
@@ -2886,7 +2959,15 @@ static float calcHPumpDuty() {
 
     bool  normalMode = solarTargetMode == SOLAR_TANK_PLUS8 && !sFault[H_SENSOR_TANK_TOP]
                                                             && sTemp[H_SENSOR_TANK_TOP] <= 75.0f;
-    float effTarget  = normalMode ? sTemp[H_SENSOR_TANK_TOP] : 85.0f;
+    float effTarget  = 85.0f;
+    if (normalMode) {
+        // Tank reference is the highest of tank top, bottom+40, mid+20 (same as W's
+        // solar target), so a cold lower tank doesn't pull the target down with it.
+        float tankRef = sTemp[H_SENSOR_TANK_TOP];
+        if (!sFault[H_SENSOR_TANK_BOT]) tankRef = fmaxf(tankRef, sTemp[H_SENSOR_TANK_BOT] + 40.0f);
+        if (!sFault[H_SENSOR_TANK_MID]) tankRef = fmaxf(tankRef, sTemp[H_SENSOR_TANK_MID] + 20.0f);
+        effTarget = fminf(fmaxf(tankRef + 3.0f, 60.0f), 85.0f);
+    }
     float pred = calcPred(heaterLevelPct(), hotPipeC + fmaxf(0.0f, 85.0f - effTarget));
     float duty;
 
@@ -2896,7 +2977,7 @@ static float calcHPumpDuty() {
     float upper     = fminf(pred * upperMult, 100.0f);
 
     if (normalMode) {
-        // Normal mode: target tracks tank top.
+        // Normal mode: target tracks tank reference + 3°C, held within 60-85°C.
         // Above target: linear ramp from pred at target to 100% at 89°C.
         float target    = effTarget;
         if (heaterOutC >= 89.0f) {
@@ -3176,10 +3257,14 @@ static void pollRS485() {
             // Winter mode: hold off heater until export has been ≥500W for ≥60s (battery charges to 100% first).
             if (systemMode == MODE_WINTER && !pvExportOverride) {
                 heaterLevelIdx = 0; heaterRunning = false;
+                heaterReason = HR_OFF_WINTER_MODE; heaterAvailW = 0; heaterReserveW = 0;
             } else {
                 updateHeaterDuty(lastWPkt.pvExportW, lastWPkt.gridImportW, manualHeaterMode, wSolarFault);
             }
         }
+#ifdef DEBUG_SERIAL
+        else { heaterReason = HR_TEST; heaterAvailW = 0; heaterReserveW = 0; }
+#endif
 
         bool needTS = lastWPkt.requestTimeSync && (millis() - lastTimeSyncSentMs > 5000);
         if (needTS) { lastTimeSyncSentMs = millis(); needTSSinceLastLog = true; }
@@ -3924,6 +4009,16 @@ void loop() {
     // H-side solar pump direct drive
     updateFlush();
     updateImbalancePulse();
+    {
+        // Latch on the rising edge only, so a burst still running when a log row
+        // is written isn't reported again in the following row.
+        static FlushState      prevFlush = FLUSH_IDLE;
+        static ImbalPulseState prevImbal = IMBAL_IDLE;
+        if (flushState == FLUSH_ACTIVE && prevFlush != FLUSH_ACTIVE) flushSinceLastLog |= 1;
+        if (imbalPulseState == IMBAL_ON && prevImbal != IMBAL_ON)    flushSinceLastLog |= 2;
+        prevFlush = flushState;
+        prevImbal = imbalPulseState;
+    }
 #ifdef DEBUG_SERIAL
     updatePumpTest();
     if (pumpTestState == PT_COOLDOWN)     setHPumpDuty(10.0f);
@@ -3941,6 +4036,7 @@ void loop() {
 
     // 5am trigger and heating session
     checkMorningTrigger();
+    readLogBurnerModule();
     checkHotTankProtection();
     updateHeatSourceSelection();
     updatePVExportOverride();

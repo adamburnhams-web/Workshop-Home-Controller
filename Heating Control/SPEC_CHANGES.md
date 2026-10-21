@@ -1001,3 +1001,212 @@ Start thresholds (Tank+ `min(tankTop, 80)`, Max 80°C) and the H pump targets ar
 - **Below target:** unchanged shape relative to the target — `pred` within 5°C below, tapering to 0.8 × `pred` at 55°C below.
 
 MAX mode (and the Tank+ fallback when tank top > 75°C or faulted) is unchanged.
+
+## Tank+ target floors — W solar 50°C, H pump 60°C
+
+- **W `solarTarget` (Tank+):** `max(tankTop, 50°C)`. The Tank+ start threshold (`min(tankTop, 80)`) is unchanged, so the pump can still start below 50°C but sits at its minimum duty until solar hot approaches 50°C.
+- **H `calcHPumpDuty()` (Tank+):** heater outlet target is `max(tankTop + 3°C, 60°C)` (raised from tank top + 0°C); `pred` and the above/below-target ramps all follow this target, so the ramp to 100% at 89°C now starts from tank top + 3°C.
+
+## H Controller — winter half-year heater hold at low SOC with cold tank bottom (`winterLowSocBlock`)
+
+From 23 Sep to 19 Mar inclusive (winter side of the equinoxes, by RTC date — independent of `systemMode`), `updateHeaterDuty()` holds the heater at 0 while battery SOC < 80% and tank bottom < 45°C.
+
+- **Hysteresis:** tank bottom engages below 45°C and releases at 46°C (same pattern as `tankBotHeaterBlock`). SOC has none: the hold drops as soon as SOC reads 80%.
+- **Scope:** normal auto mode only. FORCE_ON and SOC_LIM manual modes are not held.
+- **Not applied** when the RTC is invalid, Growatt data is invalid, or the tank-bottom sensor is faulted.
+- **2-port valve:** the hold sets `heaterRunning = false` and returns before the heater's flow-path valve requests, so `heaterWantsPower` goes to 0 and the 2-port follows the existing solar tracking in `updateSolarValves()` (3min heater latch, then mid-tank side when the W pump is ≥ 3% and hot pipe is 5°C below tank top).
+
+## H Controller — winter half-year 3500W reservation at low SOC with cold tank bottom (`winterLowSocReserve`)
+
+From 23 Sep to 19 Mar inclusive (winter side of the equinoxes, by RTC date — independent of `systemMode`), the battery-charging/export reservation in `updateHeaterDuty()` normal auto mode is 3500W while battery SOC < 80% and tank bottom < 45°C. This replaces whatever the SOC/time-of-day tier would have given (max 3000W).
+
+- **Hysteresis:** tank bottom engages below 45°C and releases at 46°C (same pattern as `tankBotHeaterBlock`). SOC has none: the tiers resume as soon as SOC reads 80%.
+- **Scope:** normal auto mode only. FORCE_ON and SOC_LIM manual modes have no reservation and are unaffected.
+- **Not applied** when the RTC is invalid or the tank-bottom sensor is faulted.
+- **With the 1500W start rule:** both apply, so with the W pump idle the heater needs export + battery charge ≥ 5000W to start, and stops below 3800W.
+- **2-port valve:** unchanged. While the heater is not running it makes no flow-path valve requests and `heaterWantsPower` is 0, so the 2-port follows the existing solar tracking in `updateSolarValves()` (3min heater latch, then mid-tank side when the W pump is ≥ 3% and hot pipe is 5°C below tank top).
+
+## H Controller — `solar_mode` and `flush` columns added to log.csv
+
+`log.csv` gains two columns appended after `w_rx_age_s` (43 columns total):
+- `solar_mode`: 0 = Tank+, 1 = Max (the `SolarTargetMode` value).
+- `flush`: H pump 100% bursts started since the previous row. 0 = none, 1 = 80°C+ flush burst (4s), 2 = 65–80°C imbalance pulse (0.5s), 3 = both. Latched on the rising edge of each burst and cleared when the row is written, so every burst is logged exactly once, in the first row after it starts, however short it is.
+
+`LOG_EXPECTED_COMMAS` 40 → 42, so on first boot with this firmware the header check fails and the existing `log.csv` on the SD card is deleted and restarted — copy it off first.
+
+## Tank+ targets use a tank reference: highest of top, bottom + 40°C, mid + 20°C
+
+In Tank+ mode both targets are now built from `tankRef = max(tankTop, tankBot + 40°C, tankMid + 20°C)` in place of tank top alone. A faulted bottom or mid sensor drops out of the max.
+
+- **W `solarTarget`:** `tankRef`, held within 50–85°C (85°C cap added: bottom + 40°C would otherwise exceed the Max-mode target once tank bottom passes 45°C).
+- **H `calcHPumpDuty()` target:** `tankRef + 3°C`, held within 60–85°C.
+
+Unchanged, still on real tank top: the W Tank+ start threshold (`min(tankTop, 80)`), W's force-to-0 comparisons (`hot/cold <= tankTop`, `hotPipe < tankTop`), the H 2-port tracking, and the H rule that Tank+ falls back to the Max curve when tank top > 75°C or faulted.
+
+## W Controller — Tank+ solar start threshold moved from tank top to tank mid
+
+In Tank+ mode the solar start trigger is now solar hot or cold ≥ `min(tankMid, 80°C)` (was `min(tankTop, 80°C)`), still held for 20s. If the mid sensor is faulted, tank top stands in. Max mode (80°C) is unchanged.
+
+The pump target and the force-to-0 tests are unchanged, so after an early start the pump sits at its 4% minimum until solar hot approaches the target, and the "pipes and hot pipe below tank top" rule can still hold it at 0% once the startup sequence has completed.
+
+## Logging — heater reason, available/reserved power, settings, W pump reason, UFH state
+
+`log.csv` gains 11 columns after `flush` (54 columns total; `LOG_EXPECTED_COMMAS` → 53, so the existing file is deleted and restarted on first boot — copy it off first).
+
+| Column | Meaning |
+|---|---|
+| `htr_reason` | Why the heater is off or limited (table below) |
+| `avail_w` | Power available for the heater after the reservation, as last evaluated (0 when not evaluated — see `htr_reason`) |
+| `reserve_w` | Battery/export reservation in force (0 in SOC-limited mode or when not evaluated) |
+| `sys_mode` | 0 = Winter, 1 = Summer |
+| `htr_mode` | 0 = Auto, 1 = SOC-limited, 2 = Force on |
+| `boost` | 0 = off, 1 = 5am, 2 = 8hr |
+| `solar_active` | W `solarPumpActive` (1 = solar loop active) |
+| `w_pump_reason` | Why the W solar pump is at its current duty (table below) |
+| `ufh_pump` | W UFH pump running |
+| `ufh_reached` | W reports workshop air target reached |
+| `morning_heat` | H morning/boost heating session active |
+
+**`htr_reason`** (`HeaterReason` in h_controller/main.cpp):
+
+| Code | Meaning |
+|---|---|
+| 0 | Running on surplus, not limited |
+| 1 | Off: heater disabled or grid outage |
+| 2 | Off: W solar sensor fault |
+| 3 | Off: overheat/element hard lockout (95°C manual lockout shows in `h_faults`) |
+| 4 | Off: import trip |
+| 5 | Off: hot tank protection (tank bottom > 83°C) |
+| 6 | Off: morning heat session |
+| 7 | Off: tank bottom ≥ 80°C |
+| 8 | Off: SOC-limited mode, SOC below threshold |
+| 9 | Off: no PV (< 200W) or Growatt data invalid |
+| 10 | Off: no surplus after the normal reservation |
+| 11 | Off: no surplus after the winter 3500W reservation |
+| 12 | Off: surplus below the 1500W start rule |
+| 13 | Off: below the normal start threshold, or inside the start delay |
+| 14 | Off: Winter system mode, waiting for export |
+| 20 | Running: waiting for flow-path valves |
+| 21 | Running: limited by hot-pipe cap |
+| 22 | Running: limited by heater-outlet cap |
+| 23 | Running: solar-surge hold |
+| 24 | Running: surplus below stop point, counting down to stop |
+| 30 | Force on (manual) |
+| 31 | Test, sim or calibration |
+
+Codes 22 and 23 are overlaid at log time because those limits act in the ISR after `updateHeaterDuty()` has chosen a level.
+
+**`w_pump_reason`** (`SolarPumpReason` in shared_types.h, new last byte of `WToHPacket`):
+
+| Code | Meaning |
+|---|---|
+| 0 | Running on the pump curve |
+| 1 | Not started (below start threshold) |
+| 2 | Past sunset |
+| 3 | Critical overheat ≥ 95°C |
+| 4 | Sensor-fault dump (100%) |
+| 5 | 0%: heater priority |
+| 6 | 0%: solar pipes and hot pipe below tank top |
+| 7 | 0%: no gain (hot/cold within 0.5°C for 5 min) |
+| 8 | 0%: 10s pause after overshoot |
+| 9 | 0%: stopped by H calibration |
+| 10 | 100%: cold-return flush, fast-rise or 60s kick override |
+| 11 | 0%: both solar pipes below tank bottom |
+| 12 | Winter mode frost protection |
+| 13 | Winter mode idle / end-of-day stop |
+| 14 | Winter 0%: solar hot below workshop air + 2°C or solar cold + 2°C |
+
+**Packet change:** `WToHPacket` grows by one byte. Both controllers check the payload length, so H and W must both be flashed with this build; with only one flashed, each rejects the other's packets and the link is down until the second is done.
+
+## W Controller — Tank+ mid-tank gain: run the pump below tank top once the heater has been off 10 min
+
+In Tank+ mode, once `heaterPowerPct` has been 0 for 10 minutes, solar hot **or** cold at or above mid-tank sets a `midGainActive` latch that suspends the "pipes and hot pipe below tank top" force-to-0 (`w_pump_reason` 6). The pump then runs on its normal curve (4% minimum), and H's existing 2-port tracking moves the 2-port to mid-tank (W pump ≥ 3%, hot pipe > 5°C below tank top), so the water enters below the hot layer.
+
+- **Latch release:** both solar hot and cold below mid-tank for 3 minutes continuously, or the heater firing, or Max mode. Latched rather than instantaneous because starting flow pulls the cold sensor down immediately and the hot sensor only sees collector water after the transit time.
+- **Low-differential timer reset:** on the latch engaging, the 5-minute no-gain timer (`w_pump_reason` 7) restarts, since stagnant pipes read cold ≥ hot and would otherwise hold the pump at 0% before flow could establish. If flow then shows no gain for 5 minutes the pump stops as before, and stays stopped while the latch remains set.
+- **2-port on mid-tank:** unchanged. The pump keeps running on its curve (≥ 4%) whatever the collector temperature, stopping only for no gain, sunset or 95°C; the latch only affects the heater-side "below tank top" hold.
+- A faulted mid-tank sensor uses tank top in its place, which makes the latch equivalent to the old rule.
+- For the first 10 minutes after a W boot the heater is treated as recently on, so the old behaviour applies.
+
+Unchanged: Max mode, heater-priority 0%, the sunset cutoff (table is 70–100 min ahead of true sunset — left as is), and the 80°C cold-return flush.
+
+## W Controller — solar pump 0% when both pipes are below tank bottom
+
+In summer solar logic, in both Tank+ and Max, the pump is forced to 0% whenever solar hot and solar cold are both below tank bottom (`w_pump_reason` 11). It applies with the 2-port in either position and regardless of heater state.
+
+- Uses the last tank-bottom value received from H even if the link is momentarily stale; skipped only if no H packet has ever been received or the tank-bottom sensor is faulted.
+- No hysteresis: the pump resumes as soon as either pipe reads at or above tank bottom.
+- The older tank-bottom stop in the same function is left in place but still never fires (it only acts at ≤ 1% and the pump curve's minimum is 4%).
+- H's cold-start valve routing (hot pipe < 40°C and > 3°C below tank bottom) is unchanged, but needs the W pump above 0% to engage, so it will now rarely be reached from this state.
+
+## H Controller — 2-port heater latch: 3min hold, release at tank top − 5°C
+
+After the heater stops, `updateSolarValves()` holds the 2-port on the heater side for 3min (was 15s), then moves it to mid-tank once the W pump is ≥ 3% and hot pipe is more than 5°C below tank top (was: any amount below tank top).
+
+- **Why the hold:** on cloudy days the heater cycles with the sun; 15s let the 2-port swing to mid and back on every short cloud.
+- **Why −5°C:** matches the normal tracking band (mid below −5°C, heater side above −1°C). The old release at 0°C could land inside the −1°C return band, so the valve went to mid and straight back to the heater side.
+- **Heater waiting for valves holds the 2-port:** the heater-side hold now applies whenever `heaterRunning` (heater wants power, including while waiting on its flow path), not only once it is firing. Before, the heater's flow-path request (heater side) and the tracking rule (mid-tank when W pump ≥ 3% and hot pipe < tank top − 5°C) reversed the valve on every packet: relay chatter, and the heater stayed in `HR_RUN_WAIT_VALVES` until the W pump dropped below 3% (18 Oct 2026: 11:57–12:02 and 16:51–17:10).
+
+## W Controller — external lights on at sunset while unlocked
+
+`updateExtLights()` drives D25 (230VAC external LED lights): ON when the workshop is unlocked, W has a time sync from H, and local time is at or past today's true sunset. OFF otherwise.
+
+- **Sunset:** new `kRealSunsetUtcMin[]` table (Alton, -0.833° altitude, BST-adjusted), e.g. 18:13 BST on 15 Oct, 15:57 GMT on 20 Dec.
+- **Off window:** the clock wraps at 00:00, so lights go off at midnight and stay off until the next sunset, even if still unlocked. Locking turns them off immediately.
+- **Fire alarm:** still overrides (250ms flash), then restores to `extLightsOn`.
+- **Existing `kSunsetUtcMin[]`** is the sun-at-10°-altitude time, not true sunset — comments corrected; solar end-of-day cutoff unchanged.
+- `security` debug command shows `ext_lights` state and today's sunset.
+
+## W Controller — Tank+ first-hour solar target: tank top − 2°C
+
+For 60min after the day's first solar start (the start sequence that runs once per day and re-arms at the 10° sun cutoff), the Tank+ `solarTarget` is `tank top − 2°C` (capped at 85°C, no 50°C floor) instead of the tank-reference target. After 60min it reverts to normal.
+
+- MAX mode unaffected. Tank-top sensor fault → normal target.
+- Restarts after a transient fault later in the day (`summerSeqDone` already set) don't re-arm the hour.
+
+## W Controller — end-of-day cutoff extended while solar hot > tank bottom + 8°C
+
+At the 10°-sun cutoff time, if the solar pump is already running and solar hot is more than 8°C above tank bottom, solar keeps running until that's no longer true, then cuts off as before.
+
+- Latched: once cut off it stays off until the clock wraps past midnight (no restart on a late warm blip).
+- Never starts solar after the cutoff — only extends a run already in progress.
+- Tank-bottom fault or RS485 data older than 10s → cuts off at the normal time.
+
+## Heater interlock on W UFH cold valve + W winter/summer mode handover
+
+- **H `heaterFlowPathOk()`:** heater now also requires W to report UFH cold **closed** (`VSTATE_UFH_COLD_OPEN` clear), in addition to solar cold open.
+- **W closes UFH cold when H's heater wants power** (`heaterWantsPower`), unless a morning UFH session, a solar dump (`solarDumpUFHOn`) or frost protection is active — H blocks the heater in those cases anyway. Covers frost protection leaving UFH cold open, and the mode-flip case below.
+- **W mode handover:** on any change of the mode H sends (incl. the winter PV-export override flipping to summer and back), W stops the solar pump, closes solar cold and UFH cold (UFH cold kept if a morning UFH session is active), and resets `summerPhase`/`summerSeqDone`/`frostProtActive`. The new mode's logic then starts from scratch. Skipped (except the sequence reset) while a solar dump is active.
+- Previously `summerSeqDone` was only reset by the summer evening cutoff, so if the winter override dropped back before the cutoff, the next day's override skipped the start sequence and UFH cold stayed open.
+- Flash both controllers together: new H with old W would block the heater whenever UFH cold was left open.
+
+## W Controller — external lights also on before sunrise
+
+`updateExtLights()` now treats both after true sunset and before true sunrise as dark (new `kRealSunriseUtcMin[]`, Alton, BST-adjusted — e.g. 07:29 BST on 18 Oct). Lights on = unlocked + time synced + dark. The 00:00 off rule is removed. `security` debug shows today's sunrise and sunset.
+
+## W Controller — workshop lock state persists across reboot
+
+Lock state is saved to EEPROM address 1 (`EEPROM_LOCK_STATE_ADDR`; 0 = unlocked, else locked) on every lock/unlock via `setWorkshopLocked()`. `powerUpSafeState()` re-drives the saved state instead of always pulsing lock: unlocked before a flash/power cut/WDT reset → unlocks on boot; locked → locks.
+
+- Blank EEPROM (0xFF) counts as locked, so the first boot after flashing this firmware still locks once.
+
+## W Controller — winter solar: start on hot or cold ≥ 21°C, 30 min stop hold, new pump curve, UFH boost
+
+Found 21 Oct: before the pump runs, solar cold reads hotter than solar hot (cold 27°C / hot 14°C at 13:30). The old 18°C hot-only trigger never fired, and when it did (17:04, hot 23.7 / cold 38.7) the end-of-day stop (hot − cold ≤ 2°C with PV < 350W) cut the pump in the same call it started.
+
+- **Start:** solar hot **or** solar cold ≥ 21°C (`SOLAR_HOT_MIN_C` 180 → 210).
+- **30 min start hold** (`WINTER_STOP_HOLD_MS`): for 30 min after winter solar starts, the end-of-day stop and the cold + 2°C cutoff below are ignored, so the loop can mix first.
+- **Pump curve** (replaces `calcPumpDuty(hot, 20°C)` in winter; summer unchanged):
+
+| Solar hot | Duty |
+|---|---|
+| < workshop air + 2°C | 0% |
+| < solar cold + 2°C (after the 30 min hold) | 0% |
+| workshop air + 2°C → 26°C | 4% → 100% linear |
+| ≥ 26°C (`WINTER_FULL_SPEED_C`) | 100% |
+
+The 0% rules are checked first. Workshop air sensor fault → last good reading is held (10°C if none since boot, i.e. 4% point at 12°C). New `w_pump_reason` 14 for the 0% case.
+- **No speed overrides in winter:** `applyPumpSpeedOverrides()` (fast-rise 100%, overshoot 10s pause, 60s kick, cold ≥ 80°C flush) now runs in summer only.
+- **Winter UFH boost** (`updateWinterUFHBoost()`): while winter solar is running, UFH pump on + UFH cold open when solar hot > 38°C, off below 37°C. Drops out on end-of-day stop, mode change (incl. PV override), solar hot sensor fault, `cal_pump`, or UFH hard lockout. The post-TMV > 45°C lockout now also covers the boost. On boost end the pump is left on if a morning UFH session or dump still needs it; the morning session no longer turns the pump off / closes UFH cold while the boost is on. Exempt from the heater-wants-power UFH cold close.
+- H needs no reflash (only the new enum value; H logs the number).
+

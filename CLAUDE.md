@@ -95,14 +95,13 @@ All addresses are filled in (commissioning complete for both controllers).
   - Levels 30% and 70% (old firmware) excluded automatically
 
 ## Commissioning TODOs
-- [ ] Calibrate `SOLAR_PUMP_MIN_CURRENT_A` (INA219, W controller)
+Kept permanently as-is (not TODOs): `SOLAR_PUMP_MIN_CURRENT_A = 0.20`, `VALVE_POWERUP_WAIT_MS = 30s`, W `calcPumpDuty()` curve.
+
 - [ ] Calibrate `FAN_MIN_DUTY_PCT` (W controller)
 - [ ] Calibrate `FAN_FLAP_OPEN_MS` (motorized damper travel time, W controller)
-- [ ] Verify `VALVE_POWERUP_WAIT_MS` (30s conservative, W controller)
-- [ ] Install MAX485 hardware and test RS485 inter-controller link end-to-end
-- [ ] Test Growatt Modbus on Serial2 (W controller, separate MAX485)
+- [x] Install MAX485 hardware and test RS485 inter-controller link end-to-end
+- [x] Test Growatt Modbus on Serial2 (W controller, separate MAX485)
 - [ ] Run `cal_pump` on H controller to derive H-pump duty calibration curve
-- [ ] Replace temporary `calcPumpDuty()` curve in W controller with data-derived version
 - [ ] Re-enable fire alarm (`FIRE_ALARM_ENABLED = false` at top of w_controller/main.cpp)
 
 ## Code conventions
