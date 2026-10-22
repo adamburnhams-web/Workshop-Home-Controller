@@ -1206,8 +1206,16 @@ Found 21 Oct: before the pump runs, solar cold reads hotter than solar hot (cold
 | workshop air + 2°C → 26°C | 4% → 100% linear |
 | ≥ 26°C (`WINTER_FULL_SPEED_C`) | 100% |
 
-The 0% rules are checked first. Workshop air sensor fault → last good reading is held (10°C if none since boot, i.e. 4% point at 12°C). New `w_pump_reason` 14 for the 0% case.
+During the 30 min start hold the pump runs at least 4% (a cold-side start leaves hot below air + 2°C, and with no flow it never warms). The 0% rules are otherwise checked first. Workshop air sensor fault → last good reading is held (10°C if none since boot, i.e. 4% point at 12°C). New `w_pump_reason` 14 for the 0% case.
 - **No speed overrides in winter:** `applyPumpSpeedOverrides()` (fast-rise 100%, overshoot 10s pause, 60s kick, cold ≥ 80°C flush) now runs in summer only.
 - **Winter UFH boost** (`updateWinterUFHBoost()`): while winter solar is running, UFH pump on + UFH cold open and solar pump held at 0% (`w_pump_reason` 15) from solar hot ≥ 35°C; below 30°C the UFH pump goes off and the solar pump curve resumes. Drops out on end-of-day stop, mode change (incl. PV override), solar hot sensor fault, `cal_pump`, or UFH hard lockout. The post-TMV > 45°C lockout now also covers the boost. On boost end the pump is left on if a morning UFH session or dump still needs it; the morning session no longer turns the pump off / closes UFH cold while the boost is on. Exempt from the heater-wants-power UFH cold close.
 - H needs no reflash (only the new enum value; H logs the number).
 
+
+## H Controller — tank valves not moved by winter solar
+
+`updateSolarValves()` now treats W solar as not running while H is in winter mode without the PV export override (`systemMode == MODE_WINTER && !pvExportOverride`), so winter solar (workshop UFH only) no longer opens the bottom-of-tank / log-burner-cold valves or moves the 2-port. With the override on, W runs summer solar and the valves work as before. When the override drops mid-run, the existing solar-stop path returns the valves to rest (log-burner cold and bottom closed unless a morning session is active, 2-port heater side). Overheat, hot-tank protection, morning session and dump valve handling are unchanged.
+
+## W Controller — vacuum pump not run by winter solar
+
+`updateVacuum()` now only counts the solar pump as a vacuum trigger when W is running summer solar (`lastH.systemMode == MODE_SUMMER`, which includes the PV export override). Winter solar no longer starts a vacuum cycle. A switch to summer solar starts one if it hasn't completed that day (`vacFullThisSession`, reset at midnight). The solar start-edge top-up (sensor already full → run anyway) is removed: one vacuum run per day. The winter UFH boost does not trigger a vacuum run. A morning UFH session (`WUFH_ACTIVE`/`WUFH_COOLING`) still starts a cycle if one hasn't completed that day.

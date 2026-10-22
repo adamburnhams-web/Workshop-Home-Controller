@@ -1111,20 +1111,17 @@ void updateFanControl() {
 // ============================================================
 
 void updateVacuum() {
-    bool heatingOrSolarActive = solarPumpActive || ufhState == WUFH_ACTIVE
+    // Winter solar only feeds the workshop UFH, so it doesn't call for vacuum; summer solar
+    // (incl. the PV export override) does, once a day.
+    bool summerSolar = solarPumpActive && hasHPacket && lastH.systemMode == MODE_SUMMER;
+    bool heatingOrSolarActive = summerSolar || ufhState == WUFH_ACTIVE
                                  || ufhState == WUFH_COOLING;
     bool vacSensorFull = (digitalRead(PIN_VAC_SENSOR) == LOW);
     unsigned long now  = millis();
 
-    // Solar start edge: if vacuum already full when solar kicks in, force a top-up run
-    static bool prevSolarActive = false;
-    bool solarJustStarted = !prevSolarActive && solarPumpActive;
-    prevSolarActive = solarPumpActive;
-
     switch (vacState) {
         case VAC_IDLE:
-            if ((heatingOrSolarActive && !vacFullThisSession)
-                || (solarJustStarted && vacSensorFull)) {
+            if (heatingOrSolarActive && !vacFullThisSession) {
                 digitalWrite(PIN_VAC_PUMP, RELAY_ON);
                 vacStateEnteredMs = now;
                 vacState = VAC_PUMP_START;
@@ -1301,6 +1298,8 @@ void updateWinterSolar(float tankBottomC) {
     if (hot < lowC || (!startHold && hot < cold + 2.0f)) duty = 0;
     else if (hot >= fullC)                               duty = 100;
     else duty = (uint8_t)(4.0f + (hot - lowC) / (fullC - lowC) * 96.0f);
+    // A cold-side start leaves hot below air+2; without flow it never warms and the loop sits at 0%.
+    if (startHold && duty < 4) duty = 4;
     float   wTarget   = (float)WINTER_UFH_TARGET_C / 10.0f;
     uint8_t finalDuty = duty; // summer speed overrides deliberately not applied in winter
     solarPumpReason = duty ? SPR_RUNNING : SPR_WINTER_LOW;

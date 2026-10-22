@@ -1412,7 +1412,10 @@ void updateSolarValves() {
     static bool          heaterLatch     = false;
     static unsigned long heaterStopMs    = 0;
 
-    bool solarRunning = hasWPkt && lastWPkt.solarPumpActive;
+    // Winter solar only feeds the workshop UFH, so the tank valves stay put. The PV export
+    // override puts W in summer solar, which does need them.
+    bool winterSolar  = systemMode == MODE_WINTER && !pvExportOverride;
+    bool solarRunning = hasWPkt && lastWPkt.solarPumpActive && !winterSolar;
 
     if (!solarRunning || morningHeatActive) {
         if (solarActive) {
