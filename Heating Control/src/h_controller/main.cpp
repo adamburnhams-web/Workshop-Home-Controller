@@ -306,6 +306,7 @@ unsigned long lastGridLossMs     = 0;
 bool gridOutageFault             = false;
 bool          pvExportOverride   = false; // true = PV export ≥500W for ≥60s in WINTER mode → allow heater + send MODE_SUMMER to W
 unsigned long pvExport500StartMs = 0;
+bool          airSummerOverride  = false; // true = workshop air reached 20°C in WINTER mode → same as pvExportOverride until midnight
 
 float         hPumpDuty        = 0.0f;
 bool          hPumpOutputState = false;
@@ -1414,7 +1415,7 @@ void updateSolarValves() {
 
     // Winter solar only feeds the workshop UFH, so the tank valves stay put. The PV export
     // override puts W in summer solar, which does need them.
-    bool winterSolar  = systemMode == MODE_WINTER && !pvExportOverride;
+    bool winterSolar  = systemMode == MODE_WINTER && !pvExportOverride && !airSummerOverride;
     bool solarRunning = hasWPkt && lastWPkt.solarPumpActive && !winterSolar;
 
     if (!solarRunning || morningHeatActive) {
@@ -1527,7 +1528,15 @@ void updateSolarValves() {
 // PV export override: in winter mode, when PV export >= 500W, tell W to run summer solar
 // logic by sending MODE_SUMMER in the H→W packet without changing the stored systemMode.
 void updatePVExportOverride() {
-    if (systemMode != MODE_WINTER) { pvExportOverride = false; pvExport500StartMs = 0; return; }
+    // Workshop already warm: winter solar has nothing left to do, so run summer until midnight.
+    static uint8_t airSummerDay = 0;
+    if (airSummerOverride && (!rtcValid || rtcNow.day() != airSummerDay)) airSummerOverride = false;
+    if (systemMode == MODE_WINTER && !airSummerOverride && rtcValid && hasWPkt
+            && lastWPkt.tempWorkshopAir != TEMP_FAULT && lastWPkt.tempWorkshopAir >= 200) {
+        airSummerOverride = true;
+        airSummerDay      = rtcNow.day();
+    }
+    if (systemMode != MODE_WINTER) { airSummerOverride = false; pvExportOverride = false; pvExport500StartMs = 0; return; }
     bool pvActive = lastWPkt.growattValid ? ((lastWPkt.pv1W + lastWPkt.pv2W) >= 200) : (rtcHour() < 21);
     if (!pvExportOverride) {
         if (lastWPkt.pvExportW >= 500) {
@@ -3138,7 +3147,7 @@ void sendHToWPacket(bool timeSyncReq) {
     pkt.twoPortHeaterSide = twoPortValve.isOpen ? 1 : 0;
     pkt.botTankOpen       = botTankValve.isOpen ? 1 : 0;
 
-    pkt.systemMode          = (uint8_t)(pvExportOverride ? MODE_SUMMER : systemMode);
+    pkt.systemMode          = (uint8_t)((pvExportOverride || airSummerOverride) ? MODE_SUMMER : systemMode);
     pkt.boostMode           = (uint8_t)boostMode;
     pkt.ufhStopTemp_dC      = (int16_t)(getUFHStopTemp() * 10.0f);
     pkt.morningHeatActive   = morningHeatActive ? 1 : 0;
@@ -3258,7 +3267,7 @@ static void pollRS485() {
             checkHeaterImportTrip(lastWPkt.gridImportW, lastWPkt.battSocPct, lastWPkt.battChargeW, lastWPkt.growattValid,
                                    lastWPkt.pv1W, lastWPkt.pv2W);
             // Winter mode: hold off heater until export has been ≥500W for ≥60s (battery charges to 100% first).
-            if (systemMode == MODE_WINTER && !pvExportOverride) {
+            if (systemMode == MODE_WINTER && !pvExportOverride && !airSummerOverride) {
                 heaterLevelIdx = 0; heaterRunning = false;
                 heaterReason = HR_OFF_WINTER_MODE; heaterAvailW = 0; heaterReserveW = 0;
             } else {
@@ -3361,6 +3370,7 @@ static void dbgMode() {
     Serial.print(F("  morning_heat: ")); Serial.println(morningHeatActive  ? F("active") : F("off"));
     Serial.print(F("  summer_phase: ")); Serial.println(summerStartupPhase);
     Serial.print(F("  pv_override:  ")); Serial.println(pvExportOverride   ? F("yes")    : F("no"));
+    Serial.print(F("  air_summer:   ")); Serial.println(airSummerOverride  ? F("yes")    : F("no"));
     Serial.print(F("  log_burner:   ")); Serial.println(logBurnerHot       ? F("HOT")    : F("cold"));
     if (simLogBurnerActive) Serial.println(F("  (log_burner SIM active)"));
     Serial.print(F("  heater:       ")); Serial.print(heaterRunning ? F("ON ") : F("off "));

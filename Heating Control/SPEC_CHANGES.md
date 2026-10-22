@@ -1219,3 +1219,11 @@ During the 30 min start hold the pump runs at least 4% (a cold-side start leaves
 ## W Controller — vacuum pump not run by winter solar
 
 `updateVacuum()` now only counts the solar pump as a vacuum trigger when W is running summer solar (`lastH.systemMode == MODE_SUMMER`, which includes the PV export override). Winter solar no longer starts a vacuum cycle. A switch to summer solar starts one if it hasn't completed that day (`vacFullThisSession`, reset at midnight). The solar start-edge top-up (sensor already full → run anyway) is removed: one vacuum run per day. The winter UFH boost does not trigger a vacuum run. A morning UFH session (`WUFH_ACTIVE`/`WUFH_COOLING`) still starts a cycle if one hasn't completed that day.
+
+## H Controller — winter mode switches to summer for the rest of the day at workshop air 20°C
+
+New `airSummerOverride`: in winter mode, once W reports workshop air ≥ 20.0°C, H behaves as if the PV export override were on until midnight (RTC day change): sends `MODE_SUMMER` to W (summer solar to the tank), allows the heater, and runs the tank solar valves. Stored `systemMode` is unchanged (display and `sys_mode` log column still show Winter). Not latched while the RTC is invalid or workshop air is faulted; cleared if the mode is set to Summer by hand. `mode` debug command shows `air_summer`.
+
+## W Controller — Tank+ first-start solar target: 30min at tank top
+
+The Tank+ first-start target after the day's first summer solar start (see "Tank+ first-hour solar target" above) now lasts 30min instead of 60min, and is `tank top` (capped at 85°C) instead of `tank top − 2°C`.

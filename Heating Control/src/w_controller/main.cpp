@@ -1734,12 +1734,12 @@ void updateSummerSolar() {
     // Determine pump target: solar hot vs target (tank reference, 50-85, or MAX 85 from H data)
     float solarTarget  = (tgtMode == SOLAR_MAX) ? 85.0f : constrain(tankRefC, 50.0f, 85.0f);
 
-    // First 60min after the day's first start: Tank+ chases tank top - 2°C (no 50°C
+    // First 30min after the day's first start: Tank+ chases tank top (no 50°C
     // floor) so the pump moves heat early instead of holding back for the full target.
-    bool firstHour = firstStartMs != 0 && millis() - firstStartMs < 3600000UL;
+    bool firstHour = firstStartMs != 0 && millis() - firstStartMs < 1800000UL;
     if (!firstHour) firstStartMs = 0;
     if (tgtMode != SOLAR_MAX && firstHour && !tankTopFault)
-        solarTarget = min(tankTopC - 2.0f, 85.0f);
+        solarTarget = min(tankTopC, 85.0f);
 
     // Cal override: H sets calPumpActive=1 and drives solarTarget remotely.
     // calSolarTargetC==0 during PRE_RAMP: stop pump so heater can heat up unimpeded.
