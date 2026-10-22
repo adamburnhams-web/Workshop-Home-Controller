@@ -1115,6 +1115,7 @@ Codes 22 and 23 are overlaid at log time because those limits act in the ISR aft
 | 12 | Winter mode frost protection |
 | 13 | Winter mode idle / end-of-day stop |
 | 14 | Winter 0%: solar hot below workshop air + 2°C or solar cold + 2°C |
+| 15 | Winter 0%: UFH pump carrying the flow (solar hot ≥ 35°C until < 30°C) |
 
 **Packet change:** `WToHPacket` grows by one byte. Both controllers check the payload length, so H and W must both be flashed with this build; with only one flashed, each rejects the other's packets and the link is down until the second is done.
 
@@ -1207,6 +1208,6 @@ Found 21 Oct: before the pump runs, solar cold reads hotter than solar hot (cold
 
 The 0% rules are checked first. Workshop air sensor fault → last good reading is held (10°C if none since boot, i.e. 4% point at 12°C). New `w_pump_reason` 14 for the 0% case.
 - **No speed overrides in winter:** `applyPumpSpeedOverrides()` (fast-rise 100%, overshoot 10s pause, 60s kick, cold ≥ 80°C flush) now runs in summer only.
-- **Winter UFH boost** (`updateWinterUFHBoost()`): while winter solar is running, UFH pump on + UFH cold open when solar hot > 38°C, off below 37°C. Drops out on end-of-day stop, mode change (incl. PV override), solar hot sensor fault, `cal_pump`, or UFH hard lockout. The post-TMV > 45°C lockout now also covers the boost. On boost end the pump is left on if a morning UFH session or dump still needs it; the morning session no longer turns the pump off / closes UFH cold while the boost is on. Exempt from the heater-wants-power UFH cold close.
+- **Winter UFH boost** (`updateWinterUFHBoost()`): while winter solar is running, UFH pump on + UFH cold open and solar pump held at 0% (`w_pump_reason` 15) from solar hot ≥ 35°C; below 30°C the UFH pump goes off and the solar pump curve resumes. Drops out on end-of-day stop, mode change (incl. PV override), solar hot sensor fault, `cal_pump`, or UFH hard lockout. The post-TMV > 45°C lockout now also covers the boost. On boost end the pump is left on if a morning UFH session or dump still needs it; the morning session no longer turns the pump off / closes UFH cold while the boost is on. Exempt from the heater-wants-power UFH cold close.
 - H needs no reflash (only the new enum value; H logs the number).
 

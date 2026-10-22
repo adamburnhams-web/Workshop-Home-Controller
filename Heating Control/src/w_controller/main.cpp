@@ -513,7 +513,7 @@ bool solarDumpUFHOn   = false; // UFH pump running for emergency solar dump; sen
 bool frostProtActive = false;
 bool frostProtUFHOpen = false;
 unsigned long winterSolarStartMs = 0;
-bool winterUFHBoost  = false; // winter: UFH pump on while solar hot > 38°C, off below 37°C
+bool winterUFHBoost  = false; // winter: UFH pump on (solar pump held at 0) from solar hot 35°C, off below 30°C
 
 // ============================================================
 //  MID-POINT LED
@@ -1304,6 +1304,10 @@ void updateWinterSolar(float tankBottomC) {
     float   wTarget   = (float)WINTER_UFH_TARGET_C / 10.0f;
     uint8_t finalDuty = duty; // summer speed overrides deliberately not applied in winter
     solarPumpReason = duty ? SPR_RUNNING : SPR_WINTER_LOW;
+    if (winterUFHBoost) {
+        finalDuty = 0;
+        solarPumpReason = SPR_WINTER_UFH;
+    }
     if (hasHPacket && lastH.heaterPowerPct > 0 && lastH.hPumpDutyPct >= finalDuty && hot < wTarget) {
         finalDuty = 0;
         solarPumpReason = SPR_HEATER_PRIO;
@@ -1996,7 +2000,7 @@ void updateUFHHeating() {
 // Runs before updateUFHHeating() so the post-TMV overheat lockout there covers the boost.
 void updateWinterUFHBoost(bool winterSolarRunning) {
     float hot  = sTemp[SENSOR_SOLAR_HOT];
-    bool  want = winterUFHBoost ? (hot >= 37.0f) : (hot > 38.0f);
+    bool  want = winterUFHBoost ? (hot >= 30.0f) : (hot >= 35.0f);
     if (!winterSolarRunning || sFault[SENSOR_SOLAR_HOT] || ufhHardLockout) want = false;
 
     if (want) {

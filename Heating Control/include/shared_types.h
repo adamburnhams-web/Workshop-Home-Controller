@@ -50,7 +50,8 @@ enum SolarPumpReason : uint8_t {
     SPR_BELOW_BOT      = 11,  // 0%: both solar pipes below tank bottom
     SPR_FROST          = 12,  // winter mode frost protection
     SPR_WINTER_IDLE    = 13,  // winter mode, trigger not met or end-of-day stop
-    SPR_WINTER_LOW     = 14   // winter 0%: hot below workshop air+2 or solar cold+2
+    SPR_WINTER_LOW     = 14,  // winter 0%: hot below workshop air+2 or solar cold+2
+    SPR_WINTER_UFH     = 15   // winter 0%: UFH pump carrying the flow (solar hot >= 35°C)
 };
 
 enum WinchState : uint8_t {
