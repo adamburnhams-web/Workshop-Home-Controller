@@ -23,7 +23,7 @@
 // ============================================================
 
 // Digital inputs
-#define PIN_PIR              2   // INT4 — 15VDC output via 10k/4.7k divider
+#define PIN_PIR              2   // INT4 — dry contact, pull-up; LOW=motion
 #define PIN_DOOR_HANDLE      3   // INT5 — dry contact, pull-up, closes when pushed
 #define PIN_DOOR_REED        4   // dry contact, pull-up; LOW=door open, HIGH=closed
 #define PIN_WINCH_REED_OPEN  5   // pull-up; LOW=fully open
@@ -49,6 +49,7 @@
 #define PIN_UFH_COLD_DIR    22   // even ch1: SPDT direction relay, NO=open, NC=close
 // D23: spare (odd ch1)
 #define PIN_ALARM_SOUNDER   26   // even ch3: alarm sounder at W
+#define PIN_INT_LIGHTS      23   // odd  ch1: internal workshop lights
 #define PIN_EXT_LIGHTS      25   // odd  ch2: external LED lights
 #define PIN_SOLAR_COLD_DIR  24   // even ch2: SPDT direction relay
 #define PIN_WALL_FAN        27   // odd  ch3: wall axial fan (BES speed controller)
@@ -85,6 +86,8 @@
 
 // Set false to re-enable once workshop air sensor is trusted
 static const bool FIRE_ALARM_ENABLED = false;
+// Temporary block: buzzer at H not in use yet, relay stays off. See SPEC_CHANGES.md
+static const bool BUZZER_ENABLED = false;
 
 // ============================================================
 //  COMMISSIONING CONSTANTS — must be verified on-site
@@ -133,7 +136,8 @@ static const uint16_t VALVE_POWERUP_WAIT_MS = 30000;
 #define FROST_STOP_C         80   // 8.0°C — frost protection stop
 #define UFH_PUMP_OFF_C      280   // 28.0°C — stop UFH pump when supply drops here
 #define UFH_OVERHEAT_C      450   // 45.0°C — hard lockout trigger
-#define RELOCK_TIMEOUT_MS  300000UL  // 5 minutes
+#define RELOCK_TIMEOUT_MS  600000UL  // 10 minutes
+#define RELOCK_GRACE_MS    600000UL  // PIR within 10 min of an auto-lock unlocks again
 #define ALARM_DURATION_MS   60000UL  // 1-minute alarm auto-stop
 #define HANDLE_ALERT_NIGHT_MIN_MS 10000UL
 #define INTER_CTRL_POLL_MS  250UL
@@ -155,6 +159,9 @@ static const uint16_t VALVE_POWERUP_WAIT_MS = 30000;
 #define TIME_SYNC_INTERVAL_MS 3600000UL // 1 hour
 #define EEPROM_FAN_BASE_ADDR 0       // EEPROM address for fan base speed
 #define EEPROM_LOCK_STATE_ADDR 1     // 0 = unlocked; anything else (incl. blank 0xFF) = locked
+#define EEPROM_VAC_LAST_DAY_ADDR 2   // uint16 day number of last completed vacuum cycle (2 bytes)
+#define EEPROM_HANDLE_TRIED_ADDR 4   // h,m,s of first night handle push (3 bytes); h 0xFF = none
+#define EEPROM_HANDLE_SEQ_ADDR   7   // next handle push seq — kept across reboots so it can't match H's last ack
 
 // ============================================================
 //  GLOBAL OBJECTS
@@ -442,6 +449,42 @@ bool         workshopLocked      = true;
 void setWorkshopLocked(bool locked) {
     workshopLocked = locked;
     EEPROM.update(EEPROM_LOCK_STATE_ADDR, locked ? 1 : 0);
+}
+// Persisted so the night handle fault survives a W reboot until the user resets faults
+uint8_t handleTriedHour = 0xFF, handleTriedMin = 0, handleTriedSec = 0;
+void setHandleTried(uint8_t h, uint8_t m, uint8_t sec) {
+    handleTriedHour = h; handleTriedMin = m; handleTriedSec = sec;
+    EEPROM.update(EEPROM_HANDLE_TRIED_ADDR,     h);
+    EEPROM.update(EEPROM_HANDLE_TRIED_ADDR + 1, m);
+    EEPROM.update(EEPROM_HANDLE_TRIED_ADDR + 2, sec);
+}
+struct HandleEvt { unsigned long downMs, upMs; uint8_t seq; bool locked; };
+static const uint8_t HANDLE_Q_SIZE = 8;
+HandleEvt handleQ[HANDLE_Q_SIZE];
+uint8_t   handleQHead = 0, handleQCount = 0;
+uint8_t   handleNextSeq = 1;
+
+// Returns true once per debounced up -> down. The boot state is taken as-is, so a handle
+// already stuck down isn't seen as a push until it has come back up.
+bool updateHandleLog(bool rawDown, unsigned long now) {
+    static bool started = false, lastRaw = false, stable = false, downLocked = false;
+    static unsigned long changeMs = 0, downMs = 0;
+    if (!started) { started = true; lastRaw = stable = rawDown; changeMs = now; return false; }
+    if (rawDown != lastRaw) { lastRaw = rawDown; changeMs = now; }
+    if (rawDown == stable || now - changeMs < 50UL) return false;
+    stable = rawDown;
+    if (stable) {
+        downLocked = workshopLocked;
+        downMs     = changeMs;
+        return true;
+    }
+    if (handleQCount < HANDLE_Q_SIZE) {
+        handleQ[(handleQHead + handleQCount) % HANDLE_Q_SIZE] = { downMs, changeMs, handleNextSeq, downLocked };
+        handleQCount++;
+        if (++handleNextSeq == 0) handleNextSeq = 1;
+        EEPROM.update(EEPROM_HANDLE_SEQ_ADDR, handleNextSeq);
+    }
+    return false;
 }
 unsigned long relockTimerStartMs  = 0;
 bool          relockTimerActive   = false;
@@ -1110,12 +1153,31 @@ void updateFanControl() {
 //  VACUUM SYSTEM
 // ============================================================
 
+static uint16_t dayOfYearForSunset(uint8_t month, uint8_t day);
+
+// Days since 2000-01-01 (year held as year - 2000, 2000-2099 only).
+static uint16_t dayNumber(uint8_t yy, uint8_t m, uint8_t d) {
+    uint16_t n = yy * 365u + (yy + 3) / 4 + dayOfYearForSunset(m, d);
+    if (yy % 4 == 0 && (m > 2 || (m == 2 && d == 29))) n++;
+    return n;
+}
+
+// No cycle today or yesterday. Blank EEPROM (0xFFFF) or a date ahead of the
+// clock reads as never run.
+static bool vacOverdue() {
+    uint16_t last;
+    EEPROM.get(EEPROM_VAC_LAST_DAY_ADDR, last);
+    uint16_t today = dayNumber(curYear, curMonth, curDay);
+    return last > today || today - last >= 2;
+}
+
 void updateVacuum() {
     // Winter solar only feeds the workshop UFH, so it doesn't call for vacuum; summer solar
     // (incl. the PV export override) does, once a day.
     bool summerSolar = solarPumpActive && hasHPacket && lastH.systemMode == MODE_SUMMER;
     bool heatingOrSolarActive = summerSolar || ufhState == WUFH_ACTIVE
-                                 || ufhState == WUFH_COOLING;
+                                 || ufhState == WUFH_COOLING
+                                 || (!workshopLocked && timeSynced && vacOverdue());
     bool vacSensorFull = (digitalRead(PIN_VAC_SENSOR) == LOW);
     unsigned long now  = millis();
 
@@ -1173,6 +1235,7 @@ void updateVacuum() {
             if (now - vacDoneStartMs >= 10000UL) {
                 digitalWrite(PIN_VAC_PUMP, RELAY_OFF);
                 vacFullThisSession = true;
+                if (timeSynced) EEPROM.put(EEPROM_VAC_LAST_DAY_ADDR, dayNumber(curYear, curMonth, curDay));
                 vacState = VAC_IDLE;
             }
             break;
@@ -1264,18 +1327,21 @@ void updateWinterSolar(float tankBottomC) {
     bool startHold  = solarPumpActive && millis() - winterSolarStartMs < WINTER_STOP_HOLD_MS;
 
     if (!triggerMet) {
-        if (!solarPumpActive) solarPumpReason = SPR_WINTER_IDLE;
-        if (solarPumpActive && !startHold) {
-            // Stop on end-of-day: low diff + low PV
-            if ((hot - cold) <= 2.0f && pvLow) {
-                solarColdValve.setClose();
-                resetSolarPumpOverrides();
-                setSolarPumpDuty(0);
-                solarPumpActive = false;
-                solarPumpReason = SPR_WINTER_IDLE;
-            }
+        if (!solarPumpActive) {
+            solarPumpReason = SPR_WINTER_IDLE;
+            return;
         }
-        return;
+        // Stop on end-of-day: low diff + low PV
+        if (!startHold && (hot - cold) <= 2.0f && pvLow) {
+            solarColdValve.setClose();
+            resetSolarPumpOverrides();
+            setSolarPumpDuty(0);
+            solarPumpActive = false;
+            solarPumpReason = SPR_WINTER_IDLE;
+            return;
+        }
+        // Still running: fall through so the speed is set every pass. Returning here left
+        // the last duty in place, so a one-sample 100% stall kick stuck until hot reached 21°C.
     }
 
     if (!solarPumpActive) {
@@ -2027,12 +2093,27 @@ void getCurrentTime(uint8_t &h, uint8_t &m) {
     m = (uint8_t)((totalSec % 3600) / 60);
 }
 
+uint8_t getCurrentSecond() {
+    unsigned long elapsed = (millis() - timeBaseMs) / 1000UL;
+    return (uint8_t)((curSecond + elapsed) % 60);
+}
+
 void updateExtLights() {
     uint8_t h, m; getCurrentTime(h, m);
     uint16_t now = (uint16_t)h * 60 + m;
     bool dark = now >= realSunsetLocalMinutes() || now < realSunriseLocalMinutes();
     extLightsOn = timeSynced && !workshopLocked && dark;
     if (!fireAlarmActive) digitalWrite(PIN_EXT_LIGHTS, extLightsOn ? RELAY_ON : RELAY_OFF);
+}
+
+// Held on for 30s after locking so there's light to leave by
+void updateIntLights() {
+    static unsigned long lastUnlockedMs = 0;
+    static bool          everUnlocked   = false;
+    unsigned long now = millis();
+    if (!workshopLocked) { lastUnlockedMs = now; everUnlocked = true; }
+    bool on = everUnlocked && now - lastUnlockedMs < 30000UL;
+    digitalWrite(PIN_INT_LIGHTS, on ? RELAY_ON : RELAY_OFF);
 }
 
 bool isNightHours() {
@@ -2043,10 +2124,10 @@ bool isNightHours() {
 void updateSecurity() {
 #ifdef DEBUG_SERIAL
     bool doorOpen     = simDoorActive    ? simDoorVal    : (digitalRead(PIN_DOOR_REED)       == LOW);
-    bool pirActive    = simPIRActive     ? simPIRVal     : (digitalRead(PIN_PIR)              == HIGH);
+    bool pirActive    = simPIRActive     ? simPIRVal     : (digitalRead(PIN_PIR)              == LOW);
 #else
     bool doorOpen     = (digitalRead(PIN_DOOR_REED) == LOW);
-    bool pirActive    = (digitalRead(PIN_PIR)        == HIGH);
+    bool pirActive    = (digitalRead(PIN_PIR)        == LOW);
 #endif
     gDoorOpen = doorOpen;
     bool manualSupp   = (digitalRead(PIN_MANUAL_RELOCK) == LOW); // LOW = suppression ON
@@ -2066,7 +2147,7 @@ void updateSecurity() {
 
     // Unlock button: pulse door lock open
     static bool prevUnlockBtn = false;
-    if (unlockBtn && !prevUnlockBtn && workshopLocked) {
+    if (unlockBtn && !prevUnlockBtn && workshopLocked && !(hasHPacket && lastH.holidayMode)) {
         doorLock.request(true);
         setWorkshopLocked(false);
     }
@@ -2081,7 +2162,34 @@ void updateSecurity() {
     }
     prevLockSw = lockSw;
 
-    relockTimerActive = false; // relock only via D11 lock switch
+    // Auto-lock: door closed, stay-unlocked switch off and no PIR for RELOCK_TIMEOUT_MS
+    static bool          autoLockGrace = false;
+    static unsigned long autoLockedMs  = 0;
+    if (!workshopLocked && !doorOpen && !manualSupp && !pirActive) {
+        if (!relockTimerActive) {
+            relockTimerActive  = true;
+            relockTimerStartMs = now;
+        } else if (now - relockTimerStartMs >= RELOCK_TIMEOUT_MS) {
+            doorLock.request(false);
+            setWorkshopLocked(true);
+            relockTimerActive = false;
+            autoLockGrace     = true;
+            autoLockedMs      = now;
+        }
+    } else {
+        relockTimerActive = false;
+    }
+
+    // Someone still inside after an auto-lock: unlock instead of raising the intruder alarm
+    if (autoLockGrace) {
+        if (!workshopLocked || now - autoLockedMs >= RELOCK_GRACE_MS) {
+            autoLockGrace = false;
+        } else if (pirActive) {
+            doorLock.request(true);
+            setWorkshopLocked(false);
+            autoLockGrace = false;
+        }
+    }
 
     // Intruder alert: PIR while locked
     static bool prevPIR = false;
@@ -2104,6 +2212,15 @@ void updateSecurity() {
         if (!pirActive) { buzzerActive = false; }
     }
     prevPIR = pirActive;
+
+    bool handlePushed = updateHandleLog(handleDown, now);
+    if (handlePushed && workshopLocked && timeSynced && !hasFault(FAULT_W_HANDLE_TRIED)) {
+        uint8_t h, m; getCurrentTime(h, m);
+        if (h >= 22 || h < 7) {
+            setHandleTried(h, m, getCurrentSecond());
+            setFault(FAULT_W_HANDLE_TRIED);
+        }
+    }
 
     // Door handle alert
     if (workshopLocked && handleDown) {
@@ -2133,7 +2250,7 @@ void updateSecurity() {
                  || hasFault(FAULT_W_SOLAR_PUMP)
                  || fireAlarmActive;
 
-    digitalWrite(PIN_BUZZER_SIGNAL, buzzerActive ? RELAY_ON : RELAY_OFF);
+    digitalWrite(PIN_BUZZER_SIGNAL, (BUZZER_ENABLED && buzzerActive) ? RELAY_ON : RELAY_OFF);
     doorLock.update();
 }
 
@@ -2545,7 +2662,7 @@ void sendWToHPacket() {
 
     pkt.workshopLocked   = workshopLocked ? 1 : 0;
     pkt.doorOpen         = (digitalRead(PIN_DOOR_REED)    == LOW) ? 1 : 0;
-    pkt.pirActive        = (digitalRead(PIN_PIR)           == HIGH) ? 1 : 0;
+    pkt.pirActive        = (digitalRead(PIN_PIR)           == LOW) ? 1 : 0;
     pkt.manualRelockOn   = (digitalRead(PIN_MANUAL_RELOCK) == LOW)  ? 1 : 0;
     pkt.vacPumpRunning   = (digitalRead(PIN_VAC_PUMP) == HIGH) ? 1 : 0;
     pkt.vacSensorFull    = (digitalRead(PIN_VAC_SENSOR) == LOW)  ? 1 : 0;
@@ -2569,6 +2686,21 @@ void sendWToHPacket() {
     pkt.rs485RxGood        = rs485RxGood;
     pkt.rs485RxBadFrame    = rs485RxBadFrame;
     pkt.solarPumpReason    = solarPumpReason;
+    pkt.handleTriedHour    = handleTriedHour;
+    pkt.handleTriedMin     = handleTriedMin;
+    pkt.handleTriedSec     = handleTriedSec;
+    if (handleQCount) {
+        HandleEvt &e = handleQ[handleQHead];
+        pkt.handleEvtSeq    = e.seq;
+        pkt.handleEvtDurMs  = e.upMs - e.downMs;
+        pkt.handleEvtUpAgoS = (millis() - e.upMs) / 1000UL;
+        pkt.handleEvtLocked = e.locked ? 1 : 0;
+    } else {
+        pkt.handleEvtSeq    = 0;
+        pkt.handleEvtDurMs  = 0;
+        pkt.handleEvtUpAgoS = 0;
+        pkt.handleEvtLocked = 0;
+    }
     {
         uint32_t ageMs = millis() - lastRxMs;
         pkt.rs485RxAgeS = (uint16_t)min(ageMs / 1000UL, 65535UL);
@@ -2655,10 +2787,23 @@ void receiveHToWPacket() {
             }
 
             // Alert reset acknowledgement
+            // First packet after W boot only syncs the seq; a drop to 0 is H rebooting,
+            // not a user reset — either would otherwise wipe the persisted handle fault
+            static bool alertSeqKnown = false;
             if (lastH.alertResetSeq != lastAlertResetSeq) {
+                if (alertSeqKnown && lastH.alertResetSeq != 0) {
+                    clearFault(FAULT_W_HANDLE_TRIED);
+                    setHandleTried(0xFF, 0, 0);
+                }
                 lastAlertResetSeq = lastH.alertResetSeq;
                 // Clear all LED-persistent faults (condition must have cleared separately)
                 // The fault conditions themselves are re-evaluated each loop
+            }
+            alertSeqKnown = true;
+
+            if (handleQCount && lastH.handleEvtAck == handleQ[handleQHead].seq) {
+                handleQHead = (handleQHead + 1) % HANDLE_Q_SIZE;
+                handleQCount--;
             }
 
             // Manual valve override from H
@@ -2677,9 +2822,6 @@ void receiveHToWPacket() {
     // Timeout — no valid packet received
     missedPackets++;
     rs485RxMiss++;
-#ifdef DEBUG_SERIAL
-    Serial.print('.');   // live, no threshold — one dot per ~200ms miss; wire-wiggle test aid
-#endif
     if (millis() - lastRxMs >= COMMS_FAULT_TIMEOUT_MS && !rs485CommsFault) {
         rs485CommsFault = true;
         setFault(FAULT_W_RS485_COMMS);
@@ -2767,6 +2909,7 @@ WF(FAULT_W_SOLAR_OVERHEAT_HOT,   "SOLAR_OVERHEAT_HOT")
     WF(FAULT_W_GROWATT_COMMS,         "SDM230_COMMS")
     WF(FAULT_W_RS485_COMMS,          "RS485_COMMS")
     WF(FAULT_W_WINCH_OVER_OPEN,      "WINCH_OVER_OPEN")
+    WF(FAULT_W_HANDLE_TRIED,         "HANDLE_TRIED")
     WF(FAULT_W_SENSOR_SOLAR_HOT,     "SENSOR_SOLAR_HOT")
     WF(FAULT_W_SENSOR_SOLAR_COLD,    "SENSOR_SOLAR_COLD")
     WF(FAULT_W_SENSOR_UFH_SUPPLY,    "SENSOR_UFH_SUPPLY")
@@ -2795,6 +2938,7 @@ static void dbgMode() {
     Serial.print(F("  ufh_state:   ")); Serial.println(ufhState);
     Serial.print(F("  ufh_lockout: ")); Serial.println(ufhHardLockout ? F("YES") : F("no"));
     Serial.print(F("  vac_state:   ")); Serial.println(vacState);
+    Serial.print(F("  vac_overdue: ")); Serial.println(timeSynced && vacOverdue() ? F("yes") : F("no"));
     Serial.print(F("  workshop:    ")); Serial.println(workshopLocked ? F("locked") : F("unlocked"));
     Serial.print(F("  rs485:       ")); Serial.println(rs485CommsFault ? F("FAULT") : F("ok"));
     Serial.print(F("  time_synced: ")); Serial.println(timeSynced ? F("yes") : F("no"));
@@ -2857,11 +3001,19 @@ static void dbgSecurity() {
     Serial.print(F("  lock_sw:    ")); Serial.println(digitalRead(PIN_LOCK_SW) == HIGH ? F("ON") : F("off"));
     Serial.print(F("  led_pin:    ")); Serial.println(digitalRead(PIN_MIDPOINT_LED) == RELAY_OFF ? F("OFF(ok)") : F("ON(masked)"));
     Serial.print(F("  door:       ")); Serial.println((digitalRead(PIN_DOOR_REED)       == LOW)  ? F("OPEN")   : F("closed"));
-    Serial.print(F("  pir:        ")); Serial.println((digitalRead(PIN_PIR)              == HIGH) ? F("ACTIVE") : F("clear"));
+    Serial.print(F("  handle:     ")); Serial.println((digitalRead(PIN_DOOR_HANDLE)     == LOW)  ? F("DOWN")   : F("up"));
+    Serial.print(F("  hold_off:   ")); Serial.println((digitalRead(PIN_MANUAL_RELOCK)   == LOW)  ? F("ON")     : F("off"));
+    Serial.print(F("  pir:        ")); Serial.println((digitalRead(PIN_PIR)              == LOW) ? F("ACTIVE") : F("clear"));
+    if (handleTriedHour < 24) {
+        char buf[40];
+        snprintf(buf, sizeof(buf), "  handle_tried: %02u:%02u:%02u (%u queued)",
+                 handleTriedHour, handleTriedMin, handleTriedSec, handleQCount);
+        Serial.println(buf);
+    }
     Serial.print(F("  winch_cls:  ")); Serial.println((digitalRead(PIN_WINCH_REED_CLOSE) == HIGH)  ? F("CLOSED") : F("open"));
     Serial.print(F("  winch_lock: ")); Serial.println((digitalRead(PIN_WINCH_REED_LOCK)  == HIGH)  ? F("LOCKED") : F("clear"));
     Serial.print(F("  alarm:      ")); Serial.println(alarmActive  ? F("ACTIVE") : F("off"));
-    Serial.print(F("  buzzer:     ")); Serial.println(buzzerActive ? F("on")     : F("off"));
+    Serial.print(F("  buzzer:     ")); Serial.print(buzzerActive ? F("on")     : F("off")); Serial.println(BUZZER_ENABLED ? F("") : F(" (relay blocked)"));
     if (simDoorActive)      { Serial.print(F("  SIM door=")); Serial.println(simDoorVal); }
     if (simPIRActive)       { Serial.print(F("  SIM pir=")); Serial.println(simPIRVal); }
     if (simWinchClsActive)  { Serial.print(F("  SIM winch_cls=")); Serial.println(simWinchClsVal); }
@@ -3134,6 +3286,7 @@ void powerUpSafeState() {
     digitalWrite(PIN_WALL_FAN,       RELAY_OFF);
     digitalWrite(PIN_FAN_FLAP,       RELAY_OFF);
     digitalWrite(PIN_EXT_LIGHTS,     RELAY_OFF);
+    digitalWrite(PIN_INT_LIGHTS,     RELAY_OFF);
     digitalWrite(PIN_VAC_PUMP,       RELAY_OFF);
     digitalWrite(PIN_ALARM_SOUNDER,  RELAY_OFF);
     digitalWrite(PIN_BUZZER_SIGNAL,  RELAY_OFF);
@@ -3162,6 +3315,7 @@ void setup() {
     pinMode(PIN_FAN_FLAP,        OUTPUT); digitalWrite(PIN_FAN_FLAP,        RELAY_OFF);
     pinMode(PIN_DOOR_LOCK_A,     OUTPUT); digitalWrite(PIN_DOOR_LOCK_A,     RELAY_OFF);
     pinMode(PIN_EXT_LIGHTS,      OUTPUT); digitalWrite(PIN_EXT_LIGHTS,      RELAY_OFF);
+    pinMode(PIN_INT_LIGHTS,      OUTPUT); digitalWrite(PIN_INT_LIGHTS,      RELAY_OFF);
     pinMode(PIN_WINCH_DIR_OPEN,  OUTPUT); digitalWrite(PIN_WINCH_DIR_OPEN,  RELAY_OFF);
     pinMode(PIN_WINCH_POWER,     OUTPUT); digitalWrite(PIN_WINCH_POWER,     RELAY_OFF);
     pinMode(PIN_WINCH_DIR_CLOSE, OUTPUT); digitalWrite(PIN_WINCH_DIR_CLOSE, RELAY_OFF);
@@ -3180,7 +3334,7 @@ void setup() {
     pinMode(PIN_SOLAR_PUMP,      OUTPUT); digitalWrite(PIN_SOLAR_PUMP,      LOW);        // MOSFET gate, not relay
 
     // Input pins
-    pinMode(PIN_PIR,             INPUT);  // voltage divider, no pull-up
+    pinMode(PIN_PIR,             INPUT_PULLUP);
     pinMode(PIN_DOOR_HANDLE,     INPUT_PULLUP);
     pinMode(PIN_DOOR_REED,       INPUT_PULLUP);
     pinMode(PIN_WINCH_REED_OPEN, INPUT_PULLUP);
@@ -3239,6 +3393,17 @@ void setup() {
     uint8_t storedBase = EEPROM.read(EEPROM_FAN_BASE_ADDR);
     if (storedBase <= 100) fanBaseSpeedPct = storedBase;
 
+    handleNextSeq = EEPROM.read(EEPROM_HANDLE_SEQ_ADDR);
+    if (handleNextSeq == 0) handleNextSeq = 1;
+
+    uint8_t th = EEPROM.read(EEPROM_HANDLE_TRIED_ADDR);
+    if (th < 24) {
+        handleTriedHour = th;
+        handleTriedMin  = EEPROM.read(EEPROM_HANDLE_TRIED_ADDR + 1);
+        handleTriedSec  = EEPROM.read(EEPROM_HANDLE_TRIED_ADDR + 2);
+        setFault(FAULT_W_HANDLE_TRIED);
+    }
+
     // Packet receiver reset
     pktRx.reset();
 
@@ -3291,6 +3456,7 @@ void loop() {
     // Security
     updateSecurity();
     updateExtLights();
+    updateIntLights();
 
     // INA219 current sampling (during pump ON period)
     sampleSolarPumpCurrent();

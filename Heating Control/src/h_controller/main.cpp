@@ -101,6 +101,7 @@ static const bool HEATER_ENABLED = true;
 #define EE_DISPLAY_BRIGHT    3   // uint8_t 10–100 %
 #define EE_FAN_BASE_SPEED    4   // uint8_t 0–100 % (also written by W via its own EEPROM)
 #define EE_BST_STATE         5   // uint8_t: 0=GMT applied, 1=BST applied, other=uninitialized
+#define EE_HOLIDAY_MODE      6   // uint8_t bool
 
 // ============================================================
 //  SYSTEM CONSTANTS
@@ -120,6 +121,12 @@ static const bool HEATER_ENABLED = true;
 #define BUS_PSU_ON_DELAY_MS     5000UL   // 5s before PSU turns on
 #define BUS_RESTORE_THRESH_DV   140      // 14.0V
 #define BUS_LOW_DELAY_MS        10000UL  // 10s before fault
+// Early warning of a dead supply with the bus running down on its battery. From the logs
+// (Jul-Oct 2026): normal 5-min averages never went below 14.98V, and both supply losses
+// stayed under 14.9V for 64-89 min before reaching 14.0V.
+#define BUS_FALLING_THRESH_DV   149      // 14.9V
+#define BUS_FALLING_DELAY_MS    300000UL // 5 min below before fault
+#define BUS_FALLING_RESET_MS    30000UL  // 30s back above resets; single readings jitter across 14.9V while falling
 #define HEATER_RATED_W          3000     // immersion element rated power
 #define ENERGY_LOG_INTERVAL_MS  300000UL // 5 min SD flush of daily kWh totals
 
@@ -296,7 +303,7 @@ int16_t heaterReserveW = 0;       // battery/export reservation in force, as las
 bool winterLowSocReserve = false; // SOC <80% and tank bottom <45°C on / 46°C off, winter half-year only, see updateHeaterDuty()
 bool          importTripActive   = false;
 unsigned long importHighStartMs  = 0;
-unsigned long importZeroStartMs  = 0;
+uint8_t       importZeroPkts     = 0;  // consecutive W packets with import <= 0W while tripped
 uint8_t       dawnHoldDay        = 0;     // day-of-month the dawn hold last opened (0 = never)
 bool          dawnHoldActive     = false;
 unsigned long dawnPvHighStartMs  = 0;
@@ -306,7 +313,7 @@ unsigned long lastGridLossMs     = 0;
 bool gridOutageFault             = false;
 bool          pvExportOverride   = false; // true = PV export ≥500W for ≥60s in WINTER mode → allow heater + send MODE_SUMMER to W
 unsigned long pvExport500StartMs = 0;
-bool          airSummerOverride  = false; // true = workshop air reached 20°C in WINTER mode → same as pvExportOverride until midnight
+bool          airSummerOverride  = false; // true = workshop air above 18.0°C in WINTER mode → same as pvExportOverride until midnight
 
 float         hPumpDuty        = 0.0f;
 bool          hPumpOutputState = false;
@@ -398,6 +405,7 @@ static uint16_t heaterLevelPct10() {
 }
 
 uint8_t rtcHour();   // defined after RTC section
+bool clockIsBST();   // defined after RTC section
 uint8_t rtcMinute(); // defined after RTC section
 uint8_t rtcSecond(); // defined after RTC section
 extern bool     rtcValid; // defined after RTC section
@@ -512,22 +520,25 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
         int16_t battChgW   = lastWPkt.battChargeW;
         // SOC > 95%: battery full, no reservation at all.
         // Otherwise, time-of-day tiers (SOC threshold tightens as the day's solar
-        // window narrows, so heater takes more of the export later in the low-sun hours):
-        //   before 11:00:00          SOC ≤20% 3kW, 21-25% 1kW, >25% 500W
-        //   11:00:00 - 13:00:00      SOC ≤40% 3kW, 41-55% 1kW, >55% 500W
-        //   13:00:01 - 13:59:59      SOC ≤50% 3kW, 51-80% 1kW, >80% 400W
-        //   14:00:00 onward          SOC <95% 3kW
+        // window narrows, so heater takes more of the export later in the low-sun hours).
+        // Times are GMT all year so the tiers stay put against the sun; in BST they fall
+        // at 11:00 / 13:00 / 14:00 on the clock, as they were set up:
+        //   before 10:00:00 GMT          SOC ≤20% 3kW, 21-25% 1kW, >25% 500W
+        //   10:00:00 - 12:00:00 GMT      SOC ≤40% 3kW, 41-55% 1kW, >55% 500W
+        //   12:00:01 - 12:59:59 GMT      SOC ≤50% 3kW, 51-80% 1kW, >80% 400W
+        //   13:00:00 GMT onward          SOC <95% 3kW
         uint32_t nowSec = (uint32_t)rtcHour() * 3600UL + (uint32_t)rtcMinute() * 60UL + rtcSecond();
+        uint32_t gmtSec = clockIsBST() ? (nowSec + 86400UL - 3600UL) % 86400UL : nowSec;
         int32_t reservationW;
         if (soc > 95) {
             reservationW = 0L;
-        } else if (nowSec < 39600UL) {          // before 11:00:00
+        } else if (gmtSec < 36000UL) {          // before 10:00:00 GMT
             reservationW = (soc <= 20) ? 3000L : (soc <= 25) ? 1000L : 500L;
-        } else if (nowSec <= 46800UL) {         // 11:00:00 - 13:00:00
+        } else if (gmtSec <= 43200UL) {         // 10:00:00 - 12:00:00 GMT
             reservationW = (soc <= 40) ? 3000L : (soc <= 55) ? 1000L : 500L;
-        } else if (nowSec < 50400UL) {          // 13:00:01 - 13:59:59
+        } else if (gmtSec < 46800UL) {          // 12:00:01 - 12:59:59 GMT
             reservationW = (soc <= 50) ? 3000L : (soc <= 80) ? 1000L : 400L;
-        } else {                                // 14:00:00 onward
+        } else {                                // 13:00:00 GMT onward
             reservationW = 3000L;
         }
         // Winter half of the year (autumn equinox 23 Sep to spring equinox 20 Mar): with
@@ -667,6 +678,21 @@ void checkHeaterImportTrip(int16_t gridImportW, uint8_t soc, int16_t battChargeW
                             int16_t pv1W, int16_t pv2W) {
     unsigned long now = millis();
 
+    // Clearing runs ahead of the dawn hold: a trip still live overnight would otherwise
+    // stay on the screen until mid-morning however long import had been back at zero.
+    if (importTripActive) {
+        if (growattValid && gridImportW <= 0) {
+            if (++importZeroPkts >= 3) {
+                importTripActive = false;
+                importZeroPkts   = 0;
+                clearFaultH(FAULT_H_HEATER_IMPORT_TRIP);
+            }
+        } else {
+            importZeroPkts = 0;
+        }
+        if (importTripActive) return;
+    }
+
     if (rtcValid) {
         uint8_t  today  = rtcNow.day();
         uint32_t nowSec = (uint32_t)rtcHour() * 3600UL + (uint32_t)rtcMinute() * 60UL + rtcSecond();
@@ -697,31 +723,17 @@ void checkHeaterImportTrip(int16_t gridImportW, uint8_t soc, int16_t battChargeW
     int32_t pvTotalW   = (int32_t)pv1W + pv2W;
     bool    importHigh = soc > 15 && battDischargeW < 3900L && pvTotalW + battDischargeW < 6000L && gridImportW > 100;
 
-    if (!importTripActive) {
-        if (importHigh) {
-            if (!importHighStartMs) importHighStartMs = now;
-            if (now - importHighStartMs >= 20000UL) {
-                importTripActive  = true;
-                importHighStartMs = 0;
-                heaterRunning     = false;
-                heaterLevelIdx    = 0;
-                setFaultH(FAULT_H_HEATER_IMPORT_TRIP);
-            }
-        } else {
+    if (importHigh) {
+        if (!importHighStartMs) importHighStartMs = now;
+        if (now - importHighStartMs >= 20000UL) {
+            importTripActive  = true;
             importHighStartMs = 0;
+            heaterRunning     = false;
+            heaterLevelIdx    = 0;
+            setFaultH(FAULT_H_HEATER_IMPORT_TRIP);
         }
-        importZeroStartMs = 0;
     } else {
-        if (gridImportW <= 0) {
-            if (!importZeroStartMs) importZeroStartMs = now;
-            if (now - importZeroStartMs >= 20000UL) {
-                importTripActive  = false;
-                importZeroStartMs = 0;
-                clearFaultH(FAULT_H_HEATER_IMPORT_TRIP);
-            }
-        } else {
-            importZeroStartMs = 0;
-        }
+        importHighStartMs = 0;
     }
 }
 
@@ -788,6 +800,8 @@ float busVoltageV = 15.0f;
 bool  psu12vActive = false;
 unsigned long psuOnStartMs = 0;
 unsigned long busLowStartMs = 0;
+unsigned long busFallStartMs = 0;
+unsigned long busFallRecoverMs = 0;
 bool  busLowActive = false;
 
 void readBusVoltage() {
@@ -828,6 +842,19 @@ void updateBusVoltage() {
         if (busLowActive) {
             busLowActive = false;
             clearFaultH(FAULT_H_BUS_VOLTAGE_LOW);
+        }
+    }
+
+    if (vdv < BUS_FALLING_THRESH_DV) {
+        busFallRecoverMs = 0;
+        if (busFallStartMs == 0) busFallStartMs = millis();
+        if (millis() - busFallStartMs >= BUS_FALLING_DELAY_MS) setFaultH(FAULT_H_BUS_VOLTAGE_FALLING);
+    } else if (busFallStartMs != 0 || hasFaultH(FAULT_H_BUS_VOLTAGE_FALLING)) {
+        if (busFallRecoverMs == 0) busFallRecoverMs = millis();
+        if (millis() - busFallRecoverMs >= BUS_FALLING_RESET_MS) {
+            busFallStartMs   = 0;
+            busFallRecoverMs = 0;
+            clearFaultH(FAULT_H_BUS_VOLTAGE_FALLING);
         }
     }
 }
@@ -1220,6 +1247,13 @@ void readRTC() {
 }
 
 uint8_t rtcHour()   { return rtcValid ? rtcNow.hour()   : 0; }
+// Whether the RTC is currently on BST: the state checkAutoBST() last applied, or the
+// date's own state before that's ever been recorded.
+bool clockIsBST() {
+    uint8_t stored = EEPROM.read(EE_BST_STATE);
+    if (stored <= 1) return stored == 1;
+    return rtcValid && isBST(rtcNow.year(), rtcNow.month(), rtcNow.day());
+}
 uint8_t rtcMinute() { return rtcValid ? rtcNow.minute() : 0; }
 uint8_t rtcSecond() { return rtcValid ? rtcNow.second() : 0; }
 
@@ -1231,6 +1265,7 @@ SystemMode      systemMode          = MODE_WINTER;
 bool            nightCoolingEnabled = true;
 SolarTargetMode solarTargetMode     = SOLAR_TANK_PLUS8;
 uint8_t         displayBrightness   = 100;
+bool            holidayMode         = false; // W ignores the workshop unlock button while set
 
 // Not stored in EEPROM — reset on power cycle
 BoostMode        boostMode          = BOOST_OFF;
@@ -1249,6 +1284,8 @@ void loadSettings() {
     if (st <= 1)  solarTargetMode     = (SolarTargetMode)st;
     uint8_t db = EEPROM.read(EE_DISPLAY_BRIGHT);
     if (db >= 10 && db <= 100) displayBrightness = db;
+    uint8_t hm = EEPROM.read(EE_HOLIDAY_MODE);
+    if (hm <= 1)  holidayMode         = (bool)hm;
 }
 
 void saveSettingsIfDue() {
@@ -1258,6 +1295,7 @@ void saveSettingsIfDue() {
     EEPROM.update(EE_NIGHT_COOLING, (uint8_t)nightCoolingEnabled);
     EEPROM.update(EE_SOLAR_TARGET,  (uint8_t)solarTargetMode);
     EEPROM.update(EE_DISPLAY_BRIGHT, displayBrightness);
+    EEPROM.update(EE_HOLIDAY_MODE,  (uint8_t)holidayMode);
     eepromDirty = false;
 }
 
@@ -1390,11 +1428,11 @@ void updateHeatSourceSelection() {
 //  2-port valve: request(true)  = heater cold side / top-of-tank
 //                request(false) = mid-tank side
 //
-//  Cold-start: when pump > 0%, heater off, hot-pipe < 40°C and
-//  > 3°C below tank-bottom — open log-burner-cold, close bot-tank,
+//  Cold-start: when pump > 0%, heater off, hot-pipe < 30°C and
+//  below tank-bottom — open log-burner-cold, close bot-tank,
 //  force 2-port to heater side. Exit when hot-pipe reaches tank-
-//  bottom (3°C hysteresis) or heater fires: close log-burner-cold,
-//  open bot-tank. On sensor fault, hold last valve state.
+//  bottom + 2°C or heater fires: close log-burner-cold, open
+//  bot-tank. On sensor fault, hold last valve state.
 //
 //  2-port tracked independently: heater-side when heater firing or
 //  within 3min of stopping (heater latch); mid-tank when hot-pipe <
@@ -1441,8 +1479,8 @@ void updateSolarValves() {
         solarActive        = true;
         summerStartupPhase = 3;
         if (!heaterActive && pumpAboveZero && hpOk && botOk
-                && sTemp[H_SENSOR_HOT_PIPE] < 40.0f
-                && sTemp[H_SENSOR_HOT_PIPE] < sTemp[H_SENSOR_TANK_BOT] - 3.0f) {
+                && sTemp[H_SENSOR_HOT_PIPE] < 30.0f
+                && sTemp[H_SENSOR_HOT_PIPE] < sTemp[H_SENSOR_TANK_BOT]) {
             coldStartActive = true;
             logBurnerCold.request(true);
             botTankValve.request(false);
@@ -1458,8 +1496,8 @@ void updateSolarValves() {
     // Cold-start transitions (only when solar already running)
     if (!coldStartActive) {
         if (!heaterActive && pumpAboveZero && hpOk && botOk
-                && sTemp[H_SENSOR_HOT_PIPE] < 40.0f
-                && sTemp[H_SENSOR_HOT_PIPE] < sTemp[H_SENSOR_TANK_BOT] - 3.0f) {
+                && sTemp[H_SENSOR_HOT_PIPE] < 30.0f
+                && sTemp[H_SENSOR_HOT_PIPE] < sTemp[H_SENSOR_TANK_BOT]) {
             coldStartActive  = true;
             logBurnerCold.request(true);
             botTankValve.request(false);
@@ -1472,8 +1510,9 @@ void updateSolarValves() {
             logBurnerCold.request(false);
             botTankValve.request(true);
             twoPortValve.request(true);
-        } else if (hpOk && botOk && sTemp[H_SENSOR_HOT_PIPE] >= sTemp[H_SENSOR_TANK_BOT]) {
-            // Hot pipe warmed up to tank bottom: switch to normal path
+        } else if (hpOk && botOk && sTemp[H_SENSOR_HOT_PIPE] >= sTemp[H_SENSOR_TANK_BOT] + 2.0f) {
+            // Hot pipe warmed past tank bottom: switch to normal path. The 2°C over entry
+            // stops the log-burner/bottom valves swapping back and forth at the crossover.
             coldStartActive = false;
             logBurnerCold.request(false);
             botTankValve.request(true);
@@ -1532,7 +1571,7 @@ void updatePVExportOverride() {
     static uint8_t airSummerDay = 0;
     if (airSummerOverride && (!rtcValid || rtcNow.day() != airSummerDay)) airSummerOverride = false;
     if (systemMode == MODE_WINTER && !airSummerOverride && rtcValid && hasWPkt
-            && lastWPkt.tempWorkshopAir != TEMP_FAULT && lastWPkt.tempWorkshopAir >= 200) {
+            && lastWPkt.tempWorkshopAir != TEMP_FAULT && lastWPkt.tempWorkshopAir > 180) {
         airSummerOverride = true;
         airSummerDay      = rtcNow.day();
     }
@@ -1558,6 +1597,30 @@ float kwhImport      = 0.0f;   // gross import only
 float kwhExport      = 0.0f;   // gross export only
 float kwhHeater      = 0.0f;
 float kwhConsumption = 0.0f;
+float kwhSolar       = 0.0f;
+
+// W per °C rise across the collectors at each solar pump duty 4–100%. Measured on the
+// same pump/loop from H heater runs (heater W ÷ htr_out−hot_pipe), see
+// logs/make_pump_wpc.py → pump_w_per_c.xlsx "All levels" col B, Aug–Oct 2026 logs.
+static const uint8_t kSolarWPerC[97] PROGMEM = {
+     12,  16,  19,  25,  29,  31,  33,  36,  39,  41,  // 4-13%
+     43,  45,  46,  47,  51,  52,  52,  55,  56,  57,  // 14-23%
+     59,  59,  60,  63,  63,  65,  66,  67,  69,  69,  // 24-33%
+     70,  69,  69,  71,  71,  74,  76,  76,  76,  77,  // 34-43%
+     78,  78,  80,  80,  81,  82,  80,  83,  86,  86,  // 44-53%
+     86,  86,  87,  88,  90,  90,  90,  91,  90,  92,  // 54-63%
+     93,  94,  93,  94,  95,  96,  97,  98, 100, 101,  // 64-73%
+    102, 102, 102, 102, 102, 103, 105, 105, 106, 106,  // 74-83%
+    107, 108, 109, 111, 110, 110, 111, 110, 107, 111,  // 84-93%
+    111, 113, 114, 113, 114, 114, 114,                 // 94-100%
+};
+
+static float solarWPerC(uint8_t duty) {
+    if (duty == 0) return 0.0f;
+    if (duty < 4)  return pgm_read_byte(&kSolarWPerC[0]) * duty / 4.0f;
+    if (duty > 100) duty = 100;
+    return pgm_read_byte(&kSolarWPerC[duty - 4]);
+}
 
 bool          energyInited       = false;
 unsigned long energyLastMs       = 0;
@@ -1567,6 +1630,7 @@ int16_t       energyLastImportW  = 0;   // net import; negative = net export
 int16_t       energyLastBattChgW = 0;
 uint8_t       energyLastHeaterPct = 0;
 uint8_t       energyLastSocPct    = 0;
+float         energyLastSolarW    = 0.0f;
 
 // Called once per received W packet. Integrates the values noted at the *previous*
 // packet across the elapsed time to *this* packet (uncapped — a held last-known value
@@ -1579,7 +1643,7 @@ void accumulateEnergy() {
     if (rtcValid) {
         uint8_t today = rtcNow.day();
         if (energyLastDay != 0xFF && today != energyLastDay) {
-            kwhPV = kwhImport = kwhExport = kwhHeater = kwhConsumption = 0.0f;
+            kwhPV = kwhImport = kwhExport = kwhHeater = kwhConsumption = kwhSolar = 0.0f;
         }
         energyLastDay = today;
     }
@@ -1597,6 +1661,7 @@ void accumulateEnergy() {
         kwhExport      += max((int16_t)0, (int16_t)-energyLastImportW) * dtH / 1000.0f;
         kwhHeater      += heaterW           * dtH / 1000.0f;
         kwhConsumption += consumptionW      * dtH / 1000.0f;
+        kwhSolar       += energyLastSolarW  * dtH / 1000.0f;
     }
     energyLastMs = nowMs;
     energyInited = true;
@@ -1608,6 +1673,12 @@ void accumulateEnergy() {
         energyLastSocPct   = lastWPkt.battSocPct;
     }
     energyLastHeaterPct = heaterRunning ? heaterLevelPct() : 0;
+
+    // H and W both drive the one solar pump; the higher duty is what it actually runs at
+    uint8_t solarDuty = max(lastWPkt.solarPumpDutyPct, (uint8_t)roundf(hPumpDuty));
+    int16_t sHot = lastWPkt.tempSolarHot, sCold = lastWPkt.tempSolarCold;
+    energyLastSolarW = (sHot == TEMP_FAULT || sCold == TEMP_FAULT || sHot <= sCold) ? 0.0f
+                     : solarWPerC(solarDuty) * (sHot - sCold) / 10.0f;
 }
 
 // ============================================================
@@ -1624,7 +1695,7 @@ File    energyLogFile;
 unsigned long lastEnergyLogMs = 0;
 
 static const uint8_t LOG_EXPECTED_COMMAS = 53; // 54 columns = 53 commas
-static const uint8_t ENERGY_LOG_EXPECTED_COMMAS = 6; // 7 columns = 6 commas
+static const uint8_t ENERGY_LOG_EXPECTED_COMMAS = 7; // 8 columns = 7 commas
 
 void initSD() {
     if (SD.begin(PIN_SD_CS)) {
@@ -1680,11 +1751,16 @@ void initSD() {
         if (needEnergyHeader) {
             File f = SD.open("energy.csv", FILE_WRITE);
             if (f) {
-                f.println(F("datetime,pv_kwh,import_kwh,export_kwh,heater_kwh,consumption_kwh,soc_pct"));
+                f.println(F("datetime,pv_kwh,import_kwh,export_kwh,heater_kwh,consumption_kwh,soc_pct,solar_kwh"));
                 f.close();
             }
         }
         energyLogFile = SD.open("energy.csv", FILE_WRITE);
+
+        if (!SD.exists("handle.csv")) {
+            File f = SD.open("handle.csv", FILE_WRITE);
+            if (f) { f.println(F("down,up,duration_s,locked")); f.close(); }
+        }
     } else {
 #ifdef DEBUG_SERIAL
         Serial.println(F("SD: init failed"));
@@ -1791,8 +1867,33 @@ void logEnergyRow() {
     energyLogFile.print(kwhExport, 3);      energyLogFile.print(',');
     energyLogFile.print(kwhHeater, 3);      energyLogFile.print(',');
     energyLogFile.print(kwhConsumption, 3); energyLogFile.print(',');
-    energyLogFile.println(energyLastSocPct);
+    energyLogFile.print(energyLastSocPct);  energyLogFile.print(',');
+    energyLogFile.println(kwhSolar, 3);
     energyLogFile.flush();
+}
+
+uint8_t handleLoggedSeq = 0;
+
+// Not acked until written, so W keeps resending through SD ejects / RTC loss
+void logHandleEvent() {
+    uint8_t seq = lastWPkt.handleEvtSeq;
+    if (seq == 0 || seq == handleLoggedSeq) return;
+    if (!sdAvailable || sdEjected || !rtcValid) return;
+    File f = SD.open("handle.csv", FILE_WRITE);
+    if (!f) return;
+    DateTime up   = rtcNow - TimeSpan((int32_t)lastWPkt.handleEvtUpAgoS);
+    DateTime down = up - TimeSpan((int32_t)((lastWPkt.handleEvtDurMs + 500UL) / 1000UL));
+    char buf[42];
+    snprintf(buf, sizeof(buf), "%04u-%02u-%02u %02u:%02u:%02u,",
+             down.year(), down.month(), down.day(), down.hour(), down.minute(), down.second());
+    f.print(buf);
+    snprintf(buf, sizeof(buf), "%04u-%02u-%02u %02u:%02u:%02u,",
+             up.year(), up.month(), up.day(), up.hour(), up.minute(), up.second());
+    f.print(buf);
+    f.print(lastWPkt.handleEvtDurMs / 1000.0f, 1); f.print(',');
+    f.println(lastWPkt.handleEvtLocked);
+    f.close();
+    handleLoggedSeq = seq;
 }
 
 void safeEjectSD() {
@@ -1870,7 +1971,9 @@ void faultLogUpdate(uint32_t curW, uint32_t curH) {
 // ============================================================
 
 uint8_t      currentPage      = 1;
-#define      NUM_PAGES          6
+#define      NUM_PAGES          7
+// Up/down scroll order; page numbers themselves stay fixed so the `page` command and code references don't change
+static const uint8_t PAGE_ORDER[NUM_PAGES] = { 4, 1, 2, 3, 5, 6, 7 };
 bool         socLow           = false;  // latched below socLowThreshold(); re-arms only once SOC reaches it
 bool         page6Dirty       = true;
 bool         washMsg          = false;  // 06:30–09:30 with SOC at/above the wash threshold: page 6 shows the wash message
@@ -1998,6 +2101,7 @@ const char* faultNameW(uint32_t mask) {
     if (mask & FAULT_W_FAN1)                  return "Fan1 Fault";
     if (mask & FAULT_W_FAN2)                  return "Fan2 Fault";
     if (mask & FAULT_W_WINCH_OVER_OPEN)       return "Winch OvOpen";
+    if (mask & FAULT_W_HANDLE_TRIED)          return "Handle Tried";
     return "W Sensr Flt";
 }
 const char* faultNameH(uint32_t mask) {
@@ -2006,6 +2110,7 @@ const char* faultNameH(uint32_t mask) {
     if (mask & FAULT_H_HEATER_ELEMENT_FAIL)   return "Htr Elem Flt";
     if (mask & FAULT_H_RS485_COMMS)           return "H RS485 Err";
     if (mask & FAULT_H_BUS_VOLTAGE_LOW)       return "15V Bus Low";
+    if (mask & FAULT_H_BUS_VOLTAGE_FALLING)   return "15V Bus Fall";
     if (mask & FAULT_H_GRID_OUTAGE)           return "Grid Outage";
     if (mask & FAULT_H_HEATER_IMPORT_TRIP)   return "RCBO Trip";
     return "H Sensr Flt";
@@ -2217,6 +2322,9 @@ void drawPage2() {
 
     kwhStr(lv, sizeof(lv), kwhConsumption);
     wRow(4, 100, 244, 336, y, "ConsKWh:", lv, "            ", ""); y += ROW;
+
+    kwhStr(lv, sizeof(lv), kwhSolar);
+    wRow(4, 96, 244, 336, y, "SolkWh:", lv, "            ", ""); y += ROW;
 }
 
 // ── Page 3: Fault History ────────────────────────────────
@@ -2290,8 +2398,13 @@ void drawPage3() {
                      e.isH ? faultNameH(e.faultMask) : faultNameW(e.faultMask));
             tft.print(name);
 
-            char startBuf[8], timeBuf[16];
-            formatFaultTimeOfDay(e.onsetMs, startBuf, sizeof(startBuf));
+            char startBuf[9], timeBuf[16];
+            // W's own push time — H's onset is wrong if H rebooted while the fault was latched
+            if (!e.isH && e.faultMask == FAULT_W_HANDLE_TRIED && hasWPkt && lastWPkt.handleTriedHour < 24)
+                snprintf(startBuf, sizeof(startBuf), "%02u:%02u:%02u", lastWPkt.handleTriedHour,
+                         lastWPkt.handleTriedMin, lastWPkt.handleTriedSec);
+            else
+                formatFaultTimeOfDay(e.onsetMs, startBuf, sizeof(startBuf));
             if (active) {
                 strlcpy(timeBuf, startBuf, sizeof(timeBuf));
             } else {
@@ -2321,6 +2434,7 @@ static const CtrlItem PAGE4_ITEMS[] = {
     { "Man Heater",  0 },
     { "Night Cool",  0 },
     { "Solar Tgt",   0 },
+    { "Holiday",     0 },
     { "Fan Speed",   2 },
     { "Fan Full",    2 },
     { "Fan Base",    2 },
@@ -2331,7 +2445,8 @@ static const CtrlItem PAGE4_ITEMS[] = {
     { "SD Eject",    3 },
     { "Alrt Reset",  3 },  // always shown; clears page 3 fault history + resets heater lockout
 };
-static const uint8_t PAGE4_COUNT = 15;
+static const uint8_t PAGE4_COUNT = 16;
+static const uint8_t PAGE4_LEFT_ROWS = 7;
 
 void getPage4Value(uint8_t item, char* buf, uint8_t bufSz) {
     switch (item) {
@@ -2341,15 +2456,16 @@ void getPage4Value(uint8_t item, char* buf, uint8_t bufSz) {
         case 3: { const char* mm[] = {"Off","SOC-Lim","Manual On"}; strlcpy(buf, mm[manualHeaterMode], bufSz); break; }
         case 4: strlcpy(buf, nightCoolingEnabled ? "On" : "Off", bufSz); break;
         case 5: strlcpy(buf, solarTargetMode == SOLAR_TANK_PLUS8 ? "Tank+" : "Max", bufSz); break;
-        case 6: snprintf(buf, bufSz, "%d%%", lastWPkt.fanDutyPct); break;
-        case 7: snprintf(buf, bufSz, "%luh", lastWPkt.fanFullTimerSecs / 3600); break;
-        case 8: snprintf(buf, bufSz, "%lud", lastWPkt.fanBaseTimerSecs / 86400); break;
-        case 9:  snprintf(buf, bufSz, "%d%%", displayBrightness); break;
-        case 10: snprintf(buf, bufSz, "%02u", rtcHour());   break;
-        case 11: snprintf(buf, bufSz, "%02u", rtcMinute()); break;
-        case 12: snprintf(buf, bufSz, "%02u", rtcSecond()); break;
-        case 13: strlcpy(buf, sdAvailable ? "Eject" : "Ejected", bufSz); break;
-        case 14: strlcpy(buf, "Confirm", bufSz); break;
+        case 6: strlcpy(buf, holidayMode ? "Yes" : "No", bufSz); break;
+        case 7: snprintf(buf, bufSz, "%d%%", lastWPkt.fanDutyPct); break;
+        case 8: snprintf(buf, bufSz, "%luh", lastWPkt.fanFullTimerSecs / 3600); break;
+        case 9: snprintf(buf, bufSz, "%lud", lastWPkt.fanBaseTimerSecs / 86400); break;
+        case 10: snprintf(buf, bufSz, "%d%%", displayBrightness); break;
+        case 11: snprintf(buf, bufSz, "%02u", rtcHour());   break;
+        case 12: snprintf(buf, bufSz, "%02u", rtcMinute()); break;
+        case 13: snprintf(buf, bufSz, "%02u", rtcSecond()); break;
+        case 14: strlcpy(buf, sdAvailable ? "Eject" : "Ejected", bufSz); break;
+        case 15: strlcpy(buf, "Confirm", bufSz); break;
         default: buf[0] = 0;
     }
 }
@@ -2365,36 +2481,37 @@ void page4Adjust(uint8_t item, int8_t dir) {
         case 3: manualHeaterMode = (ManualHeaterMode)((manualHeaterMode + 3 + dir) % 3); break;
         case 4: nightCoolingEnabled = !nightCoolingEnabled; markSettingsDirty(); break;
         case 5: solarTargetMode = (solarTargetMode == SOLAR_TANK_PLUS8) ? SOLAR_MAX : SOLAR_TANK_PLUS8; markSettingsDirty(); break;
-        case 6: { // fan base speed — transmitted to W in H→W packet
+        case 6: holidayMode = !holidayMode; markSettingsDirty(); break;
+        case 7: { // fan base speed — transmitted to W in H→W packet
             uint8_t fs = EEPROM.read(EE_FAN_BASE_SPEED);
             fs = constrain((int)fs + dir * 10, 0, 100);
             EEPROM.update(EE_FAN_BASE_SPEED, fs);
             break;
         }
-        case 7: // fan full timer: accumulate ±1hr delta; sent to W on next packet and cleared
+        case 8: // fan full timer: accumulate ±1hr delta; sent to W on next packet and cleared
             pendingFanFullDeltaHr = (int8_t)constrain((int)pendingFanFullDeltaHr + dir, -24, 24);
             break;
-        case 8: // fan base timer: accumulate ±1 day delta; sent to W on next packet and cleared
+        case 9: // fan base timer: accumulate ±1 day delta; sent to W on next packet and cleared
             pendingFanBaseDeltaDay = (int8_t)constrain((int)pendingFanBaseDeltaDay + dir, -30, 30);
             break;
-        case 9:
+        case 10:
             displayBrightness = constrain((int)displayBrightness + dir * 10, 10, 100);
             markSettingsDirty();
             setBacklight(displayBrightness);
             break;
-        case 10: {
+        case 11: {
             uint8_t h = (uint8_t)((rtcNow.hour() + 24 + dir) % 24);
             rtc.adjust(DateTime(rtcNow.year(), rtcNow.month(), rtcNow.day(), h, rtcNow.minute(), rtcNow.second()));
             rtcNow = rtc.now();
             break;
         }
-        case 11: {
+        case 12: {
             uint8_t m = (uint8_t)((rtcNow.minute() + 60 + dir) % 60);
             rtc.adjust(DateTime(rtcNow.year(), rtcNow.month(), rtcNow.day(), rtcNow.hour(), m, rtcNow.second()));
             rtcNow = rtc.now();
             break;
         }
-        case 12: {
+        case 13: {
             uint8_t s = (uint8_t)((rtcNow.second() + 60 + dir) % 60);
             rtc.adjust(DateTime(rtcNow.year(), rtcNow.month(), rtcNow.day(), rtcNow.hour(), rtcNow.minute(), s));
             rtcNow = rtc.now();
@@ -2404,8 +2521,8 @@ void page4Adjust(uint8_t item, int8_t dir) {
 }
 
 void page4Action(uint8_t item) {
-    if (item == 13) safeEjectSD();
-    if (item == 14) {
+    if (item == 14) safeEjectSD();
+    if (item == 15) {
         alertResetSeqTx++;
         // Clear fault log and reset change-detection so currently-active faults
         // are not immediately re-added — they'll re-appear only if they toggle again
@@ -2452,8 +2569,8 @@ void drawPage4() {
     prevFlashing = flashing;
 
     for (uint8_t i = 0; i < visCount; i++) {
-        uint8_t  col = (i >= 6) ? 1 : 0;
-        uint8_t  row = col ? i - 6 : i;
+        uint8_t  col = (i >= PAGE4_LEFT_ROWS) ? 1 : 0;
+        uint8_t  row = col ? i - PAGE4_LEFT_ROWS : i;
         uint16_t y   = 30 + row * 20;
         uint16_t rx  = col ? 240 : 0;
         uint16_t lx  = col ? 244 : 4;
@@ -2472,7 +2589,7 @@ void drawPage4() {
 
     // Back row (full width, below the taller column)
     bool backSel = (navMode != NAV_PAGE && selectedItem == visCount);
-    uint8_t  rightRows = visCount > 6 ? visCount - 6 : 6;
+    uint8_t  rightRows = visCount > PAGE4_LEFT_ROWS ? visCount - PAGE4_LEFT_ROWS : PAGE4_LEFT_ROWS;
     uint16_t yb  = 30 + rightRows * 20;
     uint16_t bgb = backSel ? C_NAVY : C_BLACK;
     if (backSel != prevBackSel4) { tft.fillRect(0, yb - 2, 480, 20, bgb); prevBackSel4 = backSel; }
@@ -2659,10 +2776,145 @@ static void drawWashMsg() {
     }
 }
 
+// Boaz's birthday: page 6 shows his name in place of the SOC until 22:00 local on 25 Oct 2026
+static bool boazBirthday() {
+    return rtcValid && rtcNow.unixtime() < DateTime(2026, 10, 25, 22, 0, 0).unixtime();
+}
+
+static void rotPt(float px, float py, float c, float s, int16_t cx, int16_t cy, float& x, float& y) {
+    x = cx + px * c - py * s;
+    y = cy + px * s + py * c;
+}
+
+static void boazLine(float x0, float y0, float x1, float y1, float w, uint16_t col) {
+    tft.drawWideLine(x0, y0, x1, y1, w, col, C_BLACK);
+}
+
+static void boazBike(int16_t cx, int16_t cy, uint16_t col) {
+    tft.drawSmoothArc(cx - 14, cy + 5, 10, 8, 0, 360, col, C_BLACK);
+    tft.drawSmoothArc(cx + 14, cy + 5, 10, 8, 0, 360, col, C_BLACK);
+    boazLine(cx - 14, cy + 5, cx - 2, cy + 5, 2.5f, col);
+    boazLine(cx - 2,  cy + 5, cx - 6, cy - 8, 2.5f, col);
+    boazLine(cx - 6,  cy - 8, cx - 14, cy + 5, 2.5f, col);
+    boazLine(cx - 6,  cy - 8, cx + 9, cy - 8, 2.5f, col);
+    boazLine(cx + 9,  cy - 8, cx - 2, cy + 5, 2.5f, col);
+    boazLine(cx + 9,  cy - 8, cx + 14, cy + 5, 2.5f, col);
+    boazLine(cx + 9,  cy - 8, cx + 10, cy - 13, 2.5f, col);
+    boazLine(cx + 7,  cy - 13, cx + 13, cy - 13, 3.0f, col);
+    boazLine(cx - 10, cy - 10, cx - 3, cy - 10, 3.0f, col);
+}
+
+static void boazSkate(int16_t cx, int16_t cy, uint16_t col) {
+    boazLine(cx - 26, cy - 8, cx - 17, cy - 1, 5.0f, col);
+    boazLine(cx - 17, cy - 1, cx + 17, cy - 1, 5.0f, col);
+    boazLine(cx + 17, cy - 1, cx + 26, cy - 8, 5.0f, col);
+    tft.fillRect(cx - 16, cy + 2, 8, 3, C_LTGRAY);
+    tft.fillRect(cx + 8,  cy + 2, 8, 3, C_LTGRAY);
+    static const int8_t WHEEL_DX[4] = { -15, -9, 9, 15 };
+    for (int8_t dx : WHEEL_DX) tft.fillSmoothCircle(cx + dx, cy + 8, 4, C_WHITE, C_BLACK);
+}
+
+static void boazWrench(int16_t cx, int16_t cy, uint16_t col) {
+    const float c = 0.819f, s = -0.574f;  // -35°
+    float x0, y0, x1, y1;
+    rotPt(-15, 0, c, s, cx, cy, x0, y0); rotPt(11, 0, c, s, cx, cy, x1, y1);
+    boazLine(x0, y0, x1, y1, 7.0f, col);
+    rotPt(14, 0, c, s, cx, cy, x0, y0);  tft.fillSmoothCircle(x0, y0, 9, col, C_BLACK);
+    rotPt(17, 0, c, s, cx, cy, x0, y0); rotPt(26, 0, c, s, cx, cy, x1, y1);
+    boazLine(x0, y0, x1, y1, 7.0f, C_BLACK);
+    rotPt(-16, 0, c, s, cx, cy, x0, y0);
+    tft.fillSmoothCircle(x0, y0, 6, col, C_BLACK);
+    tft.fillSmoothCircle(x0, y0, 2, C_BLACK, col);
+}
+
+static void boazHammer(int16_t cx, int16_t cy) {
+    const float c = 0.819f, s = -0.574f;
+    const uint16_t HEAD = 0xB596;
+    float x0, y0, x1, y1;
+    rotPt(-18, 0, c, s, cx, cy, x0, y0); rotPt(12, 0, c, s, cx, cy, x1, y1);
+    boazLine(x0, y0, x1, y1, 6.0f, C_AMBER);
+    rotPt(13.5f, -8, c, s, cx, cy, x0, y0); rotPt(13.5f, 8, c, s, cx, cy, x1, y1);
+    boazLine(x0, y0, x1, y1, 9.0f, HEAD);
+    rotPt(10, -12, c, s, cx, cy, x0, y0); rotPt(1, -19, c, s, cx, cy, x1, y1);
+    boazLine(x0, y0, x1, y1, 4.0f, HEAD);
+}
+
+// side = -1 left balloon (string bows left first), +1 right
+static void boazBalloon(int16_t cx, int8_t side, uint16_t col, uint16_t shine) {
+    float px = cx, py = 177;
+    for (uint8_t i = 1; i <= 16; i++) {
+        float t = (i % 8) / 8.0f;
+        if (i % 8 == 0) t = 1.0f;
+        int8_t dir = i <= 8 ? side : -side;
+        float x = cx + dir * 16.0f * t * (1.0f - t);
+        float y = 177 + i * 3.0f;
+        boazLine(px, py, x, y, 1.5f, C_WHITE);
+        px = x; py = y;
+    }
+    tft.fillEllipse(cx, 136, 30, 38, col);
+    tft.fillTriangle(cx, 172, cx - 6, 180, cx + 6, 180, col);
+    tft.fillEllipse(cx - 11, 121, 6, 10, shine);
+}
+
+static void drawBoaz() {
+    tft.fillRect(0, 20, 480, 280, C_BLACK);
+    pollRS485(); updateHPump();
+
+    const int16_t TOP_Y = 54, BOT_Y = 266;
+    boazWrench(44, TOP_Y, C_AMBER);   boazSkate(122, TOP_Y, C_CYAN);   boazBike(200, TOP_Y, C_GREEN);
+    pollRS485(); updateHPump();
+    boazHammer(280, TOP_Y);           boazSkate(358, TOP_Y, C_RED);    boazBike(436, TOP_Y, C_YELLOW);
+    pollRS485(); updateHPump();
+    boazBike(44, BOT_Y, C_CYAN);      boazHammer(122, BOT_Y);          boazSkate(200, BOT_Y, C_YELLOW);
+    pollRS485(); updateHPump();
+    boazWrench(280, BOT_Y, C_WHITE);  boazBike(358, BOT_Y, C_RED);     boazSkate(436, BOT_Y, C_GREEN);
+    pollRS485(); updateHPump();
+
+    boazBalloon(52, -1, C_RED, 0xFC10);
+    boazBalloon(428, 1, 0x051F, 0x869F);
+    pollRS485(); updateHPump();
+
+    // Built from AA arcs plus straight bars: a 24pt bitmap font scaled 2.4x shows its pixel steps.
+    // Bars are drawn after the arcs so they cover the arcs' cut ends.
+    const uint16_t Y = C_YELLOW;
+    const int16_t  S = 14, BASE = 198, CAP = 114, XH = 138;
+    const int16_t  x0 = 240 - 268 / 2;           // B 68 + o 60 + a 60 + z 50, three 10px gaps
+    const int16_t  bxU = x0 + 38, bxL = x0 + 42;
+    tft.drawSmoothArc(bxU, 137, 23, 23 - S, 180, 360, Y, C_BLACK);
+    tft.drawSmoothArc(bxL, 172, 26, 26 - S, 180, 360, Y, C_BLACK);
+    pollRS485(); updateHPump();
+    tft.fillRect(x0, CAP, S, BASE - CAP, Y);
+    tft.fillRect(x0, CAP,      bxU - x0 + 1, S, Y);
+    tft.fillRect(x0, 146,      bxL - x0 + 1, S, Y);
+    tft.fillRect(x0, BASE - S, bxL - x0 + 1, S, Y);
+
+    const int16_t ox = x0 + 78 + 30;
+    tft.drawSmoothArc(ox, 168, 30, 30 - S, 0, 360, Y, C_BLACK);
+    pollRS485(); updateHPump();
+
+    const int16_t ax = x0 + 148 + 30;
+    tft.drawSmoothArc(ax, 168, 30, 30 - S, 0, 360, Y, C_BLACK);
+    tft.fillRect(ax + 30 - S, XH, S, BASE - XH, Y);
+    pollRS485(); updateHPump();
+
+    const int16_t zx = x0 + 218;
+    tft.drawWideLine(zx + 42, XH + 12, zx + 8, BASE - 12, 15, Y, C_BLACK);
+    tft.fillRect(zx, XH,       50, S, Y);
+    tft.fillRect(zx, BASE - S, 50, S, Y);
+    pollRS485(); updateHPump();
+}
+
 void drawPage6() {
     static int16_t prevSoc = -1;
-    static bool    prevLow = false, prevWash = false;
+    static bool    prevLow = false, prevWash = false, prevBoaz = false;
     static unsigned long lastDrawMs = 0;
+    if (boazBirthday()) {
+        if (!page6Dirty && prevBoaz) return;
+        page6Dirty = false; prevBoaz = true;
+        drawBoaz();
+        return;
+    }
+    if (prevBoaz) { prevBoaz = false; page6Dirty = true; }
     bool    gv  = hasWPkt && lastWPkt.growattValid;
     int16_t soc = gv ? lastWPkt.battSocPct : -2;
     bool    low = gv && soc < socLowThreshold();
@@ -2725,6 +2977,72 @@ void drawPage6() {
     }
 }
 
+// ── Page 7: Summary ───────────────────────────────────────
+
+void drawPage7() {
+    tft.setTextSize(2);
+    bool gv = hasWPkt && lastWPkt.growattValid;
+
+    auto row = [&](uint16_t lx, uint16_t vx, uint16_t y, const char* lbl, const char* val, uint16_t vc) {
+        tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(lx, y); tft.print(lbl);
+        char buf[10]; snprintf(buf, sizeof(buf), "%-7s", val);
+        tft.setTextColor(vc, C_BLACK); tft.setCursor(vx, y); tft.print(buf);
+    };
+    auto tempRow = [&](uint16_t lx, uint16_t vx, uint16_t y, const char* lbl, int16_t enc) {
+        char v[10];
+        if (enc == TEMP_FAULT) strcpy(v, "FAULT");
+        else { dtostrf(enc / 10.0f, 1, 1, v); strcat(v, "C"); }
+        row(lx, vx, y, lbl, v, enc == TEMP_FAULT ? C_RED : C_CYAN);
+    };
+    auto hEnc = [](uint8_t si) -> int16_t { return sRawFault[si] ? TEMP_FAULT : (int16_t)(sTemp[si] * 10.0f); };
+
+    const uint16_t LX = 6, LVX = 150, RX = 246, RVX = 390;
+    char v[10];
+    int16_t hW = heaterRunning ? (int16_t)(heaterLevelPct10() * 3) : 0;
+
+    // Left column
+    tempRow(LX, LVX, 60, "Solar Hot",   hasWPkt ? lastWPkt.tempSolarHot : TEMP_FAULT);
+    tempRow(LX, LVX, 86, "Hot Pipe",    hEnc(H_SENSOR_HOT_PIPE));
+    int16_t h1 = hEnc(H_SENSOR_HEATER_OUT), h2 = hEnc(H_SENSOR_HEATER_OUT_2);
+    tempRow(LX, LVX, 112, "Heater Temp", h1 == TEMP_FAULT ? h2 : (h2 == TEMP_FAULT ? h1 : max(h1, h2)));
+    pollBtns();
+    snprintf(v, sizeof(v), "%d%%", lastWPkt.solarPumpDutyPct);
+    row(LX, LVX, 164, "Pump W", v, C_CYAN);
+    snprintf(v, sizeof(v), "%d%%", (int)roundf(hPumpDuty));
+    row(LX, LVX, 190, "Pump H", v, C_CYAN);
+
+    // Solar return: where the solar loop returns into the tank
+    enum { SR_NONE, SR_UP, SR_DOWN, SR_LOG };
+    uint8_t sr = logBurnerCold.isOpen ? SR_LOG
+               : botTankValve.isOpen  ? (twoPortValve.isOpen ? SR_UP : SR_DOWN)
+               : SR_NONE;
+    static uint8_t prevSr = 0xFF;
+    const uint16_t SRY = 242;
+    tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(LX, SRY); tft.print("Solar Return");
+    if (sr != prevSr || needFullRedraw) {
+        tft.fillRect(LVX, SRY, 84, 16, C_BLACK);
+        if (sr == SR_LOG) { tft.setTextColor(C_CYAN, C_BLACK); tft.setCursor(LVX, SRY); tft.print("Log"); }
+        else if (sr == SR_UP)   { tft.fillTriangle(LVX + 7, SRY, LVX, SRY + 8, LVX + 14, SRY + 8, C_CYAN); tft.fillRect(LVX + 4, SRY + 8, 6, 8, C_CYAN); }
+        else if (sr == SR_DOWN) { tft.fillTriangle(LVX + 7, SRY + 15, LVX, SRY + 8, LVX + 14, SRY + 8, C_CYAN); tft.fillRect(LVX + 4, SRY, 6, 8, C_CYAN); }
+        prevSr = sr;
+    }
+    pollBtns();
+
+    // Right column
+    if (gv) snprintf(v, sizeof(v), "%dW", lastWPkt.pv1W + lastWPkt.pv2W); else strcpy(v, "--");
+    row(RX, RVX, 60, "PV", v, C_CYAN);
+    // Consumption matches page 2: PV + net import - battery charge - heater
+    int16_t importW = gv ? (int16_t)(lastWPkt.gridImportW - lastWPkt.pvExportW) : 0;
+    if (gv) snprintf(v, sizeof(v), "%dW", (int16_t)(lastWPkt.pv1W + lastWPkt.pv2W + importW - lastWPkt.battChargeW - hW)); else strcpy(v, "--");
+    row(RX, RVX, 112, "Consumption", v, C_CYAN);
+    if (gv) snprintf(v, sizeof(v), "%dW", lastWPkt.battChargeW); else strcpy(v, "--");
+    row(RX, RVX, 138, "Battery", v, C_CYAN);
+    snprintf(v, sizeof(v), "%dW", hW);
+    row(RX, RVX, 164, "Heater", v, C_CYAN);
+    if (gv) snprintf(v, sizeof(v), "%d%%", lastWPkt.battSocPct); else strcpy(v, "--");
+    row(RX, RVX, 216, "SOC", v, C_CYAN);
+}
+
 static bool inSocLowBacklightWindow() {
     if (!rtcValid) return false;
     uint16_t m = (uint16_t)rtcHour() * 60 + rtcMinute();
@@ -2766,6 +3084,7 @@ void drawFullPage() {
         case 4: drawPage4(); break;
         case 5: drawPage5(); break;
         case 6: page6Dirty = true; drawPage6(); break;
+        case 7: drawPage7(); break;
     }
     updateHPump();
     drawFaultBar(lastWPkt.wFaultFlags, hFaultFlags);
@@ -2801,8 +3120,12 @@ void handleButtons() {
 
     switch (navMode) {
         case NAV_PAGE:
-            if (upCnt) { currentPage = (uint8_t)(((int)currentPage - 1 + NUM_PAGES - upCnt % NUM_PAGES) % NUM_PAGES + 1); needFullRedraw = true; }
-            if (dnCnt) { currentPage = (uint8_t)(((int)currentPage - 1 + dnCnt)                        % NUM_PAGES + 1); needFullRedraw = true; }
+            if (upCnt || dnCnt) {
+                uint8_t idx = 0;
+                while (idx < NUM_PAGES - 1 && PAGE_ORDER[idx] != currentPage) idx++;
+                idx = (uint8_t)((idx + NUM_PAGES - upCnt % NUM_PAGES + dnCnt) % NUM_PAGES);
+                currentPage = PAGE_ORDER[idx]; needFullRedraw = true;
+            }
             if (selP && (currentPage == 4 || currentPage == 5)) { navMode = NAV_ITEM; selectedItem = 0; needPageRedraw = true; }
             break;
 
@@ -3153,6 +3476,7 @@ void sendHToWPacket(bool timeSyncReq) {
     pkt.morningHeatActive   = morningHeatActive ? 1 : 0;
     pkt.summerStartupPhase  = summerStartupPhase;
     pkt.nightCoolingEnabled = nightCoolingEnabled ? 1 : 0;
+    pkt.holidayMode         = holidayMode ? 1 : 0;
     pkt.solarTargetMode     = (uint8_t)solarTargetMode;
     pkt.manualHeaterMode    = (uint8_t)manualHeaterMode;
 
@@ -3165,6 +3489,7 @@ void sendHToWPacket(bool timeSyncReq) {
     pkt.overrideActive  = manualOverrideActive ? 1 : 0;
     pkt.overrideValves  = overrideValveStates;
     pkt.alertResetSeq   = alertResetSeqTx;
+    pkt.handleEvtAck    = handleLoggedSeq;
     pkt.hFaultFlags     = hFaultFlags;
 
     // Time sync: send whenever W requested it, or on hourly interval
@@ -3221,6 +3546,7 @@ static void pollRS485() {
         missedPackets = 0;
         if (rs485Fault) { rs485Fault = false; clearFaultH(FAULT_H_RS485_COMMS); }
         accumulateEnergy();
+        logHandleEvent();
 
 #ifdef DEBUG_SERIAL
         {
@@ -3345,6 +3671,7 @@ static void dbgFaults() {
     HF(FAULT_H_HEATER_ELEMENT_FAIL,  "HEATER_ELEMENT_FAIL")
     HF(FAULT_H_RS485_COMMS,          "RS485_COMMS")
     HF(FAULT_H_BUS_VOLTAGE_LOW,      "BUS_VOLTAGE_LOW")
+    HF(FAULT_H_BUS_VOLTAGE_FALLING,  "BUS_VOLTAGE_FALLING (<14.9V for 5 min)")
     HF(FAULT_H_GRID_OUTAGE,          "GRID_OUTAGE")
     HF(FAULT_H_HEATER_IMPORT_TRIP,   "RCBO_TRIP")
     HF(FAULT_H_SENSOR_TANK_BOT,      "SENSOR_TANK_BOT")
@@ -4150,7 +4477,7 @@ void loop() {
 
     // Display refresh
     updateSocLow();
-    bool socHoldOn = (socLow && inSocLowBacklightWindow()) || washMsg;
+    bool socHoldOn = (socLow && inSocLowBacklightWindow()) || washMsg || (currentPage == 6 && boazBirthday());
     if (!displayOn) {
         // Wake only on NEW faults that appeared after the display went to sleep
         uint32_t curFaults = hFaultFlags | (hasWPkt ? lastWPkt.wFaultFlags : 0);
@@ -4193,6 +4520,7 @@ void loop() {
                 case 4: drawPage4(); break;
                 case 5: drawPage5(); break;
                 case 6: drawPage6(); break;
+                case 7: drawPage7(); break;
             }
             updateHPump();
             if (manualOverrideActive || manualHeaterMode != MHM_OFF) {

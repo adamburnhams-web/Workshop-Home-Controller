@@ -82,6 +82,7 @@ enum WinchState : uint8_t {
 #define FAULT_W_SENSOR_WORKSHOP_AIR  (1UL << 16)
 #define FAULT_W_SENSOR_OUTSIDE_AIR   (1UL << 17)
 #define FAULT_W_FIRE_ALARM           (1UL << 18)
+#define FAULT_W_HANDLE_TRIED         (1UL << 19)  // door handle pushed 22:00-07:00 while locked, latched until fault reset
 
 // H-side faults (in hFaultFlags)
 #define FAULT_H_HEATER_OVERHEAT_SHUT (1UL << 1)
@@ -98,6 +99,7 @@ enum WinchState : uint8_t {
 #define FAULT_H_SENSOR_HEATER_OUT_2  (1UL << 12)
 #define FAULT_H_HEATER_IMPORT_TRIP   (1UL << 13)
 #define FAULT_H_HEATER_MANUAL_LOCKOUT (1UL << 14)
+#define FAULT_H_BUS_VOLTAGE_FALLING (1UL << 15)
 
 // ── W-side valve state bitmask (valveStates field) ──────────
 #define VSTATE_UFH_COLD_OPEN    (1 << 0)
@@ -175,6 +177,18 @@ struct __attribute__((packed)) WToHPacket {
     uint16_t rs485RxAgeS;       // seconds since W last received a good H->W packet (saturates at 65535)
 
     uint8_t solarPumpReason;    // SolarPumpReason enum: why the solar pump is at its current duty (logged by H)
+
+    // W time of first handle push for FAULT_W_HANDLE_TRIED; hour 0xFF = none
+    uint8_t handleTriedHour;
+    uint8_t handleTriedMin;
+    uint8_t handleTriedSec;
+
+    // Oldest unacknowledged handle push; resent until H echoes
+    // the seq in handleEvtAck, so short pushes survive slow links and SD gaps
+    uint8_t  handleEvtSeq;      // 0 = none queued
+    uint32_t handleEvtDurMs;    // handle down → up
+    uint32_t handleEvtUpAgoS;   // seconds since release, at packet build time
+    uint8_t  handleEvtLocked;   // 1 = workshop was locked when the handle went down
 };
 
 // ============================================================
@@ -246,4 +260,10 @@ struct __attribute__((packed)) HToWPacket {
 
     // H-side solar pump direct drive duty (0–100%; non-zero only when heater on)
     uint8_t hPumpDutyPct;
+
+    // 1 = W ignores the workshop unlock button (H page 4 "Holiday")
+    uint8_t holidayMode;
+
+    // Last handle push seq written to handle.csv (see WToHPacket::handleEvtSeq)
+    uint8_t handleEvtAck;
 };

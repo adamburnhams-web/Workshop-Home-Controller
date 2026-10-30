@@ -32,7 +32,7 @@ Full W relay board layout has changed from spec. New arrangement: one 8-ch board
 **Odd board (D23–D37) — mix of 15VDC and 230VAC loads:**
 | Pin | Load |
 |---|---|
-| D23 | Spare |
+| D23 | Internal workshop lights (230VAC) |
 | D25 | External LED lights (230VAC) |
 | D27 | Wall axial fan (230VAC) |
 | D29 | Window winch power relay (230VAC) |
@@ -1227,3 +1227,78 @@ New `airSummerOverride`: in winter mode, once W reports workshop air ≥ 20.0°C
 ## W Controller — Tank+ first-start solar target: 30min at tank top
 
 The Tank+ first-start target after the day's first summer solar start (see "Tank+ first-hour solar target" above) now lasts 30min instead of 60min, and is `tank top` (capped at 85°C) instead of `tank top − 2°C`.
+
+## H Controller — workshop-air summer switch threshold 20°C → above 18.0°C
+
+`airSummerOverride` now latches when workshop air is above 18.0°C (`> 180`), was above 18.5°C and before that ≥ 20.0°C. Otherwise unchanged (until midnight, winter mode only).
+
+## H Controller — RCBO trip fault clears after 3 consecutive zero-import W packets
+
+`FAULT_H_HEATER_IMPORT_TRIP` now clears once 3 consecutive W packets report valid Growatt data with grid import ≤ 0W (was 20s continuous ≤ 0W). The clear check runs before the dawn hold, so a trip still live overnight is no longer stuck until 30min after PV reaches 100W. A packet with import > 0W or no Growatt data restarts the count. While tripped, the trip check itself does not run (unchanged in effect).
+
+## W Controller — vacuum cycle on workshop unlock if not run today or yesterday
+
+If the vacuum system hasn't completed a cycle today or yesterday, the workshop being unlocked now also starts the normal vacuum cycle (prewarm, valve open, pump to full + 10min, `VAC_PUMP_MAX_MS` overtime fault). The date of the last completed cycle (`VAC_DONE`) is saved as a day number at EEPROM address 2 (uint16), so it survives reboots; blank EEPROM reads as never run. Needs time sync from H. Existing once-a-day triggers (summer solar, UFH) unchanged. `status` debug command shows `vac_overdue`.
+
+## W Controller — auto-lock after 10min, PIR re-unlocks within 10min
+
+Auto-relock re-enabled (was disabled, lock switch only). While unlocked, if the door is closed, the stay-unlocked switch (`PIN_MANUAL_RELOCK`, D12) is off and PIR is clear continuously for `RELOCK_TIMEOUT_MS` (now 10min, was 5min), the workshop locks. Any of those conditions breaking restarts the timer. Winch secured is no longer a condition (it was in the original spec relock rule). For `RELOCK_GRACE_MS` (10min) after an auto-lock, PIR going active unlocks the workshop instead of raising the intruder alarm. The unlock button unlocks at any time as before. The D11 lock switch still locks immediately, with no PIR grace period after it.
+
+## W Controller — internal lights on D23
+
+D23 (odd board ch1, was spare) now switches the internal workshop lights (`PIN_INT_LIGHTS`). On while the workshop is unlocked, and held on for 30s after it locks (by any route), then off. Off at boot until the workshop is unlocked, unless the saved lock state restores it unlocked.
+
+## H/W — page 4 "Holiday" disables the workshop unlock button
+
+New page 4 item `Holiday` (Yes/No), directly under `Solar Tgt` (left column now 7 rows; later items shift down one index). Saved to H EEPROM address 6 (`EE_HOLIDAY_MODE`) with the usual 30s delayed write; blank EEPROM = No. Sent to W as `HToWPacket.holidayMode` (new last field). While set, W ignores the unlock button. Lock switch, auto-lock and the PIR re-unlock grace after an auto-lock are unchanged. Before W has received its first H packet, the button works as normal.
+
+## H Controller — page 7 summary
+
+New display page 7 (`drawPage7()`, `NUM_PAGES` 6 → 7), refreshed every 500ms like pages 1/2. Size-2 text, name then value on one line, 26px row pitch.
+
+- Left (x 6, value x 150): Solar Hot 60, Hot Pipe 86, Heater Temp 112 (higher of htr_out / htr_out_2; the other if one has failed), Pump W 164, Pump H 190, Solar Return 242.
+- Right (x 246, value x 390): PV (pv1+pv2) 60, Consumption 112 (same formula as page 2), Battery 138 (signed W, minus = discharging), Heater W 164, SOC 216.
+- Solar Return: `Log` if log burner valve open; else if bottom-of-tank valve open, up arrow when the 2-port is to heater/top of tank, down arrow when to mid tank; blank when both shut.
+- Growatt values show `--` when Growatt data is not valid; failed temperature sensors show `FAULT` in red.
+
+## H Controller — page 4 scrolls before page 1
+
+Up/down page scrolling now follows `PAGE_ORDER` = 4, 1, 2, 3, 5, 6, 7 (was 1–7 in number order). Page numbers are unchanged, so the `page <n>` debug command, the sleep reset to page 1 and the SOC-low jump to page 6 work as before.
+
+## H Controller — solar cold-start valve routing: hot pipe < 30°C and below tank bottom
+
+`updateSolarValves()` cold start (log burner cold open, bottom-of-tank closed, 2-port heater side) now engages when hot pipe is below 30°C (was 40°C) and below tank bottom (was more than 3°C below). Other conditions unchanged: W pump above 0%, heater not firing. Exit: hot pipe reaches tank bottom + 2°C (was tank bottom), or the heater fires, so there is a 2°C hysteresis band and the valves don't swap back and forth at the crossover.
+
+## W Controller — buzzer at H temporarily blocked (to be added later)
+
+`BUZZER_ENABLED = false` at the top of `w_controller/main.cpp` holds the buzzer relay (`PIN_BUZZER_SIGNAL`, D41, board 4 ch 1) off. The triggers are unchanged and `buzzerActive` is still worked out (handle down while locked, PIR while locked, solar overheat hot, solar pump fault, fire alarm), and the `security` debug command shows it with `(relay blocked)`. The alarm sounder at W (D26) is not affected. **To be added later:** set `BUZZER_ENABLED = true` once the buzzer at H is in use, and decide then whether the handle trigger should be up-to-down only, as the night `FAULT_W_HANDLE_TRIED` is, so a stuck handle doesn't hold it on.
+
+## W Controller — PIR input now active-low with pull-up
+
+`PIN_PIR` (D2) is now `INPUT_PULLUP` and reads LOW = motion, was HIGH = motion through a 10k/4.7k divider. The PIR output must switch D2 to GND (dry contact or open collector) and the divider is removed. A broken PIR wire now reads as clear, not as motion.
+
+## W/H — night door handle fault "Handle Tried"
+
+New `FAULT_W_HANDLE_TRIED` (bit 19). W latches it when the handle (D3) goes from up to down between 22:00:00 and 06:59:59 while the workshop is locked and W has a time sync. Up-to-down only, debounced 50ms: a handle already down, including at W boot, does not raise it until it has been seen up. W saves the first push time to EEPROM (addresses 4–6), so the fault and time survive a W reboot, and later pushes don't overwrite it. The push time goes to H in `WToHPacket` (`handleTriedHour/Min/Sec`, hour 0xFF = none) and page 3 shows it as HH:MM:SS instead of H's own onset time. The mid-point LED flashes 1s/1s through the existing any-fault logic. The page 4 fault reset clears it. To protect the saved fault, W ignores the first `alertResetSeq` after its own boot and any drop to 0 (H rebooting); this applies to this fault only, the fire alarm reset is unchanged.
+
+## W/H — every handle push logged to handle.csv
+
+W queues each debounced handle push (8 max, later pushes dropped while full) and sends the oldest in `WToHPacket` (`handleEvtSeq`, `handleEvtDurMs`, `handleEvtUpAgoS`, `handleEvtLocked`) until H echoes the seq in `HToWPacket::handleEvtAck`. H acks only after the row is written, so pushes survive slow links, SD ejects and H reboots. The next seq is kept in W EEPROM (address 7) so it can't match H's last ack after a W reboot. H appends `down,up,duration_s,locked` to a new `handle.csv` when the handle comes back up, at any time of day and locked or not. Times are from H's RTC. Pushes under 50ms and a push held across a W reboot are not logged.
+
+## H Controller — daily solar kWh on page 2 and in energy.csv
+
+New `kwhSolar`, added in `accumulateEnergy()` per W packet with uncapped elapsed time and reset at midnight with the other daily totals. Solar W = `kSolarWPerC[duty]` × (solar hot − solar cold), duty = the higher of H and W pump duty. Counted as 0 when the pump is off, either sensor is faulted, or cold is at or above hot. `kSolarWPerC` (4–100%, W per °C) is a fixed copy of "All levels" column B in `logs/pump_w_per_c.xlsx`, made by `logs/make_pump_wpc.py` from heater runs in the Aug–Oct 2026 logs: heater W ÷ (htr_out − hot_pipe), rows only after 60s at the same heater level, W pump at 0%, rise ≥ 5°C, median per duty. 4–7% uses the 300W and 375W levels only (thermosiphon adds flow at higher power) and 100% is the 85–99% trend extended. Approximate: assumes 3000W at nominal mains voltage.
+
+Page 2 has a new `SolkWh:` row. `energy.csv` has a new last column `solar_kwh` (8 columns). **H deletes an old-format `energy.csv` at first boot, so copy it off the card before flashing.**
+
+## H Controller — known mismatch: 14.3% heater level fires 12.5%
+
+`kHeaterLevels` entry `{1, 7, 143}` fires 1 of 8 half-cycles = 12.5% (375W) but is labelled and accounted as 14.3% (429W), so heater kWh reads about 14% high at that level. Not changed. Fix by either 1 on / 6 off (real 14.3%) or `pct10` 125.
+
+## W Controller — serial debug changes
+
+`security` now also prints `handle`, `hold_off` and, when latched, `handle_tried` with the time and queued push count. The `.` printed on every missed H packet is removed; misses are still counted (`rx_miss` in `bus`).
+
+## Project — root platformio.ini removed
+
+The stale copy in the repo root made PlatformIO offer a second project with no `src/`, which fails to link with undefined `setup`/`loop`. The only project is now `Heating Control/`.
