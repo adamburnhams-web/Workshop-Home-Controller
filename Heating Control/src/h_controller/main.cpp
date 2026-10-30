@@ -1676,9 +1676,9 @@ void accumulateEnergy() {
 
     // H and W both drive the one solar pump; the higher duty is what it actually runs at
     uint8_t solarDuty = max(lastWPkt.solarPumpDutyPct, (uint8_t)roundf(hPumpDuty));
-    int16_t sHot = lastWPkt.tempSolarHot, sCold = lastWPkt.tempSolarCold;
-    energyLastSolarW = (sHot == TEMP_FAULT || sCold == TEMP_FAULT || sHot <= sCold) ? 0.0f
-                     : solarWPerC(solarDuty) * (sHot - sCold) / 10.0f;
+    int16_t sHot = lastWPkt.tempSolarHot, sPrePump = lastWPkt.tempPrePump;
+    energyLastSolarW = (sHot == TEMP_FAULT || sPrePump == TEMP_FAULT || sHot <= sPrePump) ? 0.0f
+                     : solarWPerC(solarDuty) * (sHot - sPrePump) / 10.0f;
 }
 
 // ============================================================
@@ -1694,7 +1694,7 @@ uint8_t       flushSinceLastLog  = 0;     // latched bits: 1 = 80°C+ flush burs
 File    energyLogFile;
 unsigned long lastEnergyLogMs = 0;
 
-static const uint8_t LOG_EXPECTED_COMMAS = 53; // 54 columns = 53 commas
+static const uint8_t LOG_EXPECTED_COMMAS = 58; // 59 columns = 58 commas
 static const uint8_t ENERGY_LOG_EXPECTED_COMMAS = 7; // 8 columns = 7 commas
 
 void initSD() {
@@ -1729,7 +1729,8 @@ void initSD() {
                             "ufh_cold_v,solar_cold_v,vac_iso_v,fan_flap_v,"
                             "w_rx_good,w_rx_badframe,h_needts,w_rx_age_s,solar_mode,flush,"
                             "htr_reason,avail_w,reserve_w,sys_mode,htr_mode,boost,"
-                            "solar_active,w_pump_reason,ufh_pump,ufh_reached,morning_heat"));
+                            "solar_active,w_pump_reason,ufh_pump,ufh_reached,morning_heat,pre_pump,"
+                            "door,pir,hold_off,locked"));
                 f.close();
             }
         }
@@ -1845,7 +1846,12 @@ void logDataRow() {
     logFile.print(lastWPkt.solarPumpReason);     logFile.print(',');
     logFile.print(lastWPkt.ufhPumpRunning);      logFile.print(',');
     logFile.print(lastWPkt.ufhTargetReached);    logFile.print(',');
-    logFile.println(morningHeatActive ? 1 : 0);
+    logFile.print(morningHeatActive ? 1 : 0);    logFile.print(',');
+    pT(lastWPkt.tempPrePump);
+    logFile.print(lastWPkt.doorOpen);            logFile.print(',');
+    logFile.print(lastWPkt.pirActive);           logFile.print(',');
+    logFile.print(lastWPkt.manualRelockOn);      logFile.print(',');
+    logFile.println(lastWPkt.workshopLocked);
     needTSSinceLastLog = false;
     flushSinceLastLog  = 0;
     logFile.flush();
@@ -2075,7 +2081,7 @@ void drawStatusBar() {
     else                             tft.print("         ");
 
     tft.setCursor(196, 2);
-    tft.print(nightCoolingEnabled ? "NC:ON " : "NC:OFF");
+    tft.print(nightCoolingEnabled ? "NC ON " : "NC OFF");
 
     tft.setCursor(272, 2);
     tft.print(solarTargetMode == SOLAR_TANK_PLUS8 ? "TK+ " : "MAX ");
@@ -2172,12 +2178,12 @@ void drawPage1(uint32_t wF) {
         tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(lx, y); tft.print(lbl);
         char vbuf[10], buf[10];
         if (fault) strcpy(vbuf, "FAULT");
-        else { dtostrf(val / 10.0f, 1, 1, vbuf); uint8_t n = strlen(vbuf); vbuf[n]=' '; vbuf[n+1]='C'; vbuf[n+2]='\0'; }
+        else { dtostrf(val / 10.0f, 1, 1, vbuf); }
         snprintf(buf, sizeof(buf), "%-7s", vbuf);
         tft.setTextColor(fault ? C_RED : C_CYAN, C_BLACK); tft.setCursor(vx, y); tft.print(buf);
     };
 
-    // Left column: W temperatures (rows 0-5)
+    // Left column: W temperatures (rows 0-6)
     printRow(4, 155, 0, "Solar Hot",    lastWPkt.tempSolarHot,    lastWPkt.tempSolarHot    == TEMP_FAULT);
     printRow(4, 155, 1, "Solar Cold",   lastWPkt.tempSolarCold,   lastWPkt.tempSolarCold   == TEMP_FAULT);
     printRow(4, 155, 2, "UFH Supply",   lastWPkt.tempUFHSupply,   lastWPkt.tempUFHSupply   == TEMP_FAULT);
@@ -2185,6 +2191,7 @@ void drawPage1(uint32_t wF) {
     pollBtns();
     printRow(4, 155, 4, "Workshop Air", lastWPkt.tempWorkshopAir, lastWPkt.tempWorkshopAir == TEMP_FAULT);
     printRow(4, 155, 5, "Outside Air",  lastWPkt.tempOutsideAir,  lastWPkt.tempOutsideAir  == TEMP_FAULT);
+    printRow(4, 155, 6, "Pre Pump",     lastWPkt.tempPrePump,     lastWPkt.tempPrePump     == TEMP_FAULT);
 
     // Right column: H temperatures (rows 0-6); rows 5-6 are the two heater sensors
     static const uint8_t hSensorIdx[7] = {
@@ -2209,15 +2216,15 @@ void drawPage1(uint32_t wF) {
     // Power row
     uint16_t y = yS;
     tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(4, y); tft.print("Heater");
-    { char tmp[8], buf[8]; snprintf(tmp, sizeof(tmp), "%dW", heaterRunning ? (int)(heaterLevelPct10() * 3) : 0); snprintf(buf, sizeof(buf), "%-5s", tmp); tft.setTextColor(C_CYAN, C_BLACK); tft.setCursor(82, y); tft.print(buf); }
-    tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(172, y); tft.print("Sol H:");
+    { char tmp[8], buf[8]; snprintf(tmp, sizeof(tmp), "%d", heaterRunning ? (int)(heaterLevelPct10() * 3) : 0); snprintf(buf, sizeof(buf), "%-5s", tmp); tft.setTextColor(C_CYAN, C_BLACK); tft.setCursor(82, y); tft.print(buf); }
+    tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(172, y); tft.print("Sol H");
     { char tmp[6], buf[6]; snprintf(tmp, sizeof(tmp), "%d%%", (int)roundf(hPumpDuty)); snprintf(buf, sizeof(buf), "%-4s", tmp); tft.setTextColor(C_CYAN, C_BLACK); tft.setCursor(250, y); tft.print(buf); }
-    tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(304, y); tft.print("Sol W:");
+    tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(304, y); tft.print("Sol W");
     { char tmp[6], buf[6]; snprintf(tmp, sizeof(tmp), "%d%%", lastWPkt.solarPumpDutyPct); snprintf(buf, sizeof(buf), "%-4s", tmp); tft.setTextColor(C_CYAN, C_BLACK); tft.setCursor(382, y); tft.print(buf); }
 
     // Valve states
     y = yS + 18;
-    tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(4, y); tft.print("V:");
+    tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(4, y); tft.print("V");
     tft.setCursor(30, y);
     auto vStr = [&](const char* n, bool open) {
         tft.setTextColor(open ? C_GREEN : C_WHITE, C_BLACK); tft.print(n); tft.print(' ');
@@ -2231,13 +2238,13 @@ void drawPage1(uint32_t wF) {
 
     // Winch state
     y = yS + 36;
-    tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(4, y); tft.print("Winch:");
+    tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(4, y); tft.print("Winch");
     { const char* ws[] = {"STOP","OPEN","CLOSE"}; char wsbuf[8]; snprintf(wsbuf, sizeof(wsbuf), "%-6s", ws[min(lastWPkt.winchState, (uint8_t)2)]); tft.setTextColor(C_CYAN, C_BLACK); tft.setCursor(82, y); tft.print(wsbuf); }
     tft.setTextColor((lastWPkt.winchReedFlags & WREED_SAFETY_LIMIT) ? C_RED : C_BLACK, C_BLACK); tft.print(" OVER!");
 
     // 15V bus voltage
     y = yS + 54;
-    tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(4, y); tft.print("Bus:");
+    tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(4, y); tft.print("Bus");
     { char bv[10]; dtostrf(busVoltageV, 1, 2, bv);
       uint8_t n = strlen(bv); bv[n] = 'V'; bv[n+1] = ' '; bv[n+2] = '\0';
       char buf[10]; snprintf(buf, sizeof(buf), "%-8s", bv);
@@ -2264,67 +2271,62 @@ void drawPage2() {
     char lv[10], rv[10];
     uint16_t y = 28;
     const uint16_t ROW = 22;
+    const uint16_t LVX = 112, RVX = 340; // one char clear of "Cons kWh" and "Imp kWh"
 
     // PV1 / PV2
-    snprintf(lv, sizeof(lv), gv ? "%-6dW" : "--    ", gv ? lastWPkt.pv1W : 0);
-    snprintf(rv, sizeof(rv), gv ? "%-6dW" : "--    ", gv ? lastWPkt.pv2W : 0);
-    wRow(4, 64, 244, 304, y, "PV1:", lv, "PV2:", rv); y += ROW;
+    snprintf(lv, sizeof(lv), gv ? "%-7d" : "--    ", gv ? lastWPkt.pv1W : 0);
+    snprintf(rv, sizeof(rv), gv ? "%-7d" : "--    ", gv ? lastWPkt.pv2W : 0);
+    wRow(4, LVX, 244, RVX, y, "PV1", lv, "PV2", rv); y += ROW;
 
     // PV Total (PV1 + PV2)
-    snprintf(lv, sizeof(lv), gv ? "%-6dW" : "--    ", gv ? (lastWPkt.pv1W + lastWPkt.pv2W) : 0);
-    wRow(4, 88, 244, 304, y, "PV Tot:", lv, "            ", ""); y += ROW;
+    snprintf(lv, sizeof(lv), gv ? "%-7d" : "--    ", gv ? (lastWPkt.pv1W + lastWPkt.pv2W) : 0);
+    wRow(4, LVX, 244, RVX, y, "PV Tot", lv, "            ", ""); y += ROW + 12;
 
     // Import (net; negative = exporting)
     int16_t importW = gv ? (int16_t)(lastWPkt.gridImportW - lastWPkt.pvExportW) : 0;
-    snprintf(lv, sizeof(lv), gv ? "%-6dW" : "--    ", importW);
-    wRow(4, 64, 244, 304, y, "Import:", lv, "            ", ""); y += ROW;
+    snprintf(lv, sizeof(lv), gv ? "%-7d" : "--    ", importW);
+    if (gv) snprintf(rv, sizeof(rv), "%u%%  ", lastWPkt.battSocPct);
+    else    snprintf(rv, sizeof(rv), "--  ");
+    wRow(4, LVX, 244, RVX, y, "Import", lv, "SOC", rv); y += ROW;
 
     int16_t hW = heaterRunning ? (int16_t)(heaterLevelPct10() * 3) : 0;
 
     // Consumption (PV + import - battery charge - heater)
-    snprintf(lv, sizeof(lv), gv ? "%-6dW" : "--    ",
+    snprintf(lv, sizeof(lv), gv ? "%-7d" : "--    ",
         gv ? (int16_t)(lastWPkt.pv1W + lastWPkt.pv2W + importW - lastWPkt.battChargeW - hW) : 0);
-    wRow(4, 76, 244, 304, y, "Cons:", lv, "            ", ""); y += ROW;
+    wRow(4, LVX, 244, RVX, y, "Cons", lv, "            ", ""); y += ROW;
 
     // Heater W
     {
-        snprintf(lv, sizeof(lv), "%-6dW", hW);
-        tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(4, y); tft.print("Heater:");
+        snprintf(lv, sizeof(lv), "%-7d", hW);
+        tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(4, y); tft.print("Heater");
         tft.setTextColor(heaterRunning ? C_GREEN : C_WHITE, C_BLACK);
-        tft.setCursor(100, y); tft.print(lv);
+        tft.setCursor(LVX, y); tft.print(lv);
         tft.setTextColor(gv ? C_BLACK : C_YELLOW, C_BLACK);
         tft.setCursor(244, y); tft.print(gv ? "          " : "No Growatt");
         y += ROW;
     }
 
     // Battery charge/discharge from Modbus r1012/r1010 (+ve=charging, -ve=discharging)
-    if (gv) {
-        int16_t bkw10 = (int16_t)(((int32_t)lastWPkt.battChargeW * 10) / 1000); // ×0.1kW
-        snprintf(lv, sizeof(lv), "%c%d.%dkW",
-            lastWPkt.battChargeW < 0 ? '-' : '+', abs(bkw10) / 10, abs(bkw10) % 10);
-    } else { snprintf(lv, sizeof(lv), "--     "); }
-    wRow(4, 76, 244, 304, y, "Batt:", lv, "            ", ""); y += ROW;
-
-    // Battery SOC
-    if (gv) snprintf(lv, sizeof(lv), "%u%%  ", lastWPkt.battSocPct);
-    else    snprintf(lv, sizeof(lv), "--  ");
-    wRow(4, 64, 244, 304, y, "SOC:", lv, "            ", ""); y += ROW;
+    snprintf(lv, sizeof(lv), gv ? "%+-7d" : "--     ", gv ? lastWPkt.battChargeW : 0);
+    wRow(4, LVX, 244, RVX, y, "Batt", lv, "            ", ""); y += ROW;
 
     // Daily kWh totals
+    y += 12;
     auto kwhStr = [&](char* buf, size_t n, float v) {
         char t[8]; dtostrf(v, 1, 1, t); snprintf(buf, n, "%-6s", t);
     };
     kwhStr(lv, sizeof(lv), kwhPV);      kwhStr(rv, sizeof(rv), kwhImport);
-    wRow(4, 80, 244, 336, y, "PVkWh:", lv, "ImpkWh:", rv); y += ROW;
+    wRow(4, LVX, 244, RVX, y, "PV kWh", lv, "Imp kWh", rv); y += ROW;
 
-    kwhStr(lv, sizeof(lv), kwhHeater);  kwhStr(rv, sizeof(rv), kwhExport);
-    wRow(4, 96, 244, 336, y, "HtrkWh:", lv, "ExpkWh:", rv); y += ROW;
+    kwhStr(lv, sizeof(lv), kwhConsumption);  kwhStr(rv, sizeof(rv), kwhExport);
+    wRow(4, LVX, 244, RVX, y, "Cons kWh", lv, "Exp kWh", rv); y += ROW;
 
-    kwhStr(lv, sizeof(lv), kwhConsumption);
-    wRow(4, 100, 244, 336, y, "ConsKWh:", lv, "            ", ""); y += ROW;
+    kwhStr(lv, sizeof(lv), kwhHeater);
+    wRow(4, LVX, 244, RVX, y, "Htr kWh", lv, "            ", ""); y += ROW;
 
     kwhStr(lv, sizeof(lv), kwhSolar);
-    wRow(4, 96, 244, 336, y, "SolkWh:", lv, "            ", ""); y += ROW;
+    wRow(4, LVX, 244, RVX, y, "Sol kWh", lv, "            ", ""); y += ROW;
 }
 
 // ── Page 3: Fault History ────────────────────────────────
@@ -2451,7 +2453,7 @@ static const uint8_t PAGE4_LEFT_ROWS = 7;
 void getPage4Value(uint8_t item, char* buf, uint8_t bufSz) {
     switch (item) {
         case 0: { const char* bm[] = {"Off","Boost-5am","8hr"}; strlcpy(buf, bm[boostMode], bufSz); break; }
-        case 1: snprintf(buf, bufSz, "%.1fC", (double)boostTarget); break;
+        case 1: snprintf(buf, bufSz, "%.1f", (double)boostTarget); break;
         case 2: strlcpy(buf, systemMode == MODE_WINTER ? "Winter" : "Summer", bufSz); break;
         case 3: { const char* mm[] = {"Off","SOC-Lim","Manual On"}; strlcpy(buf, mm[manualHeaterMode], bufSz); break; }
         case 4: strlcpy(buf, nightCoolingEnabled ? "On" : "Off", bufSz); break;
@@ -2669,7 +2671,7 @@ void drawPage5() {
         prevWinchState5 = lastWPkt.winchState;
         prevReedFlags5  = lastWPkt.winchReedFlags;
     }
-    tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(4, y); tft.print("Winch:");
+    tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(4, y); tft.print("Winch");
     { const char* ws[] = {"Idle","Open","Close"}; char wbuf[8]; snprintf(wbuf, sizeof(wbuf), "%-6s", ws[min(lastWPkt.winchState, (uint8_t)2)]); tft.setTextColor(C_CYAN, C_BLACK); tft.setCursor(82, y); tft.print(wbuf); }
     tft.setCursor(175, y);
     if (lastWPkt.winchReedFlags & WREED_FULLY_OPEN)   { tft.setTextColor(C_AMBER, C_BLACK); tft.print(" OPEN"); }
@@ -2991,7 +2993,7 @@ void drawPage7() {
     auto tempRow = [&](uint16_t lx, uint16_t vx, uint16_t y, const char* lbl, int16_t enc) {
         char v[10];
         if (enc == TEMP_FAULT) strcpy(v, "FAULT");
-        else { dtostrf(enc / 10.0f, 1, 1, v); strcat(v, "C"); }
+        else dtostrf(enc / 10.0f, 1, 1, v);
         row(lx, vx, y, lbl, v, enc == TEMP_FAULT ? C_RED : C_CYAN);
     };
     auto hEnc = [](uint8_t si) -> int16_t { return sRawFault[si] ? TEMP_FAULT : (int16_t)(sTemp[si] * 10.0f); };
@@ -3018,26 +3020,28 @@ void drawPage7() {
                : SR_NONE;
     static uint8_t prevSr = 0xFF;
     const uint16_t SRY = 242;
+    // "Solar Return" ends exactly at LVX, so its value sits further right than other rows
+    const uint16_t SRX = LVX + 12;
     tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(LX, SRY); tft.print("Solar Return");
     if (sr != prevSr || needFullRedraw) {
-        tft.fillRect(LVX, SRY, 84, 16, C_BLACK);
-        if (sr == SR_LOG) { tft.setTextColor(C_CYAN, C_BLACK); tft.setCursor(LVX, SRY); tft.print("Log"); }
-        else if (sr == SR_UP)   { tft.fillTriangle(LVX + 7, SRY, LVX, SRY + 8, LVX + 14, SRY + 8, C_CYAN); tft.fillRect(LVX + 4, SRY + 8, 6, 8, C_CYAN); }
-        else if (sr == SR_DOWN) { tft.fillTriangle(LVX + 7, SRY + 15, LVX, SRY + 8, LVX + 14, SRY + 8, C_CYAN); tft.fillRect(LVX + 4, SRY, 6, 8, C_CYAN); }
+        tft.fillRect(SRX, SRY, 72, 16, C_BLACK);
+        if (sr == SR_LOG) { tft.setTextColor(C_CYAN, C_BLACK); tft.setCursor(SRX, SRY); tft.print("Log"); }
+        else if (sr == SR_UP)   { tft.fillTriangle(SRX + 7, SRY, SRX, SRY + 8, SRX + 14, SRY + 8, C_CYAN); tft.fillRect(SRX + 4, SRY + 8, 6, 8, C_CYAN); }
+        else if (sr == SR_DOWN) { tft.fillTriangle(SRX + 7, SRY + 15, SRX, SRY + 8, SRX + 14, SRY + 8, C_CYAN); tft.fillRect(SRX + 4, SRY, 6, 8, C_CYAN); }
         prevSr = sr;
     }
     pollBtns();
 
     // Right column
-    if (gv) snprintf(v, sizeof(v), "%dW", lastWPkt.pv1W + lastWPkt.pv2W); else strcpy(v, "--");
+    if (gv) snprintf(v, sizeof(v), "%d", lastWPkt.pv1W + lastWPkt.pv2W); else strcpy(v, "--");
     row(RX, RVX, 60, "PV", v, C_CYAN);
     // Consumption matches page 2: PV + net import - battery charge - heater
     int16_t importW = gv ? (int16_t)(lastWPkt.gridImportW - lastWPkt.pvExportW) : 0;
-    if (gv) snprintf(v, sizeof(v), "%dW", (int16_t)(lastWPkt.pv1W + lastWPkt.pv2W + importW - lastWPkt.battChargeW - hW)); else strcpy(v, "--");
+    if (gv) snprintf(v, sizeof(v), "%d", (int16_t)(lastWPkt.pv1W + lastWPkt.pv2W + importW - lastWPkt.battChargeW - hW)); else strcpy(v, "--");
     row(RX, RVX, 112, "Consumption", v, C_CYAN);
-    if (gv) snprintf(v, sizeof(v), "%dW", lastWPkt.battChargeW); else strcpy(v, "--");
+    if (gv) snprintf(v, sizeof(v), "%d", lastWPkt.battChargeW); else strcpy(v, "--");
     row(RX, RVX, 138, "Battery", v, C_CYAN);
-    snprintf(v, sizeof(v), "%dW", hW);
+    snprintf(v, sizeof(v), "%d", hW);
     row(RX, RVX, 164, "Heater", v, C_CYAN);
     if (gv) snprintf(v, sizeof(v), "%d%%", lastWPkt.battSocPct); else strcpy(v, "--");
     row(RX, RVX, 216, "SOC", v, C_CYAN);
@@ -3187,7 +3191,7 @@ void updateDisplayBanners() {
         tft.setTextColor(C_WHITE); tft.setTextSize(2); tft.setCursor(2, 282);
         uint8_t soc = lastWPkt.battSocPct;
         char socBuf[28];
-        snprintf(socBuf, sizeof(socBuf), "SOC-LIM: %u%% — %s", soc, soc > 50 ? "HEATING" : "DONE");
+        snprintf(socBuf, sizeof(socBuf), "SOC-LIM %u%% — %s", soc, soc > 50 ? "HEATING" : "DONE");
         tft.print(socBuf);
     } else if (manualHeaterMode == MHM_FORCE_ON) {
         tft.fillRect(0, 280, 480, 20, C_RED);
@@ -3639,6 +3643,7 @@ static void dbgTemps() {
         pW(F("solar_hot"),    lastWPkt.tempSolarHot);
         pW(F("solar_cold"),   lastWPkt.tempSolarCold);
         pW(F("workshop_air"), lastWPkt.tempWorkshopAir);
+        pW(F("pre_pump"),     lastWPkt.tempPrePump);
     }
 }
 

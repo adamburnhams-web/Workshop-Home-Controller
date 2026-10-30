@@ -7,7 +7,7 @@ Allow without asking: `cd`, `dir`, `type`, `git status`, `git log`, `git diff`, 
 Home heating controller split across two Arduino Mega 2560s communicating over RS485.
 
 - **H controller** (house side): hot water tank, immersion heater, TFT display, RTC, SD card, 7× DS18B20 sensors
-- **W controller** (workshop side): solar thermal pump, UFH pump, PC fans, door lock, window winch, vacuum system, Growatt inverter Modbus, 6× DS18B20 sensors
+- **W controller** (workshop side): solar thermal pump, UFH pump, PC fans, door lock, window winch, vacuum system, Growatt inverter Modbus, 7× DS18B20 sensors
 
 Source lives in `Heating Control/` as a PlatformIO project.
 
@@ -69,7 +69,7 @@ Stop W solar pump from H: `simWPumpStop` (sets calPumpActive=1, calSolarTargetC=
 ### W controller commands
 `temps` `valves` `faults` `mode` `status` `pump` `fans` `security` `growatt` `scan` `set <sensor> <val>`
 
-Set sensors: `solar_hot` `solar_cold` `ufh_supply` `ufh_post_tmv` `workshop_air` `outside_air`
+Set sensors: `solar_hot` `solar_cold` `ufh_supply` `ufh_post_tmv` `workshop_air` `outside_air` `pre_pump`
 Set binary: `pir` `door` `winch_cls` `winch_lock` (value `0` or `1`; append `_clear` to key to remove sim)
 Set pump speed sim: `set pump_spd <0-100>` / `set pump_spd_clear 0`
 Set heater pct sim: `set heater_pct <0-100>` / `set heater_pct_clear 0`
@@ -81,7 +81,7 @@ Scans the 1-Wire bus and prints all DS18B20 addresses in array-literal format, r
 All addresses are filled in (commissioning complete for both controllers).
 
 - H controller (7 sensors): [src/h_controller/main.cpp ~line 77](Heating Control/src/h_controller/main.cpp) — `tank_bot`, `tank_mid`, `tank_top`, `hot_pipe`, `cold_pipe`, `htr_out` (sensor 12), `htr_out_2` (sensor 13)
-- W controller (6 sensors): [src/w_controller/main.cpp ~line 91](Heating Control/src/w_controller/main.cpp) — `solar_hot`, `solar_cold`, `ufh_supply`, `ufh_post_tmv`, `workshop_air`, `outside_air`
+- W controller (7 sensors): [src/w_controller/main.cpp ~line 91](Heating Control/src/w_controller/main.cpp) — `solar_hot`, `solar_cold`, `ufh_supply`, `ufh_post_tmv`, `workshop_air`, `outside_air`, `pre_pump`
 
 ## SCT (SOC Calibration Test) — H controller
 20-level heater sweep, each step 15 min, logging every 2s to `sct.csv` on SD card.

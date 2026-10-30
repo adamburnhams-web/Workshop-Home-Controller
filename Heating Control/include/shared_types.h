@@ -83,6 +83,7 @@ enum WinchState : uint8_t {
 #define FAULT_W_SENSOR_OUTSIDE_AIR   (1UL << 17)
 #define FAULT_W_FIRE_ALARM           (1UL << 18)
 #define FAULT_W_HANDLE_TRIED         (1UL << 19)  // door handle pushed 22:00-07:00 while locked, latched until fault reset
+#define FAULT_W_SENSOR_PRE_PUMP      (1UL << 20)
 
 // H-side faults (in hFaultFlags)
 #define FAULT_H_HEATER_OVERHEAT_SHUT (1UL << 1)
@@ -129,6 +130,7 @@ struct __attribute__((packed)) WToHPacket {
     int16_t tempUFHPostTMV;     // after TMV; 45°C lockout
     int16_t tempWorkshopAir;
     int16_t tempOutsideAir;
+    int16_t tempPrePump;
 
     // Growatt inverter data
     int16_t pv1W;               // PV string 1 power W

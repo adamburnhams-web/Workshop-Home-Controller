@@ -94,14 +94,15 @@ static const bool BUZZER_ENABLED = false;
 // ============================================================
 
 // DS18B20 64-bit addresses — scan with address-scan sketch and fill in
-// Sensor order: solar_hot, solar_cold, UFH_supply, UFH_post_TMV, workshop_air, outside_air
-static const uint8_t DS18B20_ADDRS[6][8] = {
+// Sensor order: solar_hot, solar_cold, UFH_supply, UFH_post_TMV, workshop_air, outside_air, pre_pump
+static const uint8_t DS18B20_ADDRS[7][8] = {
     { 0x28, 0xFE, 0xB5, 0x14, 0x00, 0x00, 0x00, 0xD4 }, // solar hot      (sensor 1)
     { 0x28, 0x64, 0x27, 0x15, 0x00, 0x00, 0x00, 0x11 }, // solar cold     (sensor 2)
     { 0x28, 0xE1, 0xEB, 0x14, 0x00, 0x00, 0x00, 0x9C }, // UFH supply     (sensor 3)
     { 0x28, 0xD1, 0x67, 0x15, 0x00, 0x00, 0x00, 0x14 }, // UFH post TMV   (sensor 4)
     { 0x28, 0x45, 0x77, 0x12, 0x00, 0x00, 0x00, 0x83 }, // workshop air   (sensor 5)
     { 0x28, 0xC9, 0x83, 0x12, 0x00, 0x00, 0x00, 0xAD }, // outside air    (sensor 6)
+    { 0x28, 0x9A, 0xB5, 0x3D, 0x79, 0x25, 0x0B, 0x57 }, // pre pump
 };
 #define SENSOR_SOLAR_HOT    0
 #define SENSOR_SOLAR_COLD   1
@@ -109,7 +110,8 @@ static const uint8_t DS18B20_ADDRS[6][8] = {
 #define SENSOR_UFH_POST_TMV 3
 #define SENSOR_WORKSHOP_AIR 4
 #define SENSOR_OUTSIDE_AIR  5
-#define NUM_SENSORS         6
+#define SENSOR_PRE_PUMP     6
+#define NUM_SENSORS         7
 
 // INA219 — solar pump current limits (amps). Both sampled during ON pulse only.
 static const float SOLAR_PUMP_MIN_CURRENT_A = 0.20f;
@@ -727,7 +729,8 @@ void readSensors() {
                 static const uint32_t sensorFaultMask[NUM_SENSORS] = {
                     FAULT_W_SENSOR_SOLAR_HOT, FAULT_W_SENSOR_SOLAR_COLD,
                     FAULT_W_SENSOR_UFH_SUPPLY, FAULT_W_SENSOR_UFH_POST_TMV,
-                    FAULT_W_SENSOR_WORKSHOP_AIR, FAULT_W_SENSOR_OUTSIDE_AIR
+                    FAULT_W_SENSOR_WORKSHOP_AIR, FAULT_W_SENSOR_OUTSIDE_AIR,
+                    FAULT_W_SENSOR_PRE_PUMP
                 };
                 clearFault(sensorFaultMask[i]);
             }
@@ -745,7 +748,8 @@ void readSensors() {
                 static const uint32_t sensorFaultMask[NUM_SENSORS] = {
                     FAULT_W_SENSOR_SOLAR_HOT, FAULT_W_SENSOR_SOLAR_COLD,
                     FAULT_W_SENSOR_UFH_SUPPLY, FAULT_W_SENSOR_UFH_POST_TMV,
-                    FAULT_W_SENSOR_WORKSHOP_AIR, FAULT_W_SENSOR_OUTSIDE_AIR
+                    FAULT_W_SENSOR_WORKSHOP_AIR, FAULT_W_SENSOR_OUTSIDE_AIR,
+                    FAULT_W_SENSOR_PRE_PUMP
                 };
                 setFault(sensorFaultMask[i]);
             }
@@ -2635,6 +2639,7 @@ void sendWToHPacket() {
     pkt.tempUFHPostTMV  = sFault[SENSOR_UFH_POST_TMV] ? TEMP_FAULT : (int16_t)(sTemp[SENSOR_UFH_POST_TMV] * 10);
     pkt.tempWorkshopAir = sFault[SENSOR_WORKSHOP_AIR] ? TEMP_FAULT : (int16_t)(sTemp[SENSOR_WORKSHOP_AIR] * 10);
     pkt.tempOutsideAir  = sFault[SENSOR_OUTSIDE_AIR]  ? TEMP_FAULT : (int16_t)(sTemp[SENSOR_OUTSIDE_AIR]  * 10);
+    pkt.tempPrePump     = sFault[SENSOR_PRE_PUMP]     ? TEMP_FAULT : (int16_t)(sTemp[SENSOR_PRE_PUMP]     * 10);
 
     // Growatt inverter data
     pkt.growattValid    = growatt.valid ? 1 : 0;
@@ -2887,6 +2892,7 @@ static void dbgTemps() {
     dbgPrintTemp(SENSOR_UFH_POST_TMV, F("ufh_post_tmv"));
     dbgPrintTemp(SENSOR_WORKSHOP_AIR, F("workshop_air"));
     dbgPrintTemp(SENSOR_OUTSIDE_AIR,  F("outside_air"));
+    dbgPrintTemp(SENSOR_PRE_PUMP,     F("pre_pump"));
 }
 
 static void dbgValves() {
@@ -2916,6 +2922,7 @@ WF(FAULT_W_SOLAR_OVERHEAT_HOT,   "SOLAR_OVERHEAT_HOT")
     WF(FAULT_W_SENSOR_UFH_POST_TMV,  "SENSOR_UFH_POST_TMV")
     WF(FAULT_W_SENSOR_WORKSHOP_AIR,  "SENSOR_WORKSHOP_AIR")
     WF(FAULT_W_SENSOR_OUTSIDE_AIR,   "SENSOR_OUTSIDE_AIR")
+    WF(FAULT_W_SENSOR_PRE_PUMP,      "SENSOR_PRE_PUMP")
     #undef WF
     if (!any) Serial.println(F("  none"));
     if (busRecoveryCount > 0) {
@@ -3156,6 +3163,7 @@ static void dbgSet(char* key, char* val) {
     else if (!strcmp_P(key, PSTR("ufh_post_tmv"))) si = SENSOR_UFH_POST_TMV;
     else if (!strcmp_P(key, PSTR("workshop_air"))) si = SENSOR_WORKSHOP_AIR;
     else if (!strcmp_P(key, PSTR("outside_air")))  si = SENSOR_OUTSIDE_AIR;
+    else if (!strcmp_P(key, PSTR("pre_pump")))     si = SENSOR_PRE_PUMP;
 
     if (si < NUM_SENSORS) {
         if (fval >= 999.0f) { sSimulate[si] = false; Serial.println(F("cleared")); }
@@ -3200,7 +3208,7 @@ static void handleDebugCommand(char* buf) {
         Serial.println(F("temps  valves  faults  mode  status  bus  pump  fans  security  growatt  growattlisten"));
         Serial.println(F("scan  (1-Wire address discovery)  i2cscan  (I2C address discovery)"));
         Serial.println(F("set <sensor> <val>  (val=999 clears sim)"));
-        Serial.println(F("  sensors: solar_hot solar_cold ufh_supply ufh_post_tmv workshop_air outside_air"));
+        Serial.println(F("  sensors: solar_hot solar_cold ufh_supply ufh_post_tmv workshop_air outside_air pre_pump"));
         Serial.println(F("set pir|door|winch_cls|winch_lock <0|1>"));
         Serial.println(F("set pir_clear|door_clear|winch_cls_clear|winch_lock_clear 0"));
         Serial.println(F("set pv_out|pv_export|batt_soc|batt_charge <val>  (Growatt sim)"));

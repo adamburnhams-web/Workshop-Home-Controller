@@ -1287,9 +1287,9 @@ W queues each debounced handle push (8 max, later pushes dropped while full) and
 
 ## H Controller — daily solar kWh on page 2 and in energy.csv
 
-New `kwhSolar`, added in `accumulateEnergy()` per W packet with uncapped elapsed time and reset at midnight with the other daily totals. Solar W = `kSolarWPerC[duty]` × (solar hot − solar cold), duty = the higher of H and W pump duty. Counted as 0 when the pump is off, either sensor is faulted, or cold is at or above hot. `kSolarWPerC` (4–100%, W per °C) is a fixed copy of "All levels" column B in `logs/pump_w_per_c.xlsx`, made by `logs/make_pump_wpc.py` from heater runs in the Aug–Oct 2026 logs: heater W ÷ (htr_out − hot_pipe), rows only after 60s at the same heater level, W pump at 0%, rise ≥ 5°C, median per duty. 4–7% uses the 300W and 375W levels only (thermosiphon adds flow at higher power) and 100% is the 85–99% trend extended. Approximate: assumes 3000W at nominal mains voltage.
+New `kwhSolar`, added in `accumulateEnergy()` per W packet with uncapped elapsed time and reset at midnight with the other daily totals. Solar W = `kSolarWPerC[duty]` × (solar hot − pre pump), duty = the higher of H and W pump duty. Counted as 0 when the pump is off, either sensor is faulted, or pre pump is at or above solar hot. `kSolarWPerC` (4–100%, W per °C) is a fixed copy of "All levels" column B in `logs/pump_w_per_c.xlsx`, made by `logs/make_pump_wpc.py` from heater runs in the Aug–Oct 2026 logs: heater W ÷ (htr_out − hot_pipe), rows only after 60s at the same heater level, W pump at 0%, rise ≥ 5°C, median per duty. 4–7% uses the 300W and 375W levels only (thermosiphon adds flow at higher power) and 100% is the 85–99% trend extended. Approximate: assumes 3000W at nominal mains voltage.
 
-Page 2 has a new `SolkWh:` row. `energy.csv` has a new last column `solar_kwh` (8 columns). **H deletes an old-format `energy.csv` at first boot, so copy it off the card before flashing.**
+Page 2 has a new `Sol kWh` row. `energy.csv` has a new last column `solar_kwh` (8 columns). **H deletes an old-format `energy.csv` at first boot, so copy it off the card before flashing.**
 
 ## H Controller — known mismatch: 14.3% heater level fires 12.5%
 
@@ -1302,3 +1302,15 @@ Page 2 has a new `SolkWh:` row. `energy.csv` has a new last column `solar_kwh` (
 ## Project — root platformio.ini removed
 
 The stale copy in the repo root made PlatformIO offer a second project with no `src/`, which fails to link with undefined `setup`/`loop`. The only project is now `Heating Control/`.
+
+## W + H Controller — new `pre_pump` temperature sensor
+
+W reads a 7th DS18B20 (`pre_pump`), used only for the solar kWh calculation: no control logic uses it. It has its own fault flag (`FAULT_W_SENSOR_PRE_PUMP`, bit 20), which shows as `W Sensr Flt` on the fault bar. `tempPrePump` is added to `WToHPacket`, so **W and H must both be flashed or H rejects W's packets**. H shows it as `Pre Pump` on the temps page and in `temps`. `log.csv` has new last columns `pre_pump`, `door`, `pir`, `hold_off`, `locked` (59 columns); the last four are the state at each write, so changes shorter than the 5s interval can be missed. **H deletes an old-format `log.csv` at first boot, so copy it off the card before flashing.**
+
+## H Controller — display tidy-up
+
+Units `C` and `W` removed from readings on all pages (kWh labels, `%`, `h`, `d` and `Bus` volts kept; `W` in `Pump W` and `Sol W` means the W controller). Label colons removed on all pages, including `NC ON`/`NC OFF` and the `SOC-LIM` banner (clock and fault times keep theirs).
+
+Page 2: `Batt` in watts with sign (+ charging, − discharging); values aligned in fixed columns; `kWh` labels spaced (`PV kWh` etc., `ConsKWh` → `Cons kWh`); `SOC` moved to the right of `Import`; `Cons kWh` now sits beside `Exp kWh` with `Htr kWh` below it; 12px gaps below `PV Tot` and `Batt`. The `Import` value used to overwrite the end of its label, which the fixed column also fixes.
+
+Page 7: `Solar Return` arrow/`Log` moved 12px right, clear of the label.
