@@ -32,7 +32,7 @@
 #define PIN_WINCH_SAFETY     8   // pull-up; LOW=over-open safety limit
 #define PIN_VAC_SENSOR       9   // pull-up; LOW=full vacuum, HIGH=low vacuum
 #define PIN_UNLOCK_BTN      46   // 15VDC via 10k/4.7k divider
-#define PIN_LOCK_SW         11   // 15VDC via 10k/4.7k divider; HIGH=lock workshop
+#define PIN_LOCK_SW         11   // 15VDC via 10k/4.7k divider; HIGH=start vacuum cycle if not run today
 #define PIN_MANUAL_RELOCK   12   // dry contact, pull-up; LOW=suppression ON
 #define PIN_ONE_WIRE        13   // DS18B20 1-Wire bus (6 sensors)
 
@@ -48,12 +48,12 @@
 // Odd board  (D23–D37): D25 D27 D29 D31 D33 D35 D37  (D23 spare)
 #define PIN_UFH_COLD_DIR    22   // even ch1: SPDT direction relay, NO=open, NC=close
 // D23: spare (odd ch1)
-#define PIN_ALARM_SOUNDER   26   // even ch3: alarm sounder at W
+#define PIN_HEN_DOOR_OPEN   26   // even ch3: hen house door H-bridge, energise=open
 #define PIN_INT_LIGHTS      23   // odd  ch1: internal workshop lights
 #define PIN_EXT_LIGHTS      25   // odd  ch2: external LED lights
 #define PIN_SOLAR_COLD_DIR  24   // even ch2: SPDT direction relay
 #define PIN_WALL_FAN        27   // odd  ch3: wall axial fan (BES speed controller)
-#define PIN_FAN_FLAP        28   // even ch4: fan flap actuator (open before fan ON)
+#define PIN_HEN_DOOR_CLOSE  28   // even ch4: hen house door H-bridge, energise=close
 #define PIN_WINCH_POWER     29   // odd  ch4: winch power (with direction ch5 or ch6)
 #define PIN_DOOR_LOCK_A     30   // even ch5: door lock H-bridge relay 1
 #define PIN_WINCH_DIR_OPEN  31   // odd  ch5: winch direction open (with power ch4)
@@ -65,8 +65,8 @@
 #define PIN_UFH_PUMP        37   // odd  ch8: UFH central heating pump
 // 4th relay board (D41, D42, D48–D53)
 #define PIN_BUZZER_SIGNAL   41   // board4 ch1: pulls 2.5mm T&E earth → buzzer at H
-#define PIN_HEN_DOOR_OPEN   42   // board4 ch2: hen house door open
-#define PIN_HEN_DOOR_CLOSE  48   // board4 ch3: hen house door close
+#define PIN_ALARM_SOUNDER   42   // board4 ch2: alarm sounder at W
+#define PIN_FAN_FLAP        48   // board4 ch3: fan flap actuator (open before fan ON)
 #define PIN_MIDPOINT_LED    49   // board4 ch4: 12VDC status LED relay
 #define PIN_SENSOR_PWR_RELAY 50  // board4 ch5: 1-Wire bus power relay (energise=cut power to sensors)
 // D51–D53: spare (board4 ch6–ch8)
@@ -140,6 +140,7 @@ static const uint16_t VALVE_POWERUP_WAIT_MS = 30000;
 #define UFH_OVERHEAT_C      450   // 45.0°C — hard lockout trigger
 #define RELOCK_TIMEOUT_MS  600000UL  // 10 minutes
 #define RELOCK_GRACE_MS    600000UL  // PIR within 10 min of an auto-lock unlocks again
+#define INT_LIGHTS_IDLE_MS 180000UL  // internal lights off after 3 min door shut + no PIR
 #define ALARM_DURATION_MS   60000UL  // 1-minute alarm auto-stop
 #define HANDLE_ALERT_NIGHT_MIN_MS 10000UL
 #define INTER_CTRL_POLL_MS  250UL
@@ -154,6 +155,9 @@ static const uint16_t VALVE_POWERUP_WAIT_MS = 30000;
 #define VAC_PUMP_MAX_MS    1800000UL // 30 minutes
 #define VAC_PUMP_PREWARM_MS  2000UL  // pump-on lead time before valve opens
 #define VAC_EXTRA_RUN_MS   600000UL  // 10 extra minutes after full vacuum
+// TEMPORARY: vacuum sensor faulty — ignore it and run a fixed time. Set false once sensor fixed.
+#define VAC_SENSOR_BYPASS  true
+#define VAC_BYPASS_RUN_MS  900000UL  // 15 minutes
 #define VALVE_PULSE_MS      7000UL   // H-bridge valve travel time
 #define LOCK_PULSE_MS       1000UL   // door lock pulse
 #define HBRIDGE_DEAD_MS      200UL   // dead-time between relay changes
@@ -161,7 +165,6 @@ static const uint16_t VALVE_POWERUP_WAIT_MS = 30000;
 #define TIME_SYNC_INTERVAL_MS 3600000UL // 1 hour
 #define EEPROM_FAN_BASE_ADDR 0       // EEPROM address for fan base speed
 #define EEPROM_LOCK_STATE_ADDR 1     // 0 = unlocked; anything else (incl. blank 0xFF) = locked
-#define EEPROM_VAC_LAST_DAY_ADDR 2   // uint16 day number of last completed vacuum cycle (2 bytes)
 #define EEPROM_HANDLE_TRIED_ADDR 4   // h,m,s of first night handle push (3 bytes); h 0xFF = none
 #define EEPROM_HANDLE_SEQ_ADDR   7   // next handle push seq — kept across reboots so it can't match H's last ack
 
@@ -439,6 +442,7 @@ enum VacState : uint8_t { VAC_IDLE, VAC_PUMP_START, VAC_OPENING, VAC_PUMPING, VA
 VacState     vacState           = VAC_IDLE;
 unsigned long vacStateEnteredMs = 0;
 bool          vacFullThisSession = false;
+bool          vacBtnRequest      = false;
 
 // ============================================================
 //  SECURITY STATE
@@ -498,6 +502,28 @@ unsigned long handleAlertStartMs  = 0;
 bool          extLightsOn         = false;
 
 // ============================================================
+//  HEN HOUSE DOOR STATE
+// ============================================================
+
+// RAM only — `hen open_ms`/`hen close_ms` changes are lost on reboot
+uint16_t      henOpenRunMs      = 14000;
+uint16_t      henCloseRunMs     = 9500;
+// Both H-bridge relays off for this long before reversing, so the motor is never shorted
+#define HEN_DEADTIME_MS     500UL
+
+enum HenDoorState : uint8_t { HEN_UNKNOWN, HEN_OPEN, HEN_CLOSED, HEN_OPENING, HEN_CLOSING };
+HenDoorState  henState          = HEN_UNKNOWN;
+HenDoorState  henPending        = HEN_UNKNOWN;  // HEN_OPENING/HEN_CLOSING waiting out deadtime
+unsigned long henStepStartMs    = 0;
+// Schedule only acts on a change of wanted state, so a manual open/close holds until the next sunrise/close time
+int8_t        henLastWantOpen   = -1;
+#ifdef DEBUG_SERIAL
+bool          henCycleActive    = false;
+bool          henCycleNextOpen  = false;
+unsigned long henCycleLastMs    = 0;
+#endif
+
+// ============================================================
 //  FIRE ALARM STATE
 // ============================================================
 
@@ -509,6 +535,7 @@ bool          fireAlarmActive      = false;
 uint8_t       fireAlarmTriggerSeq  = 0;  // alertResetSeq value at time of trigger
 
 bool          gDoorOpen            = false;  // set by updateSecurity() each loop
+bool          gPirActive           = false;  // set by updateSecurity() each loop
 uint8_t       gWinchReedFlags      = 0;      // set by updateWinchInputs() each loop
 bool          wAirRising           = false;
 float         wAirPrevMinTemp      = NAN;
@@ -555,8 +582,11 @@ bool        summerSeqDone   = false;
 bool solarPumpActive  = false;
 bool solarActiveEver  = false; // for vacuum system "heating active" check
 bool solarDumpUFHOn   = false; // UFH pump running for emergency solar dump; sent to H
+// Frost latch: stays active (valves open) from the first dip until winter solar triggers
 bool frostProtActive = false;
-bool frostProtUFHOpen = false;
+bool frostPumpOn     = false;
+bool frostRearmed    = false;
+bool frostUFHOn      = false; // UFH pump forced on by FROST_NOT_RECOVERING
 unsigned long winterSolarStartMs = 0;
 bool winterUFHBoost  = false; // winter: UFH pump on (solar pump held at 0) from solar hot 35°C, off below 30°C
 
@@ -1157,37 +1187,20 @@ void updateFanControl() {
 //  VACUUM SYSTEM
 // ============================================================
 
-static uint16_t dayOfYearForSunset(uint8_t month, uint8_t day);
-
-// Days since 2000-01-01 (year held as year - 2000, 2000-2099 only).
-static uint16_t dayNumber(uint8_t yy, uint8_t m, uint8_t d) {
-    uint16_t n = yy * 365u + (yy + 3) / 4 + dayOfYearForSunset(m, d);
-    if (yy % 4 == 0 && (m > 2 || (m == 2 && d == 29))) n++;
-    return n;
-}
-
-// No cycle today or yesterday. Blank EEPROM (0xFFFF) or a date ahead of the
-// clock reads as never run.
-static bool vacOverdue() {
-    uint16_t last;
-    EEPROM.get(EEPROM_VAC_LAST_DAY_ADDR, last);
-    uint16_t today = dayNumber(curYear, curMonth, curDay);
-    return last > today || today - last >= 2;
-}
-
 void updateVacuum() {
     // Winter solar only feeds the workshop UFH, so it doesn't call for vacuum; summer solar
     // (incl. the PV export override) does, once a day.
     bool summerSolar = solarPumpActive && hasHPacket && lastH.systemMode == MODE_SUMMER;
     bool heatingOrSolarActive = summerSolar || ufhState == WUFH_ACTIVE
-                                 || ufhState == WUFH_COOLING
-                                 || (!workshopLocked && timeSynced && vacOverdue());
+                                 || ufhState == WUFH_COOLING;
+    bool btnRequest = vacBtnRequest;
+    vacBtnRequest = false;
     bool vacSensorFull = (digitalRead(PIN_VAC_SENSOR) == LOW);
     unsigned long now  = millis();
 
     switch (vacState) {
         case VAC_IDLE:
-            if (heatingOrSolarActive && !vacFullThisSession) {
+            if ((heatingOrSolarActive || btnRequest) && !vacFullThisSession) {
                 digitalWrite(PIN_VAC_PUMP, RELAY_ON);
                 vacStateEnteredMs = now;
                 vacState = VAC_PUMP_START;
@@ -1211,7 +1224,14 @@ void updateVacuum() {
             break;
 
         case VAC_PUMPING:
-            if (vacSensorFull) {
+            if (VAC_SENSOR_BYPASS) {
+                if (now - vacStateEnteredMs >= VAC_BYPASS_RUN_MS) {
+                    vacIsoValve.request(false);
+                    vacDoneStartMs    = now;
+                    vacStateEnteredMs = now;
+                    vacState = VAC_DONE;
+                }
+            } else if (vacSensorFull) {
                 vacStateEnteredMs = now;
                 vacState = VAC_FULL;
             } else if (now - vacStateEnteredMs >= VAC_PUMP_MAX_MS) {
@@ -1239,7 +1259,6 @@ void updateVacuum() {
             if (now - vacDoneStartMs >= 10000UL) {
                 digitalWrite(PIN_VAC_PUMP, RELAY_OFF);
                 vacFullThisSession = true;
-                if (timeSynced) EEPROM.put(EEPROM_VAC_LAST_DAY_ADDR, dayNumber(curYear, curMonth, curDay));
                 vacState = VAC_IDLE;
             }
             break;
@@ -1263,8 +1282,11 @@ void updateVacuum() {
         } else if (curDay != lastVacResetDay) {
             lastVacResetDay = curDay;
             vacFullThisSession = false;
-            if (vacState == VAC_FAULT) clearFault(FAULT_W_VAC_PUMP_OVERTIME);
-            vacState = VAC_IDLE;
+            // Forcing IDLE mid-cycle would strand the pump on with the valve open
+            if (vacState == VAC_FAULT) {
+                clearFault(FAULT_W_VAC_PUMP_OVERTIME);
+                vacState = VAC_IDLE;
+            }
         }
     }
 }
@@ -1272,6 +1294,15 @@ void updateVacuum() {
 // ============================================================
 //  WINTER SOLAR
 // ============================================================
+
+static void frostUFHStop() {
+    if (!frostUFHOn) return;
+    frostUFHOn = false;
+    clearFault(FAULT_W_FROST_NOT_RECOVERING);
+    // Leave the pump to a dump, boost or morning session that also wants it
+    if (!solarDumpUFHOn && !winterUFHBoost && ufhState != WUFH_ACTIVE && ufhState != WUFH_COOLING)
+        digitalWrite(PIN_UFH_PUMP, RELAY_OFF);
+}
 
 void updateWinterSolar(float tankBottomC) {
     bool solarHotFault  = sFault[SENSOR_SOLAR_HOT];
@@ -1294,37 +1325,53 @@ void updateWinterSolar(float tankBottomC) {
     float hot  = sTemp[SENSOR_SOLAR_HOT];
     float cold = sTemp[SENSOR_SOLAR_COLD];
 
-    // Frost protection takes priority
-    bool frostNeeded = (hot < 2.0f || cold < 2.0f);
-    if (frostNeeded) {
-        solarPumpReason = SPR_FROST;
-        if (!frostProtActive) {
-            frostProtActive   = true;
-            frostFaultStartMs = millis();
-            ufhColdValve.setOpen();
-            solarColdValve.setOpen();
-            setSolarPumpDuty(100);
-        }
-        if (hot >= 8.0f) {
-            // Pump has done its job; leave UFH valve open, stop pump
-            setSolarPumpDuty(0);
-            frostProtUFHOpen = true;
-        }
-        // Frost not recovering: active > 1 min AND cold side still < 4°C
-        if (cold < 4.0f && millis() - frostFaultStartMs > 60000UL) {
-            setFault(FAULT_W_FROST_NOT_RECOVERING);
-        }
-        return;
-    } else {
-        frostProtActive   = false;
-        frostFaultStartMs = 0;
-        clearFault(FAULT_W_FROST_NOT_RECOVERING);
-    }
-
     // Either side can be the one in the sun while the loop is stagnant (cold often reads
     // hotter before the pump runs), so trigger on whichever is warmer.
     float trigC     = (float)SOLAR_HOT_MIN_C / 10.0f;
     bool triggerMet = (hot >= trigC || cold >= trigC);
+
+    // Frost protection takes priority
+    float frostC     = (float)FROST_THRESH_C / 10.0f;
+    float frostStopC = (float)FROST_STOP_C / 10.0f;
+    bool  frostDip   = (hot < frostC || cold < frostC);
+    if (frostDip && !frostProtActive) {
+        frostProtActive = true;
+        frostRearmed    = true;
+    }
+    if (frostProtActive && triggerMet && !frostDip) {
+        frostProtActive = false;
+        frostPumpOn     = false;
+        frostUFHStop();
+        setSolarPumpDuty(0);
+    }
+    if (frostProtActive) {
+        solarPumpReason = SPR_FROST;
+        // Only a fresh dip restarts the pump; without the rearm, cold still < 2°C when
+        // hot reaches 8°C would cycle the pump every loop.
+        if (!frostDip) frostRearmed = true;
+        if (frostDip && frostRearmed && !frostPumpOn) {
+            ufhColdValve.setOpen();
+            solarColdValve.setOpen();
+            setSolarPumpDuty(100);
+            frostPumpOn       = true;
+            frostFaultStartMs = millis();
+        }
+        if (frostPumpOn && hot >= frostStopC) {
+            setSolarPumpDuty(0);
+            frostPumpOn  = false;
+            frostRearmed = false;
+            frostUFHStop();
+        }
+        bool frostCritical = (hot < 1.0f || cold < 1.0f)
+                          || (cold < 4.0f && millis() - frostFaultStartMs > 60000UL);
+        if (frostPumpOn && frostCritical && !frostUFHOn) {
+            setFault(FAULT_W_FROST_NOT_RECOVERING);
+            ufhColdValve.setOpen();
+            digitalWrite(PIN_UFH_PUMP, RELAY_ON);
+            frostUFHOn = true;
+        }
+        return;
+    }
     bool pvLow      = !growatt.valid || (growatt.pv1W + growatt.pv2W) < 350;
     // hot-cold is meaningless until the loop has mixed; without the hold a cold-side
     // trigger starts and stops the pump in the same call.
@@ -1635,6 +1682,7 @@ static uint16_t sunTableLocalMinutes(const uint16_t *table) {
 static uint16_t sunsetLocalMinutes()     { return sunTableLocalMinutes(kSunsetUtcMin); }
 static uint16_t realSunsetLocalMinutes()  { return sunTableLocalMinutes(kRealSunsetUtcMin); }
 static uint16_t realSunriseLocalMinutes() { return sunTableLocalMinutes(kRealSunriseUtcMin); }
+static uint16_t henCloseLocalMinutes()    { return realSunsetLocalMinutes() + 60; }
 
 // ============================================================
 //  SUMMER SOLAR  (simplified — full sequence coordinated with H)
@@ -2110,13 +2158,66 @@ void updateExtLights() {
     if (!fireAlarmActive) digitalWrite(PIN_EXT_LIGHTS, extLightsOn ? RELAY_ON : RELAY_OFF);
 }
 
-// Held on for 30s after locking so there's light to leave by
+void henDoorCommand(bool open) {
+    HenDoorState target = open ? HEN_OPENING : HEN_CLOSING;
+    if (henState == target || henPending == target) return;
+    digitalWrite(PIN_HEN_DOOR_OPEN,  RELAY_OFF);
+    digitalWrite(PIN_HEN_DOOR_CLOSE, RELAY_OFF);
+    henState       = HEN_UNKNOWN;
+    henPending     = target;
+    henStepStartMs = millis();
+}
+
+void updateHenDoor() {
+#ifdef DEBUG_SERIAL
+    if (henCycleActive && millis() - henCycleLastMs >= 15000UL) {
+        henCycleLastMs = millis();
+        Serial.println(henCycleNextOpen ? F("hen open") : F("hen close"));
+        henDoorCommand(henCycleNextOpen);
+        henCycleNextOpen = !henCycleNextOpen;
+    }
+#endif
+    if (timeSynced) {
+        uint8_t h, m; getCurrentTime(h, m);
+        uint16_t now = (uint16_t)h * 60 + m;
+        int8_t wantOpen = (now >= realSunriseLocalMinutes() && now < henCloseLocalMinutes()) ? 1 : 0;
+        // First sync after reboot only records the current period — door is already where the last run left it
+        if (henLastWantOpen >= 0 && wantOpen != henLastWantOpen) henDoorCommand(wantOpen);
+        henLastWantOpen = wantOpen;
+    }
+
+    unsigned long el = millis() - henStepStartMs;
+    if (henPending != HEN_UNKNOWN) {
+        if (el < HEN_DEADTIME_MS) return;
+        henState   = henPending;
+        henPending = HEN_UNKNOWN;
+        henStepStartMs = millis();
+        digitalWrite(henState == HEN_OPENING ? PIN_HEN_DOOR_OPEN : PIN_HEN_DOOR_CLOSE, RELAY_ON);
+#ifdef DEBUG_SERIAL
+        Serial.println(henState == HEN_OPENING ? F("HEN: opening") : F("HEN: closing"));
+#endif
+        return;
+    }
+    if (henState == HEN_OPENING && el >= henOpenRunMs) {
+        digitalWrite(PIN_HEN_DOOR_OPEN, RELAY_OFF);
+        henState = HEN_OPEN;
+    } else if (henState == HEN_CLOSING && el >= henCloseRunMs) {
+        digitalWrite(PIN_HEN_DOOR_CLOSE, RELAY_OFF);
+        henState = HEN_CLOSED;
+    }
+}
+
+// Held on for 30s after locking so there's light to leave by.
+// Idle timeout applies even with the relock hold-off switch on, so lights don't burn all night.
 void updateIntLights() {
     static unsigned long lastUnlockedMs = 0;
+    static unsigned long lastActivityMs = 0;
     static bool          everUnlocked   = false;
     unsigned long now = millis();
     if (!workshopLocked) { lastUnlockedMs = now; everUnlocked = true; }
-    bool on = everUnlocked && now - lastUnlockedMs < 30000UL;
+    if (gDoorOpen || gPirActive) lastActivityMs = now;
+    bool on = everUnlocked && now - lastUnlockedMs < 30000UL
+                           && now - lastActivityMs < INT_LIGHTS_IDLE_MS;
     digitalWrite(PIN_INT_LIGHTS, on ? RELAY_ON : RELAY_OFF);
 }
 
@@ -2133,7 +2234,8 @@ void updateSecurity() {
     bool doorOpen     = (digitalRead(PIN_DOOR_REED) == LOW);
     bool pirActive    = (digitalRead(PIN_PIR)        == LOW);
 #endif
-    gDoorOpen = doorOpen;
+    gDoorOpen  = doorOpen;
+    gPirActive = pirActive;
     bool manualSupp   = (digitalRead(PIN_MANUAL_RELOCK) == LOW); // LOW = suppression ON
     bool handleDown   = (digitalRead(PIN_DOOR_HANDLE)   == LOW);
 #ifdef DEBUG_SERIAL
@@ -2157,13 +2259,9 @@ void updateSecurity() {
     }
     prevUnlockBtn = unlockBtn;
 
-    // Lock switch: lock immediately on rising edge
+    // Old lock switch now only requests a vacuum cycle
     static bool prevLockSw = false;
-    if (lockSw && !prevLockSw && !workshopLocked) {
-        doorLock.request(false);
-        setWorkshopLocked(true);
-        relockTimerActive = false;
-    }
+    if (lockSw && !prevLockSw) vacBtnRequest = true;
     prevLockSw = lockSw;
 
     // Auto-lock: door closed, stay-unlocked switch off and no PIR for RELOCK_TIMEOUT_MS
@@ -2799,6 +2897,10 @@ void receiveHToWPacket() {
                 if (alertSeqKnown && lastH.alertResetSeq != 0) {
                     clearFault(FAULT_W_HANDLE_TRIED);
                     setHandleTried(0xFF, 0, 0);
+                    if (vacState == VAC_FAULT) {
+                        clearFault(FAULT_W_VAC_PUMP_OVERTIME);
+                        vacState = VAC_IDLE;
+                    }
                 }
                 lastAlertResetSeq = lastH.alertResetSeq;
                 // Clear all LED-persistent faults (condition must have cleared separately)
@@ -2945,7 +3047,6 @@ static void dbgMode() {
     Serial.print(F("  ufh_state:   ")); Serial.println(ufhState);
     Serial.print(F("  ufh_lockout: ")); Serial.println(ufhHardLockout ? F("YES") : F("no"));
     Serial.print(F("  vac_state:   ")); Serial.println(vacState);
-    Serial.print(F("  vac_overdue: ")); Serial.println(timeSynced && vacOverdue() ? F("yes") : F("no"));
     Serial.print(F("  workshop:    ")); Serial.println(workshopLocked ? F("locked") : F("unlocked"));
     Serial.print(F("  rs485:       ")); Serial.println(rs485CommsFault ? F("FAULT") : F("ok"));
     Serial.print(F("  time_synced: ")); Serial.println(timeSynced ? F("yes") : F("no"));
@@ -3011,6 +3112,17 @@ static void dbgSecurity() {
     Serial.print(F("  handle:     ")); Serial.println((digitalRead(PIN_DOOR_HANDLE)     == LOW)  ? F("DOWN")   : F("up"));
     Serial.print(F("  hold_off:   ")); Serial.println((digitalRead(PIN_MANUAL_RELOCK)   == LOW)  ? F("ON")     : F("off"));
     Serial.print(F("  pir:        ")); Serial.println((digitalRead(PIN_PIR)              == LOW) ? F("ACTIVE") : F("clear"));
+    {
+        static const char s0[] PROGMEM = "unknown", s1[] PROGMEM = "OPEN", s2[] PROGMEM = "closed",
+                          s3[] PROGMEM = "opening", s4[] PROGMEM = "closing";
+        static const char *const names[] PROGMEM = { s0, s1, s2, s3, s4 };
+        uint16_t hc = henCloseLocalMinutes();
+        Serial.print(F("  hen_door:   "));
+        Serial.print((const __FlashStringHelper *)pgm_read_ptr(&names[henPending != HEN_UNKNOWN ? henPending : henState]));
+        Serial.print(F(" (close ")); Serial.print(hc / 60); Serial.print(':');
+        if (hc % 60 < 10) Serial.print('0');
+        Serial.print(hc % 60); Serial.println(')');
+    }
     if (handleTriedHour < 24) {
         char buf[40];
         snprintf(buf, sizeof(buf), "  handle_tried: %02u:%02u:%02u (%u queued)",
@@ -3215,6 +3327,9 @@ static void handleDebugCommand(char* buf) {
         Serial.println(F("set growatt_clear 0  (clears all Growatt sim)"));
         Serial.println(F("set heater_pct <val>  set heater_pct_clear 0"));
         Serial.println(F("set pump_spd <0-100>  set pump_spd_clear 0"));
+        Serial.println(F("hen open|close  (holds until next sunrise/close time)"));
+        Serial.println(F("hen open_ms|close_ms <ms>  (run times, until reboot)"));
+        Serial.println(F("hen cycle  (close, open every 15s)  hen stop"));
     }
     else if (!strcmp_P(cmd, PSTR("temps")))    dbgTemps();
     else if (!strcmp_P(cmd, PSTR("valves")))   dbgValves();
@@ -3230,6 +3345,25 @@ static void handleDebugCommand(char* buf) {
     else if (!strcmp_P(cmd, PSTR("scan")))     dbgScan();
     else if (!strcmp_P(cmd, PSTR("i2cscan"))) dbgI2CScan();
     else if (!strcmp_P(cmd, PSTR("set")))      dbgSet(arg1, arg2);
+    else if (!strcmp_P(cmd, PSTR("hen"))) {
+        if      (!strcmp_P(arg1, PSTR("open")))  henDoorCommand(true);
+        else if (!strcmp_P(arg1, PSTR("close"))) henDoorCommand(false);
+        else if (!strcmp_P(arg1, PSTR("cycle"))) {
+            henCycleActive   = true;
+            henCycleNextOpen = false;
+            henCycleLastMs   = millis() - 15000UL;
+        }
+        else if (!strcmp_P(arg1, PSTR("stop")))  { henCycleActive = false; Serial.println(F("hen cycle stopped")); }
+        else if (!strcmp_P(arg1, PSTR("open_ms")) || !strcmp_P(arg1, PSTR("close_ms"))) {
+            long v = atol(arg2);
+            if (*arg2 && v >= 1000 && v <= 30000) {
+                if (arg1[0] == 'o') henOpenRunMs = (uint16_t)v; else henCloseRunMs = (uint16_t)v;
+            } else if (*arg2) Serial.println(F("range 1000-30000"));
+            Serial.print(F("hen open_ms=")); Serial.print(henOpenRunMs);
+            Serial.print(F(" close_ms=")); Serial.println(henCloseRunMs);
+        }
+        else Serial.println(F("hen open|close|cycle|stop|open_ms|close_ms"));
+    }
     else if (cmd[0] != 0) { Serial.print(F("unknown: ")); Serial.println(cmd); }
 }
 
@@ -3465,6 +3599,7 @@ void loop() {
     updateSecurity();
     updateExtLights();
     updateIntLights();
+    updateHenDoor();
 
     // INA219 current sampling (during pump ON period)
     sampleSolarPumpCurrent();
@@ -3488,6 +3623,8 @@ void loop() {
         summerPhase     = SUMPH_IDLE;
         summerSeqDone   = false;
         frostProtActive = false;
+        frostPumpOn     = false;
+        frostUFHStop();
     }
     float tankBotC  = (hasHPacket && lastH.tempTankBot != TEMP_FAULT)
                        ? (float)lastH.tempTankBot / 10.0f : NAN;
@@ -3522,6 +3659,8 @@ void loop() {
     updateWinterUFHBoost(mode == MODE_WINTER && solarPumpActive
                          && !(hasHPacket && lastH.calPumpActive));
     updateUFHHeating();
+    // Morning session / boost end would otherwise switch the pump off under a frost fault
+    if (frostUFHOn) digitalWrite(PIN_UFH_PUMP, RELAY_ON);
     // Fault check after solar+UFH so it can override both pump duty and UFH pump pin
     checkSolarPumpFault();
     updateSolarPump();

@@ -1385,14 +1385,11 @@ void updateHeatSourceSelection() {
     }
 
     if (lastWPkt.ufhTargetReached) {
-        // W reached target: open top-of-tank path at H
-        if (logBurnerHot) {
-            logBurnerCold.request(true);     // open log burner cold
-            twoPortValve.request(true);      // heater side → circulates through manifold to tank top
-        } else {
-            logBurnerCold.request(false);
-        }
-        botTankValve.request(false); // close bottom-of-tank
+        // W pump keeps running until the pipes are cold, so it needs a flow path
+        // regardless of log burner state
+        logBurnerCold.request(true);
+        twoPortValve.request(true);      // heater side → circulates through manifold to tank top
+        botTankValve.request(false);
         return;
     }
 

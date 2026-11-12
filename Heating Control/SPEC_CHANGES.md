@@ -1240,6 +1240,40 @@ The Tank+ first-start target after the day's first summer solar start (see "Tank
 
 If the vacuum system hasn't completed a cycle today or yesterday, the workshop being unlocked now also starts the normal vacuum cycle (prewarm, valve open, pump to full + 10min, `VAC_PUMP_MAX_MS` overtime fault). The date of the last completed cycle (`VAC_DONE`) is saved as a day number at EEPROM address 2 (uint16), so it survives reboots; blank EEPROM reads as never run. Needs time sync from H. Existing once-a-day triggers (summer solar, UFH) unchanged. `status` debug command shows `vac_overdue`.
 
+## H Controller — UFH target reached always opens tank-top flow path
+
+When W reports `ufhTargetReached`, H now always opens the log burner cold valve and the 2-port (heater side → manifold → tank top) and closes the bottom-tank valve. Previously it only did this when the log burner was hot; otherwise it closed log burner cold, leaving W's UFH pump (which keeps running until the pipes are cold) with no flow path.
+
+## W Controller — vacuum-on-unlock removed
+
+The unlock-if-overdue vacuum trigger above is removed, along with its EEPROM last-cycle day (address 2 no longer written or read) and the `vac_overdue` status line. Vacuum now runs only from the once-a-day summer solar and UFH triggers.
+
+## W Controller — lock switch (D11) now starts vacuum, no longer locks
+
+A rising edge on `PIN_LOCK_SW` (D11) now only requests the normal vacuum cycle, which starts if no cycle has completed today (same `vacFullThisSession` daily flag as the solar/UFH triggers; it resets at midnight and on reboot). A press while a cycle is already running or in `VAC_FAULT` is ignored. The switch no longer locks the workshop; locking is by auto-lock only.
+
+## W Controller — winter frost protection latches until winter solar starts
+
+Previously frost mode exited as soon as both solar sensors were ≥ 2°C, leaving the solar pump at 100% all night (the 8°C stop was never reached). Now, in winter mode:
+- Solar hot or cold < 2.0°C (`FROST_THRESH_C`): frost latches, UFH cold + solar cold valves open, solar pump 100%.
+- Solar hot ≥ 8.0°C (`FROST_STOP_C`): pump 0%, valves stay open, latch stays active.
+- Pump restarts at 100% only on a fresh dip below 2°C (both sensors must have been ≥ 2°C since the last stop, so a still-cold solar cold side doesn't cycle the pump).
+- Latch clears when the winter solar trigger (21°C hot or cold) is met with no sensor below 2°C; normal winter solar takes over with the valves already open. A mode change also clears it.
+- `FROST_NOT_RECOVERING`: set if solar cold is still < 4°C 1 min after a frost pump start; cleared when the pump stops at 8°C or the latch clears.
+- UFH cold valve is not closed for H heater demand while latched. Unused `frostProtUFHOpen` removed.
+
+## W Controller — TEMPORARY vacuum sensor bypass
+
+`VAC_SENSOR_BYPASS = true`: the vacuum sensor (D9) is ignored while pumping. Each cycle pumps for a fixed `VAC_BYPASS_RUN_MS` (15 min) after the valve opens, then closes the valve and stops the pump as normal (10s delay). No overtime fault in this mode. Set `VAC_SENSOR_BYPASS` to `false` to restore sensor-based control once the sensor is fixed.
+
+## W Controller — Alert Reset clears vacuum overrun fault
+
+H page 4 Alert Reset now also clears `FAULT_W_VAC_PUMP_OVERTIME` and returns the vacuum from `VAC_FAULT` to idle (previously only cleared at midnight). As no cycle completed that day, it restarts on the next solar/UFH demand or lock-button press.
+
+## W Controller — FROST_NOT_RECOVERING also on < 1°C, and runs the UFH pump
+
+While the frost pump is running, `FAULT_W_FROST_NOT_RECOVERING` now also sets immediately if solar hot or cold is below 1.0°C (as well as the existing solar cold < 4°C after 1 min). When it sets, the UFH cold valve opens and the UFH pump starts, alongside the solar pump at 100%. The UFH pump is held on (over a morning session or winter boost ending) until the fault clears: frost pump stops at solar hot ≥ 8°C, the frost latch clears, or a mode change. On clear the UFH pump turns off unless a dump, winter boost or morning session still wants it.
+
 ## W Controller — auto-lock after 10min, PIR re-unlocks within 10min
 
 Auto-relock re-enabled (was disabled, lock switch only). While unlocked, if the door is closed, the stay-unlocked switch (`PIN_MANUAL_RELOCK`, D12) is off and PIR is clear continuously for `RELOCK_TIMEOUT_MS` (now 10min, was 5min), the workshop locks. Any of those conditions breaking restarts the timer. Winch secured is no longer a condition (it was in the original spec relock rule). For `RELOCK_GRACE_MS` (10min) after an auto-lock, PIR going active unlocks the workshop instead of raising the intruder alarm. The unlock button unlocks at any time as before. The D11 lock switch still locks immediately, with no PIR grace period after it.
@@ -1314,3 +1348,10 @@ Units `C` and `W` removed from readings on all pages (kWh labels, `%`, `h`, `d` 
 Page 2: `Batt` in watts with sign (+ charging, − discharging); values aligned in fixed columns; `kWh` labels spaced (`PV kWh` etc., `ConsKWh` → `Cons kWh`); `SOC` moved to the right of `Import`; `Cons kWh` now sits beside `Exp kWh` with `Htr kWh` below it; 12px gaps below `PV Tot` and `Batt`. The `Import` value used to overwrite the end of its label, which the fixed column also fixes.
 
 Page 7: `Solar Return` arrow/`Log` moved 12px right, clear of the label.
+
+## W Controller — hen house door
+
+- **Pins moved:** hen door is now the H-bridge on even board ch3 (D26, energise = open) and ch4 (D28, energise = close). Alarm sounder moved to D42 (board4 ch2), fan flap to D48 (board4 ch3).
+- **Timed runs:** open holds D26 for 14s, close holds D28 for 9.5s (were 15s / 9.9s). Both relays off for 0.5s before any reversal.
+- **Schedule:** open from true sunrise (`kRealSunriseUtcMin[]`) until true sunset + 1h (`kRealSunsetUtcMin[]`, e.g. 17:24 GMT on 11 Nov, 22:23 BST on 21 Jun; sun always ≥7.3° below the horizon by then). Needs a time sync from H. Acts only on the sunrise/close-time transition itself: after a reboot the door is not moved until the next scheduled time (state shows `unknown` until then).
+- **Debug:** `hen open|close` manual run, held until the next scheduled change; `hen cycle`/`hen stop` alternates close/open every 15s; `hen open_ms|close_ms <ms>` sets run times live (RAM only, 1000–30000, no value = show current); `security` shows the door state and today's close time.
