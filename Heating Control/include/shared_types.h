@@ -191,6 +191,9 @@ struct __attribute__((packed)) WToHPacket {
     uint32_t handleEvtDurMs;    // handle down → up
     uint32_t handleEvtUpAgoS;   // seconds since release, at packet build time
     uint8_t  handleEvtLocked;   // 1 = workshop was locked when the handle went down
+
+    // Hen door: 0 unknown, 1 open, 2 closed, 3 opening, 4 closing
+    uint8_t  henDoorState;
 };
 
 // ============================================================
@@ -268,4 +271,8 @@ struct __attribute__((packed)) HToWPacket {
 
     // Last handle push seq written to handle.csv (see WToHPacket::handleEvtSeq)
     uint8_t handleEvtAck;
+
+    // Hen door command from H page 4: W acts when henCmdSeq changes (never 0 once used)
+    uint8_t henCmdSeq;
+    uint8_t henCmdOpen;         // 1 = open, 0 = close
 };

@@ -587,8 +587,10 @@ void updateHeaterDuty(int16_t pvExportW, int16_t gridImportW,
             if (++startCount < 5) { heaterReason = HR_OFF_BELOW_START; return; }
         } else if (!highSoc) {
             startCount = 0;
-            // 500W threshold when solar is off; 150W (5%) when solar is already running
-            uint8_t startThreshPct = lastWPkt.solarPumpActive ? 5 : 17;
+            // 500W threshold when solar is off; 300W (10%, the lowest firing level) when solar
+            // is already running. Below 10% it can't fire, but would still sit in the running
+            // state holding the flow-path valves (and the solar loop) open.
+            uint8_t startThreshPct = lastWPkt.solarPumpActive ? 10 : 17;
             if (rawPct < startThreshPct) { surplusStartMs = 0; heaterReason = HR_OFF_BELOW_START; return; }
             if (surplusStartMs == 0) surplusStartMs = millis();
             if (millis() - surplusStartMs < 5000UL) { heaterReason = HR_OFF_BELOW_START; return; }
@@ -1447,6 +1449,9 @@ void updateSolarValves() {
     static bool          coldStartActive = false;
     static bool          heaterLatch     = false;
     static unsigned long heaterStopMs    = 0;
+    static bool          prevHeaterRun   = false;
+    bool heaterStopped = prevHeaterRun && !heaterRunning;
+    prevHeaterRun      = heaterRunning;
 
     // Winter solar only feeds the workshop UFH, so the tank valves stay put. The PV export
     // override puts W in summer solar, which does need them.
@@ -1463,6 +1468,10 @@ void updateSolarValves() {
             logBurnerCold.request(false);
             if (!morningHeatActive) botTankValve.request(false);
             twoPortValve.request(true);
+        } else if (heaterStopped && !morningHeatActive && !hotTankProtection) {
+            // The heater re-requests bottom-of-tank open every loop while running, which
+            // overrides the solar stop's one-shot close above if the two overlap.
+            botTankValve.request(false);
         }
         return;
     }
@@ -1973,7 +1982,7 @@ void faultLogUpdate(uint32_t curW, uint32_t curH) {
 //  DISPLAY  (ILI9488 480×320)
 // ============================================================
 
-uint8_t      currentPage      = 1;
+uint8_t      currentPage      = 7;
 #define      NUM_PAGES          7
 // Up/down scroll order; page numbers themselves stay fixed so the `page` command and code references don't change
 static const uint8_t PAGE_ORDER[NUM_PAGES] = { 4, 1, 2, 3, 5, 6, 7 };
@@ -2003,6 +2012,8 @@ bool         needPageRedraw   = false;
 uint32_t     faultFlagsAtSleep = 0;
 unsigned long lastDisplayRefreshMs = 0;
 uint8_t      alertResetSeqTx       = 0;  // increment to signal alert reset to W
+uint8_t      henCmdSeqTx           = 0;  // increment (skipping 0) to send a hen door command to W
+bool         henCmdOpenTx          = false;
 unsigned long actionFlashEndMs     = 0;  // non-zero while action-confirmation red flash is active
 int8_t       pendingFanFullDeltaHr  = 0;  // one-shot: +/- hours; sent to W, cleared after transmit
 int8_t       pendingFanBaseDeltaDay = 0;  // one-shot: +/- days;  sent to W, cleared after transmit
@@ -2434,6 +2445,7 @@ static const CtrlItem PAGE4_ITEMS[] = {
     { "Night Cool",  0 },
     { "Solar Tgt",   0 },
     { "Holiday",     0 },
+    { "Chicken",     3 },
     { "Fan Speed",   2 },
     { "Fan Full",    2 },
     { "Fan Base",    2 },
@@ -2444,8 +2456,8 @@ static const CtrlItem PAGE4_ITEMS[] = {
     { "SD Eject",    3 },
     { "Alrt Reset",  3 },  // always shown; clears page 3 fault history + resets heater lockout
 };
-static const uint8_t PAGE4_COUNT = 16;
-static const uint8_t PAGE4_LEFT_ROWS = 7;
+static const uint8_t PAGE4_COUNT = 17;
+static const uint8_t PAGE4_LEFT_ROWS = 8;
 
 void getPage4Value(uint8_t item, char* buf, uint8_t bufSz) {
     switch (item) {
@@ -2456,15 +2468,21 @@ void getPage4Value(uint8_t item, char* buf, uint8_t bufSz) {
         case 4: strlcpy(buf, nightCoolingEnabled ? "On" : "Off", bufSz); break;
         case 5: strlcpy(buf, solarTargetMode == SOLAR_TANK_PLUS8 ? "Tank+" : "Max", bufSz); break;
         case 6: strlcpy(buf, holidayMode ? "Yes" : "No", bufSz); break;
-        case 7: snprintf(buf, bufSz, "%d%%", lastWPkt.fanDutyPct); break;
-        case 8: snprintf(buf, bufSz, "%luh", lastWPkt.fanFullTimerSecs / 3600); break;
-        case 9: snprintf(buf, bufSz, "%lud", lastWPkt.fanBaseTimerSecs / 86400); break;
-        case 10: snprintf(buf, bufSz, "%d%%", displayBrightness); break;
-        case 11: snprintf(buf, bufSz, "%02u", rtcHour());   break;
-        case 12: snprintf(buf, bufSz, "%02u", rtcMinute()); break;
-        case 13: snprintf(buf, bufSz, "%02u", rtcSecond()); break;
-        case 14: strlcpy(buf, sdAvailable ? "Eject" : "Ejected", bufSz); break;
-        case 15: strlcpy(buf, "Confirm", bufSz); break;
+        case 7: {
+            const char* hs[] = {"Unknown","Open","Closed","Opening","Closing"};
+            uint8_t s = hasWPkt ? lastWPkt.henDoorState : 0;
+            strlcpy(buf, hs[s < 5 ? s : 0], bufSz);
+            break;
+        }
+        case 8: snprintf(buf, bufSz, "%d%%", lastWPkt.fanDutyPct); break;
+        case 9: snprintf(buf, bufSz, "%luh", lastWPkt.fanFullTimerSecs / 3600); break;
+        case 10: snprintf(buf, bufSz, "%lud", lastWPkt.fanBaseTimerSecs / 86400); break;
+        case 11: snprintf(buf, bufSz, "%d%%", displayBrightness); break;
+        case 12: snprintf(buf, bufSz, "%02u", rtcHour());   break;
+        case 13: snprintf(buf, bufSz, "%02u", rtcMinute()); break;
+        case 14: snprintf(buf, bufSz, "%02u", rtcSecond()); break;
+        case 15: strlcpy(buf, sdAvailable ? "Eject" : "Ejected", bufSz); break;
+        case 16: strlcpy(buf, "Confirm", bufSz); break;
         default: buf[0] = 0;
     }
 }
@@ -2481,36 +2499,36 @@ void page4Adjust(uint8_t item, int8_t dir) {
         case 4: nightCoolingEnabled = !nightCoolingEnabled; markSettingsDirty(); break;
         case 5: solarTargetMode = (solarTargetMode == SOLAR_TANK_PLUS8) ? SOLAR_MAX : SOLAR_TANK_PLUS8; markSettingsDirty(); break;
         case 6: holidayMode = !holidayMode; markSettingsDirty(); break;
-        case 7: { // fan base speed — transmitted to W in H→W packet
+        case 8: { // fan base speed — transmitted to W in H→W packet
             uint8_t fs = EEPROM.read(EE_FAN_BASE_SPEED);
             fs = constrain((int)fs + dir * 10, 0, 100);
             EEPROM.update(EE_FAN_BASE_SPEED, fs);
             break;
         }
-        case 8: // fan full timer: accumulate ±1hr delta; sent to W on next packet and cleared
+        case 9: // fan full timer: accumulate ±1hr delta; sent to W on next packet and cleared
             pendingFanFullDeltaHr = (int8_t)constrain((int)pendingFanFullDeltaHr + dir, -24, 24);
             break;
-        case 9: // fan base timer: accumulate ±1 day delta; sent to W on next packet and cleared
+        case 10: // fan base timer: accumulate ±1 day delta; sent to W on next packet and cleared
             pendingFanBaseDeltaDay = (int8_t)constrain((int)pendingFanBaseDeltaDay + dir, -30, 30);
             break;
-        case 10:
+        case 11:
             displayBrightness = constrain((int)displayBrightness + dir * 10, 10, 100);
             markSettingsDirty();
             setBacklight(displayBrightness);
             break;
-        case 11: {
+        case 12: {
             uint8_t h = (uint8_t)((rtcNow.hour() + 24 + dir) % 24);
             rtc.adjust(DateTime(rtcNow.year(), rtcNow.month(), rtcNow.day(), h, rtcNow.minute(), rtcNow.second()));
             rtcNow = rtc.now();
             break;
         }
-        case 12: {
+        case 13: {
             uint8_t m = (uint8_t)((rtcNow.minute() + 60 + dir) % 60);
             rtc.adjust(DateTime(rtcNow.year(), rtcNow.month(), rtcNow.day(), rtcNow.hour(), m, rtcNow.second()));
             rtcNow = rtc.now();
             break;
         }
-        case 13: {
+        case 14: {
             uint8_t s = (uint8_t)((rtcNow.second() + 60 + dir) % 60);
             rtc.adjust(DateTime(rtcNow.year(), rtcNow.month(), rtcNow.day(), rtcNow.hour(), rtcNow.minute(), s));
             rtcNow = rtc.now();
@@ -2520,8 +2538,13 @@ void page4Adjust(uint8_t item, int8_t dir) {
 }
 
 void page4Action(uint8_t item) {
-    if (item == 14) safeEjectSD();
-    if (item == 15) {
+    if (item == 7 && hasWPkt) {
+        uint8_t s = lastWPkt.henDoorState;
+        henCmdOpenTx = !(s == 1 || s == 3);   // open/opening → close; closed/closing/unknown → open
+        if (++henCmdSeqTx == 0) henCmdSeqTx = 1;
+    }
+    if (item == 15) safeEjectSD();
+    if (item == 16) {
         alertResetSeqTx++;
         // Clear fault log and reset change-detection so currently-active faults
         // are not immediately re-added — they'll re-appear only if they toggle again
@@ -3000,15 +3023,15 @@ void drawPage7() {
     int16_t hW = heaterRunning ? (int16_t)(heaterLevelPct10() * 3) : 0;
 
     // Left column
-    tempRow(LX, LVX, 60, "Solar Hot",   hasWPkt ? lastWPkt.tempSolarHot : TEMP_FAULT);
-    tempRow(LX, LVX, 86, "Hot Pipe",    hEnc(H_SENSOR_HOT_PIPE));
+    tempRow(LX, LVX, 34, "Solar Hot",   hasWPkt ? lastWPkt.tempSolarHot : TEMP_FAULT);
+    tempRow(LX, LVX, 60, "Hot Pipe",    hEnc(H_SENSOR_HOT_PIPE));
     int16_t h1 = hEnc(H_SENSOR_HEATER_OUT), h2 = hEnc(H_SENSOR_HEATER_OUT_2);
-    tempRow(LX, LVX, 112, "Heater Temp", h1 == TEMP_FAULT ? h2 : (h2 == TEMP_FAULT ? h1 : max(h1, h2)));
+    tempRow(LX, LVX, 86, "Heater Temp", h1 == TEMP_FAULT ? h2 : (h2 == TEMP_FAULT ? h1 : max(h1, h2)));
     pollBtns();
     snprintf(v, sizeof(v), "%d%%", lastWPkt.solarPumpDutyPct);
-    row(LX, LVX, 164, "Pump W", v, C_CYAN);
+    row(LX, LVX, 138, "Pump W", v, C_CYAN);
     snprintf(v, sizeof(v), "%d%%", (int)roundf(hPumpDuty));
-    row(LX, LVX, 190, "Pump H", v, C_CYAN);
+    row(LX, LVX, 164, "Pump H", v, C_CYAN);
 
     // Solar return: where the solar loop returns into the tank
     enum { SR_NONE, SR_UP, SR_DOWN, SR_LOG };
@@ -3016,7 +3039,7 @@ void drawPage7() {
                : botTankValve.isOpen  ? (twoPortValve.isOpen ? SR_UP : SR_DOWN)
                : SR_NONE;
     static uint8_t prevSr = 0xFF;
-    const uint16_t SRY = 242;
+    const uint16_t SRY = 216;
     // "Solar Return" ends exactly at LVX, so its value sits further right than other rows
     const uint16_t SRX = LVX + 12;
     tft.setTextColor(C_WHITE, C_BLACK); tft.setCursor(LX, SRY); tft.print("Solar Return");
@@ -3031,17 +3054,21 @@ void drawPage7() {
 
     // Right column
     if (gv) snprintf(v, sizeof(v), "%d", lastWPkt.pv1W + lastWPkt.pv2W); else strcpy(v, "--");
-    row(RX, RVX, 60, "PV", v, C_CYAN);
+    row(RX, RVX, 34, "PV", v, C_CYAN);
     // Consumption matches page 2: PV + net import - battery charge - heater
     int16_t importW = gv ? (int16_t)(lastWPkt.gridImportW - lastWPkt.pvExportW) : 0;
     if (gv) snprintf(v, sizeof(v), "%d", (int16_t)(lastWPkt.pv1W + lastWPkt.pv2W + importW - lastWPkt.battChargeW - hW)); else strcpy(v, "--");
-    row(RX, RVX, 112, "Consumption", v, C_CYAN);
+    row(RX, RVX, 86, "Consumption", v, C_CYAN);
     if (gv) snprintf(v, sizeof(v), "%d", lastWPkt.battChargeW); else strcpy(v, "--");
-    row(RX, RVX, 138, "Battery", v, C_CYAN);
+    row(RX, RVX, 112, "Battery", v, C_CYAN);
     snprintf(v, sizeof(v), "%d", hW);
-    row(RX, RVX, 164, "Heater", v, C_CYAN);
+    row(RX, RVX, 138, "Heater", v, C_CYAN);
     if (gv) snprintf(v, sizeof(v), "%d%%", lastWPkt.battSocPct); else strcpy(v, "--");
-    row(RX, RVX, 216, "SOC", v, C_CYAN);
+    row(RX, RVX, 190, "SOC", v, C_CYAN);
+
+    // Bottom row; "Workshop Air" is as long as "Solar Return", so its value shares that offset
+    tempRow(LX, SRX, 242, "Workshop Air", hasWPkt ? lastWPkt.tempWorkshopAir : TEMP_FAULT);
+    tempRow(RX, RVX, 242, "Outside Air",  hasWPkt ? lastWPkt.tempOutsideAir  : TEMP_FAULT);
 }
 
 static bool inSocLowBacklightWindow() {
@@ -3490,6 +3517,8 @@ void sendHToWPacket(bool timeSyncReq) {
     pkt.overrideActive  = manualOverrideActive ? 1 : 0;
     pkt.overrideValves  = overrideValveStates;
     pkt.alertResetSeq   = alertResetSeqTx;
+    pkt.henCmdSeq       = henCmdSeqTx;
+    pkt.henCmdOpen      = henCmdOpenTx ? 1 : 0;
     pkt.handleEvtAck    = handleLoggedSeq;
     pkt.hFaultFlags     = hFaultFlags;
 
@@ -4491,7 +4520,7 @@ void loop() {
             displayOn      = false;
             setBacklight(0);
             faultFlagsAtSleep = hFaultFlags | (hasWPkt ? lastWPkt.wFaultFlags : 0);
-            currentPage    = socLow ? 6 : 1;
+            currentPage    = socLow ? 6 : 7;
             navMode        = NAV_PAGE;
             needFullRedraw = true;
         }

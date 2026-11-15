@@ -1349,9 +1349,34 @@ Page 2: `Batt` in watts with sign (+ charging, − discharging); values aligned 
 
 Page 7: `Solar Return` arrow/`Log` moved 12px right, clear of the label.
 
+## W Controller — Holiday mode: handle fault at any time of day
+
+With H Holiday mode on, a handle push (debounced up → down) while the workshop is locked now raises `FAULT_W_HANDLE_TRIED` at any hour, not just 22:00–07:00. Same action as the night case: time of first push saved to EEPROM and sent to H, latched until Alert Reset. Still needs W time sync. Buzzer behaviour unchanged.
+
+## H Controller — page 7 air temps, page 7 default page, page 4 Chicken door control
+
+- **Page 7:** every row moved up 26px (blank gap at the top removed). New bottom row: `Workshop Air` (left, value aligned with the Solar Return arrow) and `Outside Air` (right), from W's packet; `FAULT` in red on sensor fault or no W packet.
+- **Default page:** H boots on page 7, and the display returns to page 7 when it sleeps (page 6 still if SOC low), so a button press wakes onto page 7.
+- **Page 4 `Chicken`:** new action item below `Holiday` (left column now 8 rows; later items shift down one index). Shows W's hen door state: `Open`, `Closed`, `Opening`, `Closing` or `Unknown` (after a W reboot until the next scheduled move). Selecting it commands the opposite: open/opening → close; closed/closing/unknown → open. Behaves like the `hen open|close` debug command — the door holds there until the next scheduled sunrise/close change.
+- **Packets:** `WToHPacket.henDoorState` (0 unknown, 1 open, 2 closed, 3 opening, 4 closing; during the reversal deadtime reports the pending direction). `HToWPacket.henCmdSeq` + `henCmdOpen`: W acts when the seq changes, ignoring the first packet after W boots and a seq of 0 (H reboot); H skips 0 on wrap. Both controllers must be flashed together (packet sizes changed).
+
 ## W Controller — hen house door
 
 - **Pins moved:** hen door is now the H-bridge on even board ch3 (D26, energise = open) and ch4 (D28, energise = close). Alarm sounder moved to D42 (board4 ch2), fan flap to D48 (board4 ch3).
-- **Timed runs:** open holds D26 for 14s, close holds D28 for 9.5s (were 15s / 9.9s). Both relays off for 0.5s before any reversal.
+- **Timed runs:** open holds D26 for 14s, close holds D28 for 10.5s. Both relays off for 0.5s before any reversal.
 - **Schedule:** open from true sunrise (`kRealSunriseUtcMin[]`) until true sunset + 1h (`kRealSunsetUtcMin[]`, e.g. 17:24 GMT on 11 Nov, 22:23 BST on 21 Jun; sun always ≥7.3° below the horizon by then). Needs a time sync from H. Acts only on the sunrise/close-time transition itself: after a reboot the door is not moved until the next scheduled time (state shows `unknown` until then).
 - **Debug:** `hen open|close` manual run, held until the next scheduled change; `hen cycle`/`hen stop` alternates close/open every 15s; `hen open_ms|close_ms <ms>` sets run times live (RAM only, 1000–30000, no value = show current); `security` shows the door state and today's close time.
+
+## W Controller — frost protection in summer mode, summer end-of-day needs no surplus
+
+- **Frost protection** moved into `runFrostProtection()`, called by both winter and summer solar. Previously only winter solar had it, so H's air override (workshop air >18°C, summer until midnight) or PV export override left the collectors unprotected: on 13 Nov solar hot was below 2°C from 21:30 and reached −0.3°C before the override cleared at midnight. In summer mode an active frost latch idles the summer sequence (pump inactive, phase reset); it clears as in winter, once a pipe reaches 21°C with no dip.
+- **Summer end-of-day:** sun below 10° is no longer enough on its own. It also needs Growatt export at 0W and SOC below 98% (ignored if Growatt data is invalid), with true sunset as a backstop. Before, solar stopped at the 10° time while still exporting with the battery full (14 Nov 14:51, SOC 100%, ~90W export).
+
+## H Controller — heater start threshold with solar running, bottom-of-tank closed when heater stops
+
+- **Start threshold** with W solar active raised from 5% (150W) to 10% (300W), the lowest firing level. At 5–9% the heater entered its running state but rounded down to level 0, so it never fired while holding the flow-path valves open (14 Nov 14:44–14:56, ~130W export).
+- **Bottom-of-tank valve:** when the heater leaves its running state and solar isn't running (no morning heat, no hot-tank protection), H now closes the bottom-of-tank valve. The heater re-requests it open every loop while running, which overrode solar's one-shot close at the end of the day (14 Nov: stayed open from 14:51 on). Also covers the heater stopping in winter mode, which previously left it open.
+
+## W Controller — winter cold+2 cutoff only below 25°C
+
+Winter solar's "hot below cold + 2°C → 0%" rule now applies only while both solar hot and solar cold are below 25°C. On 14 Nov a cold-side start ended its 30-min hold with hot (16°C) trailing cold (31°C); the rule held the pump at 0% and the cold side stagnated to 96.7°C until the UFH boost started at 09:51. The "hot below workshop air + 2°C → 0%" floor likewise applies only while solar cold is below 25°C; above that, hot below air + 2 runs at 4% so a sun-heated cold side always has flow. The end-of-day stop is unchanged.

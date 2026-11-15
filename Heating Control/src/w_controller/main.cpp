@@ -507,7 +507,7 @@ bool          extLightsOn         = false;
 
 // RAM only — `hen open_ms`/`hen close_ms` changes are lost on reboot
 uint16_t      henOpenRunMs      = 14000;
-uint16_t      henCloseRunMs     = 9500;
+uint16_t      henCloseRunMs     = 10500;
 // Both H-bridge relays off for this long before reversing, so the motor is never shorted
 #define HEN_DEADTIME_MS     500UL
 
@@ -1304,33 +1304,11 @@ static void frostUFHStop() {
         digitalWrite(PIN_UFH_PUMP, RELAY_OFF);
 }
 
-void updateWinterSolar(float tankBottomC) {
-    bool solarHotFault  = sFault[SENSOR_SOLAR_HOT];
-    bool solarColdFault = sFault[SENSOR_SOLAR_COLD];
-    // Tank bottom is stale if RS485 link is down or H packet is old
-    bool tankBotStale = !hasHPacket || (millis() - lastRxMs > 10000UL) || isnan(tankBottomC);
-
-    if (solarHotFault || solarColdFault) {
-        // Sensor fault: dump through UFH
-        ufhColdValve.setOpen();
-        solarColdValve.setOpen();
-        resetSolarPumpOverrides();
-        setSolarPumpDuty(100);
-        solarPumpReason = SPR_SENSOR_DUMP;
-        setFault(FAULT_W_SOLAR_PUMP); // covered by sensor fault logic
-        solarPumpActive = false;
-        return;
-    }
-
-    float hot  = sTemp[SENSOR_SOLAR_HOT];
-    float cold = sTemp[SENSOR_SOLAR_COLD];
-
-    // Either side can be the one in the sun while the loop is stagnant (cold often reads
-    // hotter before the pump runs), so trigger on whichever is warmer.
+// Frost protection, shared by winter and summer solar so a summer override (PV export or
+// workshop air) can't leave the collectors unprotected overnight. Returns true while it owns the loop.
+static bool runFrostProtection(float hot, float cold) {
     float trigC     = (float)SOLAR_HOT_MIN_C / 10.0f;
     bool triggerMet = (hot >= trigC || cold >= trigC);
-
-    // Frost protection takes priority
     float frostC     = (float)FROST_THRESH_C / 10.0f;
     float frostStopC = (float)FROST_STOP_C / 10.0f;
     bool  frostDip   = (hot < frostC || cold < frostC);
@@ -1370,8 +1348,39 @@ void updateWinterSolar(float tankBottomC) {
             digitalWrite(PIN_UFH_PUMP, RELAY_ON);
             frostUFHOn = true;
         }
+        return true;
+    }
+    return false;
+}
+
+void updateWinterSolar(float tankBottomC) {
+    bool solarHotFault  = sFault[SENSOR_SOLAR_HOT];
+    bool solarColdFault = sFault[SENSOR_SOLAR_COLD];
+    // Tank bottom is stale if RS485 link is down or H packet is old
+    bool tankBotStale = !hasHPacket || (millis() - lastRxMs > 10000UL) || isnan(tankBottomC);
+
+    if (solarHotFault || solarColdFault) {
+        // Sensor fault: dump through UFH
+        ufhColdValve.setOpen();
+        solarColdValve.setOpen();
+        resetSolarPumpOverrides();
+        setSolarPumpDuty(100);
+        solarPumpReason = SPR_SENSOR_DUMP;
+        setFault(FAULT_W_SOLAR_PUMP); // covered by sensor fault logic
+        solarPumpActive = false;
         return;
     }
+
+    float hot  = sTemp[SENSOR_SOLAR_HOT];
+    float cold = sTemp[SENSOR_SOLAR_COLD];
+
+    // Either side can be the one in the sun while the loop is stagnant (cold often reads
+    // hotter before the pump runs), so trigger on whichever is warmer.
+    float trigC     = (float)SOLAR_HOT_MIN_C / 10.0f;
+    bool triggerMet = (hot >= trigC || cold >= trigC);
+
+    if (runFrostProtection(hot, cold)) return;
+
     bool pvLow      = !growatt.valid || (growatt.pv1W + growatt.pv2W) < 350;
     // hot-cold is meaningless until the loop has mixed; without the hold a cold-side
     // trigger starts and stops the pump in the same call.
@@ -1412,8 +1421,12 @@ void updateWinterSolar(float tankBottomC) {
     float   lowC      = lastWAir + 2.0f;
     float   fullC     = (float)WINTER_FULL_SPEED_C / 10.0f;
     uint8_t duty;
-    if (hot < lowC || (!startHold && hot < cold + 2.0f)) duty = 0;
-    else if (hot >= fullC)                               duty = 100;
+    // Both 0% cutoffs only while solar cold is below 25°C: a cold-side start can leave hot
+    // trailing a sun-heated cold side, and stopping then stagnated the loop to 97°C (14 Nov)
+    bool coldCool = cold < 25.0f;
+    if ((hot < lowC && coldCool) || (!startHold && coldCool && hot < 25.0f && hot < cold + 2.0f)) duty = 0;
+    else if (hot < lowC)  duty = 4;
+    else if (hot >= fullC) duty = 100;
     else duty = (uint8_t)(4.0f + (hot - lowC) / (fullC - lowC) * 96.0f);
     // A cold-side start leaves hot below air+2; without flow it never warms and the loop sits at 0%.
     if (startHold && duty < 4) duty = 4;
@@ -1740,6 +1753,16 @@ void updateSummerSolar() {
         return;
     }
 
+    if (runFrostProtection(hot, cold)) {
+        if (solarPumpActive || summerPhase != SUMPH_IDLE) {
+            resetSolarPumpOverrides();
+            solarPumpActive = false;
+            summerPhase     = SUMPH_IDLE;
+            summerSeqDone   = false;
+        }
+        return;
+    }
+
     // End-of-day cutoff: once the sun is below 10° (kSunsetUtcMin, BST-adjusted —
     // see sunsetLocalMinutes() above), there's no useful solar gain left.
     // Must gate (and return before) the start-trigger logic below, not just tear down
@@ -1751,6 +1774,10 @@ void updateSummerSolar() {
     uint8_t eodH, eodM; getCurrentTime(eodH, eodM);
     uint16_t nowMinutes = (uint16_t)eodH * 60 + eodM;
     bool pastSunset = nowMinutes >= sunsetLocalMinutes();
+    // Still exporting or battery nearly full: the heater can still use the PV, and it needs
+    // the solar loop open, so hold off until true sunset at the latest.
+    bool surplusLeft = growatt.valid && (growatt.pvExportW > 0 || growatt.battSocPct >= 98);
+    bool endOfDay    = pastSunset && (!surplusLeft || nowMinutes >= realSunsetLocalMinutes());
 
     // Past the cutoff, a pump that's already running keeps going while solar hot is
     // still >8°C above tank bottom (useful heat left in the loop). Latched once it
@@ -1758,7 +1785,7 @@ void updateSummerSolar() {
     static bool eodLatched = false;
     if (!pastSunset) {
         eodLatched = false;
-    } else if (!eodLatched) {
+    } else if (!eodLatched && endOfDay) {
         bool botOk = hasHPacket && millis() - lastRxMs <= 10000UL
                      && lastH.tempTankBot != TEMP_FAULT;
         bool stillGaining = solarPumpActive && botOk
@@ -2318,7 +2345,7 @@ void updateSecurity() {
     bool handlePushed = updateHandleLog(handleDown, now);
     if (handlePushed && workshopLocked && timeSynced && !hasFault(FAULT_W_HANDLE_TRIED)) {
         uint8_t h, m; getCurrentTime(h, m);
-        if (h >= 22 || h < 7) {
+        if (h >= 22 || h < 7 || (hasHPacket && lastH.holidayMode)) {
             setHandleTried(h, m, getCurrentSecond());
             setFault(FAULT_W_HANDLE_TRIED);
         }
@@ -2789,6 +2816,8 @@ void sendWToHPacket() {
     pkt.rs485RxGood        = rs485RxGood;
     pkt.rs485RxBadFrame    = rs485RxBadFrame;
     pkt.solarPumpReason    = solarPumpReason;
+    // During the reversal deadtime henState is UNKNOWN; report where it's heading
+    pkt.henDoorState       = (henPending != HEN_UNKNOWN) ? henPending : henState;
     pkt.handleTriedHour    = handleTriedHour;
     pkt.handleTriedMin     = handleTriedMin;
     pkt.handleTriedSec     = handleTriedSec;
@@ -2905,6 +2934,11 @@ void receiveHToWPacket() {
                 lastAlertResetSeq = lastH.alertResetSeq;
                 // Clear all LED-persistent faults (condition must have cleared separately)
                 // The fault conditions themselves are re-evaluated each loop
+            }
+            static uint8_t lastHenCmdSeq = 0;
+            if (lastH.henCmdSeq != lastHenCmdSeq) {
+                if (alertSeqKnown && lastH.henCmdSeq != 0) henDoorCommand(lastH.henCmdOpen != 0);
+                lastHenCmdSeq = lastH.henCmdSeq;
             }
             alertSeqKnown = true;
 
