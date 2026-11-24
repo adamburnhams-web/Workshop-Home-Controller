@@ -1574,9 +1574,11 @@ void updateSolarValves() {
 // logic by sending MODE_SUMMER in the H→W packet without changing the stored systemMode.
 void updatePVExportOverride() {
     // Workshop already warm: winter solar has nothing left to do, so run summer until midnight.
+    // Only switches before 13:30: later in the day there's too little sun left for summer solar.
     static uint8_t airSummerDay = 0;
     if (airSummerOverride && (!rtcValid || rtcNow.day() != airSummerDay)) airSummerOverride = false;
-    if (systemMode == MODE_WINTER && !airSummerOverride && rtcValid && hasWPkt
+    bool beforeAirCutoff = rtcValid && (rtcHour() * 60 + rtcMinute()) < 13 * 60 + 30;
+    if (systemMode == MODE_WINTER && !airSummerOverride && beforeAirCutoff && hasWPkt
             && lastWPkt.tempWorkshopAir != TEMP_FAULT && lastWPkt.tempWorkshopAir > 180) {
         airSummerOverride = true;
         airSummerDay      = rtcNow.day();
@@ -1604,6 +1606,7 @@ float kwhExport      = 0.0f;   // gross export only
 float kwhHeater      = 0.0f;
 float kwhConsumption = 0.0f;
 float kwhSolar       = 0.0f;
+float kwhSolarCons   = 0.0f;  // heat drawn out through the collectors (pre_pump above solar hot), e.g. frost protection
 
 // W per °C rise across the collectors at each solar pump duty 4–100%. Measured on the
 // same pump/loop from H heater runs (heater W ÷ htr_out−hot_pipe), see
@@ -1637,6 +1640,7 @@ int16_t       energyLastBattChgW = 0;
 uint8_t       energyLastHeaterPct = 0;
 uint8_t       energyLastSocPct    = 0;
 float         energyLastSolarW    = 0.0f;
+float         energyLastSolarConsW = 0.0f;
 
 // Called once per received W packet. Integrates the values noted at the *previous*
 // packet across the elapsed time to *this* packet (uncapped — a held last-known value
@@ -1649,7 +1653,7 @@ void accumulateEnergy() {
     if (rtcValid) {
         uint8_t today = rtcNow.day();
         if (energyLastDay != 0xFF && today != energyLastDay) {
-            kwhPV = kwhImport = kwhExport = kwhHeater = kwhConsumption = kwhSolar = 0.0f;
+            kwhPV = kwhImport = kwhExport = kwhHeater = kwhConsumption = kwhSolar = kwhSolarCons = 0.0f;
         }
         energyLastDay = today;
     }
@@ -1668,6 +1672,7 @@ void accumulateEnergy() {
         kwhHeater      += heaterW           * dtH / 1000.0f;
         kwhConsumption += consumptionW      * dtH / 1000.0f;
         kwhSolar       += energyLastSolarW  * dtH / 1000.0f;
+        kwhSolarCons   += energyLastSolarConsW * dtH / 1000.0f;
     }
     energyLastMs = nowMs;
     energyInited = true;
@@ -1685,6 +1690,8 @@ void accumulateEnergy() {
     int16_t sHot = lastWPkt.tempSolarHot, sPrePump = lastWPkt.tempPrePump;
     energyLastSolarW = (sHot == TEMP_FAULT || sPrePump == TEMP_FAULT || sHot <= sPrePump) ? 0.0f
                      : solarWPerC(solarDuty) * (sHot - sPrePump) / 10.0f;
+    energyLastSolarConsW = (sHot == TEMP_FAULT || sPrePump == TEMP_FAULT || sPrePump <= sHot) ? 0.0f
+                         : solarWPerC(solarDuty) * (sPrePump - sHot) / 10.0f;
 }
 
 // ============================================================
@@ -1701,7 +1708,7 @@ File    energyLogFile;
 unsigned long lastEnergyLogMs = 0;
 
 static const uint8_t LOG_EXPECTED_COMMAS = 58; // 59 columns = 58 commas
-static const uint8_t ENERGY_LOG_EXPECTED_COMMAS = 7; // 8 columns = 7 commas
+static const uint8_t ENERGY_LOG_EXPECTED_COMMAS = 8; // 9 columns = 8 commas
 
 void initSD() {
     if (SD.begin(PIN_SD_CS)) {
@@ -1758,7 +1765,7 @@ void initSD() {
         if (needEnergyHeader) {
             File f = SD.open("energy.csv", FILE_WRITE);
             if (f) {
-                f.println(F("datetime,pv_kwh,import_kwh,export_kwh,heater_kwh,consumption_kwh,soc_pct,solar_kwh"));
+                f.println(F("datetime,pv_kwh,import_kwh,export_kwh,heater_kwh,consumption_kwh,soc_pct,solar_kwh,solar_neg_kwh"));
                 f.close();
             }
         }
@@ -1880,7 +1887,8 @@ void logEnergyRow() {
     energyLogFile.print(kwhHeater, 3);      energyLogFile.print(',');
     energyLogFile.print(kwhConsumption, 3); energyLogFile.print(',');
     energyLogFile.print(energyLastSocPct);  energyLogFile.print(',');
-    energyLogFile.println(kwhSolar, 3);
+    energyLogFile.print(kwhSolar, 3);       energyLogFile.print(',');
+    energyLogFile.println(kwhSolarCons, 3);
     energyLogFile.flush();
 }
 
@@ -2335,6 +2343,9 @@ void drawPage2() {
 
     kwhStr(lv, sizeof(lv), kwhSolar);
     wRow(4, LVX, 244, RVX, y, "Sol kWh", lv, "            ", ""); y += ROW;
+
+    kwhStr(lv, sizeof(lv), kwhSolarCons);
+    wRow(4, LVX, 244, RVX, y, "Sol -kWh", lv, "            ", ""); y += ROW;
 }
 
 // ── Page 3: Fault History ────────────────────────────────
@@ -2459,15 +2470,48 @@ static const CtrlItem PAGE4_ITEMS[] = {
 static const uint8_t PAGE4_COUNT = 17;
 static const uint8_t PAGE4_LEFT_ROWS = 8;
 
-void getPage4Value(uint8_t item, char* buf, uint8_t bufSz) {
+// Items 0..PAGE4_LAST_STAGED are scrolled as a pending value and only applied on SELECT —
+// applying while scrolling meant passing over e.g. "8hr" boost started the UFH heating.
+static const uint8_t PAGE4_LAST_STAGED = 6;
+int16_t page4Pending = 0;
+
+int16_t page4Current(uint8_t item) {
     switch (item) {
-        case 0: { const char* bm[] = {"Off","Boost-5am","8hr"}; strlcpy(buf, bm[boostMode], bufSz); break; }
-        case 1: snprintf(buf, bufSz, "%.1f", (double)boostTarget); break;
-        case 2: strlcpy(buf, systemMode == MODE_WINTER ? "Winter" : "Summer", bufSz); break;
-        case 3: { const char* mm[] = {"Off","SOC-Lim","Manual On"}; strlcpy(buf, mm[manualHeaterMode], bufSz); break; }
-        case 4: strlcpy(buf, nightCoolingEnabled ? "On" : "Off", bufSz); break;
-        case 5: strlcpy(buf, solarTargetMode == SOLAR_TANK_PLUS8 ? "Tank+" : "Max", bufSz); break;
-        case 6: strlcpy(buf, holidayMode ? "Yes" : "No", bufSz); break;
+        case 0: return boostMode;
+        case 1: return (int16_t)lroundf(boostTarget * 2.0f);
+        case 2: return systemMode == MODE_WINTER ? 0 : 1;
+        case 3: return manualHeaterMode;
+        case 4: return nightCoolingEnabled ? 1 : 0;
+        case 5: return solarTargetMode == SOLAR_TANK_PLUS8 ? 0 : 1;
+        case 6: return holidayMode ? 1 : 0;
+        default: return 0;
+    }
+}
+
+void page4Commit(uint8_t item, int16_t v) {
+    if (v == page4Current(item)) return;
+    switch (item) {
+        case 0: boostMode = (BoostMode)v; break;
+        case 1: boostTarget = v * 0.5f; break;
+        case 2: systemMode = v ? MODE_SUMMER : MODE_WINTER; markSettingsDirty(); break;
+        case 3: manualHeaterMode = (ManualHeaterMode)v; break;
+        case 4: nightCoolingEnabled = v; markSettingsDirty(); break;
+        case 5: solarTargetMode = v ? SOLAR_MAX : SOLAR_TANK_PLUS8; markSettingsDirty(); break;
+        case 6: holidayMode = v; markSettingsDirty(); break;
+    }
+}
+
+void getPage4Value(uint8_t item, char* buf, uint8_t bufSz) {
+    int16_t v = (navMode == NAV_OPTION && item == selectedItem && item <= PAGE4_LAST_STAGED)
+              ? page4Pending : page4Current(item);
+    switch (item) {
+        case 0: { const char* bm[] = {"Off","Boost-5am","8hr"}; strlcpy(buf, bm[v], bufSz); break; }
+        case 1: snprintf(buf, bufSz, "%.1f", (double)(v * 0.5f)); break;
+        case 2: strlcpy(buf, v ? "Summer" : "Winter", bufSz); break;
+        case 3: { const char* mm[] = {"Off","SOC-Lim","Manual On"}; strlcpy(buf, mm[v], bufSz); break; }
+        case 4: strlcpy(buf, v ? "On" : "Off", bufSz); break;
+        case 5: strlcpy(buf, v ? "Max" : "Tank+", bufSz); break;
+        case 6: strlcpy(buf, v ? "Yes" : "No", bufSz); break;
         case 7: {
             const char* hs[] = {"Unknown","Open","Closed","Opening","Closing"};
             uint8_t s = hasWPkt ? lastWPkt.henDoorState : 0;
@@ -2489,16 +2533,9 @@ void getPage4Value(uint8_t item, char* buf, uint8_t bufSz) {
 
 void page4Adjust(uint8_t item, int8_t dir) {
     switch (item) {
-        case 0: boostMode = (BoostMode)((boostMode + 3 + dir) % 3); break;
-        case 1: boostTarget = constrain(boostTarget + dir * 0.5f, 13.0f, 20.0f); break;
-        case 2:
-            systemMode = (systemMode == MODE_WINTER) ? MODE_SUMMER : MODE_WINTER;
-            markSettingsDirty();
-            break;
-        case 3: manualHeaterMode = (ManualHeaterMode)((manualHeaterMode + 3 + dir) % 3); break;
-        case 4: nightCoolingEnabled = !nightCoolingEnabled; markSettingsDirty(); break;
-        case 5: solarTargetMode = (solarTargetMode == SOLAR_TANK_PLUS8) ? SOLAR_MAX : SOLAR_TANK_PLUS8; markSettingsDirty(); break;
-        case 6: holidayMode = !holidayMode; markSettingsDirty(); break;
+        case 0: case 3: page4Pending = (page4Pending + 3 + dir) % 3; break;
+        case 1: page4Pending = constrain(page4Pending + dir, 26, 40); break;
+        case 2: case 4: case 5: case 6: page4Pending = !page4Pending; break;
         case 8: { // fan base speed — transmitted to W in H→W packet
             uint8_t fs = EEPROM.read(EE_FAN_BASE_SPEED);
             fs = constrain((int)fs + dir * 10, 0, 100);
@@ -3071,31 +3108,27 @@ void drawPage7() {
     tempRow(RX, RVX, 242, "Outside Air",  hasWPkt ? lastWPkt.tempOutsideAir  : TEMP_FAULT);
 }
 
-static bool inSocLowBacklightWindow() {
-    if (!rtcValid) return false;
-    uint16_t m = (uint16_t)rtcHour() * 60 + rtcMinute();
-    return m >= 5 * 60 + 30 && m < 23 * 60;
-}
-
-// Edge-triggered so the user can page away without being dragged back until SOC recovers and drops again
+// Page 6 is no longer brought up automatically; these flags only choose what it shows when paged to
 void updateSocLow() {
     if (!hasWPkt || !lastWPkt.growattValid) { washMsg = false; return; }
     uint8_t soc = lastWPkt.battSocPct;
     uint8_t thr = socLowThreshold();
-    if (!socLow && soc < thr) {
-        socLow = true;
-        currentPage = 6; navMode = NAV_PAGE; needFullRedraw = true;
-        if (inSocLowBacklightWindow()) wakeDisplay();
-    } else if (socLow && soc >= thr) {
-        socLow = false;
-    }
+    if (!socLow && soc < thr)       socLow = true;
+    else if (socLow && soc >= thr)  socLow = false;
+    washMsg = inWashWindow() && soc >= thr;
+}
 
-    bool wash = inWashWindow() && soc >= thr;
-    if (wash && !washMsg) {
-        currentPage = 6; navMode = NAV_PAGE; needFullRedraw = true;
+// Display held lit on a set page for an hour: 07:00–08:00 page 7, 22:00–23:00 page 2.
+// Edge-triggered so the user can page away during the hour without being dragged back.
+bool timedPageShown = false;
+void updateTimedPages() {
+    uint8_t h  = rtcValid ? rtcHour() : 255;
+    uint8_t pg = (h == 7) ? 7 : (h == 22) ? 2 : 0;
+    if (pg && !timedPageShown) {
+        currentPage = pg; navMode = NAV_PAGE; needFullRedraw = true;
         wakeDisplay();
     }
-    washMsg = wash;
+    timedPageShown = (pg != 0);
 }
 
 // ── Full page dispatch ────────────────────────────────────
@@ -3170,7 +3203,7 @@ void handleButtons() {
                     navMode = NAV_PAGE; needPageRedraw = true;
                 } else if (currentPage == 4) {
                     if (PAGE4_ITEMS[selectedItem].valueType == 3) { page4Action(selectedItem); needPageRedraw = true; }
-                    else { navMode = NAV_OPTION; needPageRedraw = true; }
+                    else { page4Pending = page4Current(selectedItem); navMode = NAV_OPTION; needPageRedraw = true; }
                 } else if (currentPage == 5) {
                     if (selectedItem == 6) {
                         // Override toggle row
@@ -3191,7 +3224,10 @@ void handleButtons() {
         case NAV_OPTION:
             if (upCnt) { for (uint8_t i = 0; i < upCnt; i++) page4Adjust(selectedItem, -1); needPageRedraw = true; }
             if (dnCnt) { for (uint8_t i = 0; i < dnCnt; i++) page4Adjust(selectedItem,  1); needPageRedraw = true; }
-            if (selP)  { navMode = NAV_ITEM; needPageRedraw = true; }
+            if (selP)  {
+                if (selectedItem <= PAGE4_LAST_STAGED) page4Commit(selectedItem, page4Pending);
+                navMode = NAV_ITEM; needPageRedraw = true;
+            }
             break;
     }
 #ifdef DEBUG_SERIAL
@@ -4508,7 +4544,8 @@ void loop() {
 
     // Display refresh
     updateSocLow();
-    bool socHoldOn = (socLow && inSocLowBacklightWindow()) || washMsg || (currentPage == 6 && boazBirthday());
+    updateTimedPages();
+    bool socHoldOn = timedPageShown || (currentPage == 6 && boazBirthday());
     if (!displayOn) {
         // Wake only on NEW faults that appeared after the display went to sleep
         uint32_t curFaults = hFaultFlags | (hasWPkt ? lastWPkt.wFaultFlags : 0);
@@ -4520,7 +4557,7 @@ void loop() {
             displayOn      = false;
             setBacklight(0);
             faultFlagsAtSleep = hFaultFlags | (hasWPkt ? lastWPkt.wFaultFlags : 0);
-            currentPage    = socLow ? 6 : 7;
+            currentPage    = 7;
             navMode        = NAV_PAGE;
             needFullRedraw = true;
         }

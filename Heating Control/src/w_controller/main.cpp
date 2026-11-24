@@ -141,6 +141,8 @@ static const uint16_t VALVE_POWERUP_WAIT_MS = 30000;
 #define RELOCK_TIMEOUT_MS  600000UL  // 10 minutes
 #define RELOCK_GRACE_MS    600000UL  // PIR within 10 min of an auto-lock unlocks again
 #define INT_LIGHTS_IDLE_MS 180000UL  // internal lights off after 3 min door shut + no PIR
+#define OCC_PIR_MIN_MS       5000UL  // PIR must stay active longer than this to set the occupied hold
+#define OCC_DOOR_WINDOW_MS  90000UL  // door opened within this before PIR clears = left, no hold
 #define ALARM_DURATION_MS   60000UL  // 1-minute alarm auto-stop
 #define HANDLE_ALERT_NIGHT_MIN_MS 10000UL
 #define INTER_CTRL_POLL_MS  250UL
@@ -157,7 +159,7 @@ static const uint16_t VALVE_POWERUP_WAIT_MS = 30000;
 #define VAC_EXTRA_RUN_MS   600000UL  // 10 extra minutes after full vacuum
 // TEMPORARY: vacuum sensor faulty — ignore it and run a fixed time. Set false once sensor fixed.
 #define VAC_SENSOR_BYPASS  true
-#define VAC_BYPASS_RUN_MS  900000UL  // 15 minutes
+#define VAC_BYPASS_RUN_MS  600000UL  // 10 minutes
 #define VALVE_PULSE_MS      7000UL   // H-bridge valve travel time
 #define LOCK_PULSE_MS       1000UL   // door lock pulse
 #define HBRIDGE_DEAD_MS      200UL   // dead-time between relay changes
@@ -536,6 +538,9 @@ uint8_t       fireAlarmTriggerSeq  = 0;  // alertResetSeq value at time of trigg
 
 bool          gDoorOpen            = false;  // set by updateSecurity() each loop
 bool          gPirActive           = false;  // set by updateSecurity() each loop
+// PIR went quiet (after a >5s trigger) with no door opening in the 90s before: someone is sitting still inside,
+// not gone. Holds lights on and blocks auto-lock until the door next opens.
+bool          gOccupiedHold        = false;
 uint8_t       gWinchReedFlags      = 0;      // set by updateWinchInputs() each loop
 bool          wAirRising           = false;
 float         wAirPrevMinTemp      = NAN;
@@ -2242,7 +2247,7 @@ void updateIntLights() {
     static bool          everUnlocked   = false;
     unsigned long now = millis();
     if (!workshopLocked) { lastUnlockedMs = now; everUnlocked = true; }
-    if (gDoorOpen || gPirActive) lastActivityMs = now;
+    if (gDoorOpen || gPirActive || gOccupiedHold) lastActivityMs = now;
     bool on = everUnlocked && now - lastUnlockedMs < 30000UL
                            && now - lastActivityMs < INT_LIGHTS_IDLE_MS;
     digitalWrite(PIN_INT_LIGHTS, on ? RELAY_ON : RELAY_OFF);
@@ -2263,6 +2268,20 @@ void updateSecurity() {
 #endif
     gDoorOpen  = doorOpen;
     gPirActive = pirActive;
+    {
+        static unsigned long lastDoorOpenMs = 0;
+        static bool          doorSeen       = false;
+        static bool          prevPirOcc     = false;
+        static unsigned long pirOnSinceMs   = 0;
+        unsigned long t = millis();
+        if (doorOpen) { lastDoorOpenMs = t; doorSeen = true; gOccupiedHold = false; }
+        if (pirActive && !prevPirOcc) pirOnSinceMs = t;
+        // Short PIR blips with nobody inside were latching the hold and leaving the workshop unlocked
+        if (prevPirOcc && !pirActive && !workshopLocked && t - pirOnSinceMs > OCC_PIR_MIN_MS)
+            gOccupiedHold = !(doorSeen && t - lastDoorOpenMs <= OCC_DOOR_WINDOW_MS);
+        prevPirOcc = pirActive;
+        if (workshopLocked) gOccupiedHold = false;
+    }
     bool manualSupp   = (digitalRead(PIN_MANUAL_RELOCK) == LOW); // LOW = suppression ON
     bool handleDown   = (digitalRead(PIN_DOOR_HANDLE)   == LOW);
 #ifdef DEBUG_SERIAL
@@ -2291,10 +2310,10 @@ void updateSecurity() {
     if (lockSw && !prevLockSw) vacBtnRequest = true;
     prevLockSw = lockSw;
 
-    // Auto-lock: door closed, stay-unlocked switch off and no PIR for RELOCK_TIMEOUT_MS
+    // Auto-lock: door closed, stay-unlocked switch off, no PIR and no occupied hold for RELOCK_TIMEOUT_MS
     static bool          autoLockGrace = false;
     static unsigned long autoLockedMs  = 0;
-    if (!workshopLocked && !doorOpen && !manualSupp && !pirActive) {
+    if (!workshopLocked && !doorOpen && !manualSupp && !pirActive && !gOccupiedHold) {
         if (!relockTimerActive) {
             relockTimerActive  = true;
             relockTimerStartMs = now;
@@ -3146,6 +3165,7 @@ static void dbgSecurity() {
     Serial.print(F("  handle:     ")); Serial.println((digitalRead(PIN_DOOR_HANDLE)     == LOW)  ? F("DOWN")   : F("up"));
     Serial.print(F("  hold_off:   ")); Serial.println((digitalRead(PIN_MANUAL_RELOCK)   == LOW)  ? F("ON")     : F("off"));
     Serial.print(F("  pir:        ")); Serial.println((digitalRead(PIN_PIR)              == LOW) ? F("ACTIVE") : F("clear"));
+    Serial.print(F("  occupied:   ")); Serial.println(gOccupiedHold ? F("HOLD (lights on, no auto-lock)") : F("no"));
     {
         static const char s0[] PROGMEM = "unknown", s1[] PROGMEM = "OPEN", s2[] PROGMEM = "closed",
                           s3[] PROGMEM = "opening", s4[] PROGMEM = "closing";

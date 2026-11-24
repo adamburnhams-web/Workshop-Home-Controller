@@ -1380,3 +1380,32 @@ With H Holiday mode on, a handle push (debounced up → down) while the workshop
 ## W Controller — winter cold+2 cutoff only below 25°C
 
 Winter solar's "hot below cold + 2°C → 0%" rule now applies only while both solar hot and solar cold are below 25°C. On 14 Nov a cold-side start ended its 30-min hold with hot (16°C) trailing cold (31°C); the rule held the pump at 0% and the cold side stagnated to 96.7°C until the UFH boost started at 09:51. The "hot below workshop air + 2°C → 0%" floor likewise applies only while solar cold is below 25°C; above that, hot below air + 2 runs at 4% so a sun-heated cold side always has flow. The end-of-day stop is unchanged.
+
+## H Controller — page 2 solar consumption kWh
+
+New `Sol -kWh` row on page 2 below `Sol kWh`: daily heat drawn *out* through the collectors, i.e. the negative side of the solar kWh calc that `Sol kWh` ignores. Same method, flipped: W/°C at the pump duty (`solarWPerC`) × (pre_pump − solar hot) whenever pre_pump is above solar hot, integrated per packet and reset at midnight with the other totals. Mostly frost protection (~0.4 kWh on the night of 12–13 Nov). Also logged as a new last column `solar_neg_kwh` in `energy.csv` (9 columns). The header check means H deletes an existing 8-column `energy.csv` on first boot with this firmware, so empty the card first.
+
+## W Controller — occupied hold (lights on, no auto-lock) when PIR loses someone sitting still
+
+When the PIR goes from active to inactive while unlocked, W checks whether the door was opened in the minute before. If not, someone is assumed to still be inside (sitting still, out of PIR view): `gOccupiedHold` keeps the internal lights on and blocks the auto-lock timer. The hold clears as soon as the door opens (then the normal 3-min lights-off and auto-lock timers apply), or if the workshop locks. If the door was opened in that minute, behaviour is unchanged. `security` debug shows `occupied`. Note: a PIR trigger with nobody inside and no door opening (e.g. a false trigger) also sets the hold, leaving lights on and the workshop unlocked until the door is next opened.
+
+## H Controller — workshop-air summer switch only before 13:30
+
+The winter → summer switch on workshop air above 18.0°C (`airSummerOverride`) now only triggers before 13:30 on H's clock. Air above 18°C from 13:30 onward leaves H in winter mode. Once switched before 13:30 it still holds until midnight as before. The PV export override is unchanged.
+
+## W Controller — occupied hold needs a 5s PIR trigger, door window 90s
+
+On 23 Nov the workshop stayed unlocked with the lights on from 14:06 to 15:09 after everyone had left; most likely a short PIR blip set the occupied hold. The hold is now only set when the PIR trigger that just ended lasted more than 5s (`OCC_PIR_MIN_MS`); shorter blips are ignored for the hold (they still restart the auto-lock timer and keep the lights on as before). The "door opened recently, so they left" window is now 90s (`OCC_DOOR_WINDOW_MS`, was 60s).
+
+## H Controller — page 4 options apply only on SELECT
+
+Scrolling through a page 4 option used to apply each value as it was shown, so passing over "8hr" boost started the UFH heating straight away. Boost, Boost Tgt, Mode, Man Heater, Night Cool, Solar Tgt and Holiday now scroll a pending value and only apply it when SELECT is pressed. If the page times out back to page scroll first, nothing changes. Fan Speed/Full/Base, Brightness and Set Hour/Min/Sec still adjust live.
+
+## H Controller — page 6 no longer automatic, page 2 shown 22:00–23:00
+
+Page 6 (SOC / washing machine) is no longer switched to or woken automatically during the 06:30–09:30 wash window or on low SOC, and the display no longer goes to page 6 when it sleeps (always page 7). Page 6 still shows the same SOC / wash messages when paged to. Instead, at 22:00 each day the display wakes on page 2 and stays lit until 23:00; paging away during that hour is allowed and it won't be pulled back. At 23:00 it sleeps as normal.
+Also 07:00–08:00: the display wakes on page 7 (the default page) and stays lit until 08:00, same rules as the 22:00 page 2 hour.
+
+## W Controller — vacuum bypass run 10 min
+
+`VAC_BYPASS_RUN_MS` (temporary vacuum sensor bypass) reduced from 15 min to 10 min per cycle.
