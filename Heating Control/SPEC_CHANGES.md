@@ -1409,3 +1409,28 @@ Also 07:00–08:00: the display wakes on page 7 (the default page) and stays lit
 ## W Controller — vacuum bypass run 10 min
 
 `VAC_BYPASS_RUN_MS` (temporary vacuum sensor bypass) reduced from 15 min to 10 min per cycle.
+
+## H Controller — workshop-air summer switch needs 30 min above 18°C
+
+The winter → summer switch on workshop air (`airSummerOverride`) now needs the air to stay above 18.0°C continuously for 30 min (`AIR_SUMMER_HOLD_MS`); any reading at or below 18.0°C (or a sensor fault) restarts the 30 min. The 30 min must complete before 14:00 (cut-off moved from 13:30). Holding until midnight is unchanged.
+
+## W Controller — hen door close 11s
+
+Hen house door close run time increased from 10.5s to 11s (`henCloseRunMs`). Open stays 14s.
+
+## W Controller — frost not-recovering check after 120s
+
+`FAULT_W_FROST_NOT_RECOVERING` on solar cold still below 4.0°C now waits 120s of frost pumping (was 60s). On 27 Nov it fired at ~62s while solar cold was rising fast (2.5→3.9°C) and recovered to 14°C within 4 min. The immediate below-1°C trigger is unchanged.
+
+## W Controller — solar cold closed during morning heat when collectors are above frost
+
+The frost latch keeps solar cold open until winter solar next runs, so a morning UFH session was circulating slab heat out through the collectors. During morning heat W now closes solar cold whenever both solar hot and solar cold are above 2.5°C, whether they are already above at the start or rise above later. If either drops below 2.0°C, frost protection runs as usual (solar cold opens, solar pump 100% until solar hot reaches 8°C), and once both are back above 2.5°C solar cold closes again. Not applied while the solar pump is running for solar, during a solar UFH dump, with a solar sensor fault, or under H manual valve override.
+
+## H Controller — boost returns to Off after it has run
+
+- **Boost-5am** used to stay set every morning until changed by hand. Once its 5:00 check has run (whether or not the workshop needed heating), it now goes back to Off after 07:00, waiting for that morning's session to finish if it's still running so the raised target isn't cut short.
+- **8hr boost** used to restart straight away when its 8 hours ended (boost still 8hr, session inactive), so it never ended. It now goes back to Off when the 8 hours are up.
+
+## W Controller — handle knock unlock
+
+Pushing the door handle down and back up 5 times within 3s unlocks the workshop, if: it's between 08:00 and 22:00 (W clock synced), the workshop was last unlocked less than 1 hr ago (e.g. it auto-locked while you were outside), and Holiday mode is off. Pushes are the debounced ones already used for the handle log. After a W reboot the workshop counts as not recently unlocked until it is next unlocked. The usual locked-handle buzzer still sounds while the handle is down.

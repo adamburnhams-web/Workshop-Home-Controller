@@ -129,6 +129,7 @@ static const bool HEATER_ENABLED = true;
 #define BUS_FALLING_RESET_MS    30000UL  // 30s back above resets; single readings jitter across 14.9V while falling
 #define HEATER_RATED_W          3000     // immersion element rated power
 #define ENERGY_LOG_INTERVAL_MS  300000UL // 5 min SD flush of daily kWh totals
+#define AIR_SUMMER_HOLD_MS      1800000UL // workshop air >18°C this long before the winter→summer switch
 
 // Display colours (RGB565)
 #define C_BLACK   0x0000
@@ -1325,15 +1326,26 @@ void checkMorningTrigger() {
         boost8hrEndMs     = millis() + 8UL * 3600000UL;
     }
     if (boostMode == BOOST_8HR && morningHeatActive) {
+        // Back to Off, else the next pass sees 8hr + inactive and starts another 8 hours
         if (millis() >= boost8hrEndMs) {
             morningHeatActive = false;
+            boostMode         = BOOST_OFF;
         }
         return;
+    }
+
+    // Boost-5am is a one-morning setting: once its 5am check has run, drop it after 07:00
+    // (and after that session has finished, so its raised target isn't cut short)
+    static uint8_t boost5amDay = 255;
+    if (boostMode == BOOST_5AM && d == boost5amDay && h >= 7 && !morningHeatActive) {
+        boostMode   = BOOST_OFF;
+        boost5amDay = 255;
     }
 
     // 5am trigger (or boost-at-5am)
     if (h == 5 && m == 0 && d != lastHeatDay) {
         lastHeatDay = d;
+        if (boostMode == BOOST_5AM) boost5amDay = d;
         // Check W air temp from last W packet
         bool wAirFault = (lastWPkt.tempWorkshopAir == TEMP_FAULT);
         float wAir = wAirFault ? 0.0f : (float)lastWPkt.tempWorkshopAir / 10.0f;
@@ -1574,12 +1586,17 @@ void updateSolarValves() {
 // logic by sending MODE_SUMMER in the H→W packet without changing the stored systemMode.
 void updatePVExportOverride() {
     // Workshop already warm: winter solar has nothing left to do, so run summer until midnight.
-    // Only switches before 13:30: later in the day there's too little sun left for summer solar.
-    static uint8_t airSummerDay = 0;
+    // Only switches before 14:00: later in the day there's too little sun left for summer solar.
+    // Air must stay above 18°C for 30 min so a brief warm spell (door open, sun on the sensor) doesn't switch it.
+    static uint8_t       airSummerDay     = 0;
+    static unsigned long airAbove18SinceMs = 0;
     if (airSummerOverride && (!rtcValid || rtcNow.day() != airSummerDay)) airSummerOverride = false;
-    bool beforeAirCutoff = rtcValid && (rtcHour() * 60 + rtcMinute()) < 13 * 60 + 30;
-    if (systemMode == MODE_WINTER && !airSummerOverride && beforeAirCutoff && hasWPkt
-            && lastWPkt.tempWorkshopAir != TEMP_FAULT && lastWPkt.tempWorkshopAir > 180) {
+    bool beforeAirCutoff = rtcValid && (rtcHour() * 60 + rtcMinute()) < 14 * 60;
+    bool airWarm = hasWPkt && lastWPkt.tempWorkshopAir != TEMP_FAULT && lastWPkt.tempWorkshopAir > 180;
+    if (!airWarm)               airAbove18SinceMs = 0;
+    else if (!airAbove18SinceMs) airAbove18SinceMs = millis() | 1;
+    if (systemMode == MODE_WINTER && !airSummerOverride && beforeAirCutoff && airWarm
+            && millis() - airAbove18SinceMs >= AIR_SUMMER_HOLD_MS) {
         airSummerOverride = true;
         airSummerDay      = rtcNow.day();
     }

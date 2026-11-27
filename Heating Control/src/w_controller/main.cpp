@@ -143,6 +143,9 @@ static const uint16_t VALVE_POWERUP_WAIT_MS = 30000;
 #define INT_LIGHTS_IDLE_MS 180000UL  // internal lights off after 3 min door shut + no PIR
 #define OCC_PIR_MIN_MS       5000UL  // PIR must stay active longer than this to set the occupied hold
 #define OCC_DOOR_WINDOW_MS  90000UL  // door opened within this before PIR clears = left, no hold
+#define HANDLE_KNOCK_COUNT       5
+#define HANDLE_KNOCK_WINDOW_MS   3000UL     // pushes must all fall within this
+#define HANDLE_KNOCK_RECENT_MS   3600000UL  // only if last unlocked less than 1 hr ago
 #define ALARM_DURATION_MS   60000UL  // 1-minute alarm auto-stop
 #define HANDLE_ALERT_NIGHT_MIN_MS 10000UL
 #define INTER_CTRL_POLL_MS  250UL
@@ -509,7 +512,7 @@ bool          extLightsOn         = false;
 
 // RAM only — `hen open_ms`/`hen close_ms` changes are lost on reboot
 uint16_t      henOpenRunMs      = 14000;
-uint16_t      henCloseRunMs     = 10500;
+uint16_t      henCloseRunMs     = 11000;
 // Both H-bridge relays off for this long before reversing, so the motor is never shorted
 #define HEN_DEADTIME_MS     500UL
 
@@ -1346,7 +1349,7 @@ static bool runFrostProtection(float hot, float cold) {
             frostUFHStop();
         }
         bool frostCritical = (hot < 1.0f || cold < 1.0f)
-                          || (cold < 4.0f && millis() - frostFaultStartMs > 60000UL);
+                          || (cold < 4.0f && millis() - frostFaultStartMs > 120000UL);
         if (frostPumpOn && frostCritical && !frostUFHOn) {
             setFault(FAULT_W_FROST_NOT_RECOVERING);
             ufhColdValve.setOpen();
@@ -2362,6 +2365,29 @@ void updateSecurity() {
     prevPIR = pirActive;
 
     bool handlePushed = updateHandleLog(handleDown, now);
+
+    // Handle knock to get back in: 5 pushes within 3s, daytime only, and only within an hour
+    // of the workshop last being unlocked (e.g. auto-locked while you stepped out)
+    {
+        static unsigned long lastUnlockedAtMs = 0;
+        static bool          everUnlocked     = false;
+        static unsigned long knockStartMs     = 0;
+        static uint8_t       knockCount       = 0;
+        if (!workshopLocked) { lastUnlockedAtMs = now; everUnlocked = true; knockCount = 0; }
+        if (handlePushed && workshopLocked) {
+            if (knockCount == 0 || now - knockStartMs > HANDLE_KNOCK_WINDOW_MS) { knockStartMs = now; knockCount = 0; }
+            knockCount++;
+            uint8_t h, m; getCurrentTime(h, m);
+            if (knockCount >= HANDLE_KNOCK_COUNT && timeSynced && h >= 8 && h < 22
+                    && everUnlocked && now - lastUnlockedAtMs < HANDLE_KNOCK_RECENT_MS
+                    && !(hasHPacket && lastH.holidayMode)) {
+                doorLock.request(true);
+                setWorkshopLocked(false);
+                knockCount = 0;
+            }
+        }
+    }
+
     if (handlePushed && workshopLocked && timeSynced && !hasFault(FAULT_W_HANDLE_TRIED)) {
         uint8_t h, m; getCurrentTime(h, m);
         if (h >= 22 || h < 7 || (hasHPacket && lastH.holidayMode)) {
@@ -3704,6 +3730,14 @@ void loop() {
 #endif
     if (hasHPacket && lastH.heaterPowerPct > 0)
         solarColdValve.setOpen();
+    // The frost latch leaves solar cold open, so a morning UFH session would push slab heat
+    // out through the collectors. Close it once both pipes are safely above frost; a dip below
+    // 2°C restarts frost protection, which reopens it and runs the pump. 2.0/2.5 = hysteresis.
+    if (hasHPacket && lastH.morningHeatActive && !lastH.overrideActive
+            && !frostPumpOn && !solarPumpActive && !solarDumpUFHOn
+            && !sFault[SENSOR_SOLAR_HOT] && !sFault[SENSOR_SOLAR_COLD]
+            && sTemp[SENSOR_SOLAR_HOT] > 2.5f && sTemp[SENSOR_SOLAR_COLD] > 2.5f)
+        solarColdValve.setClose();
     // H won't fire the heater with UFH cold open; frost protection and the mode
     // handover can leave it open, so close it whenever H calls for heat. Dumps and a
     // morning UFH session keep it (H blocks the heater in both anyway).
